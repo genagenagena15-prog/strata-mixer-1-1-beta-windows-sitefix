@@ -20,10 +20,12 @@
     "appId": "com.stratamixer.app",
     "productName": "Strata Mixer",
     "asar": false,
+    "artifactName": "StrataMixer-${version}.${ext}",
     "publish": [
       {
-        "provider": "generic",
-        "url": "https://updates.stratamixer.net"
+        "provider": "github",
+        "owner": "genagenagena15-prog",
+        "repo": "strata-mixer-releases"
       }
     ],
     "directories": {

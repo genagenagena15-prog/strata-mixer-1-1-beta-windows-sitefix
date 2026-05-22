@@ -601,7 +601,7 @@ function createWindow() {
 // are hosted on Cloudflare R2 — see package.json "build.publish".
 // ──────────────────────────────────────────────────────────────────────
 const { autoUpdater } = require('electron-updater');
-const NOTIFICATIONS_URL = 'https://updates.stratamixer.net/notifications.json';
+const NOTIFICATIONS_URL = 'https://raw.githubusercontent.com/genagenagena15-prog/strata-mixer-releases/main/notifications.json';
 
 let updateState = { status: 'idle', version: null, percent: 0, error: null };
 let notificationsCache = [];
