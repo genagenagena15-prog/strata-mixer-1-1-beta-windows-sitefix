@@ -1,0 +1,75 @@
+{
+  "name": "strata-mixer",
+  "version": "1.2.0",
+  "description": "Strata Mixer v1.2 — программа для уникализации и редактирования видео",
+  "main": "electron/main.js",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"vite --port 5180\" \"wait-on http://localhost:5180 && cross-env STRATA_SKIP_UPDATE_CHECK=1 VITE_DEV_PORT=5180 electron .\"",
+    "vite-only": "vite --port 5180",
+    "build": "vite build",
+    "package": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=win32 --arch=x64 --out=release --overwrite --icon=assets/strata_mixer_1_1d.ico --prune=true",
+    "prepare-ffmpeg": "node scripts/prepare-ffmpeg.cjs",
+    "package:win": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=win32 --arch=x64 --out=release --overwrite --icon=assets/strata_mixer_1_1d.ico --prune=true",
+    "package:mac-arm64": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=darwin --arch=arm64 --out=release-mac --overwrite --icon=assets/strata_mixer_1_1d.icns --prune=true",
+    "package:mac-x64": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=darwin --arch=x64 --out=release-mac --overwrite --icon=assets/strata_mixer_1_1d.icns --prune=true",
+    "package:mac": "node scripts/build-mac.cjs",
+    "dist:win": "npm run build && npm run prepare-ffmpeg && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.stratamixer.app",
+    "productName": "Strata Mixer",
+    "asar": false,
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://updates.stratamixer.net"
+      }
+    ],
+    "directories": {
+      "output": "release-installer"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "assets/**/*",
+      "bin/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/strata_mixer_1_1d.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Strata Mixer"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "assets/strata_mixer_1_1d.icns",
+      "category": "public.app-category.video"
+    }
+  },
+  "dependencies": {
+    "@electron/remote": "latest",
+    "electron-updater": "^6.8.3",
+    "ffmpeg-static": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "latest",
+    "cross-env": "^10.1.0",
+    "electron": "latest",
+    "electron-builder": "^26.8.1",
+    "electron-packager": "latest",
+    "vite": "latest",
+    "wait-on": "latest"
+  },
+  "publicVersion": "v1.2",
+  "updateVersion": "1.4.2"
+}

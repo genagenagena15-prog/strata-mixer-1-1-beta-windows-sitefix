@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Strata Mixer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #020202; overflow: hidden;
+    font-family: Inter, 'Segoe UI', Arial, sans-serif; color: #f6f8ff;
+    -webkit-user-select: none; cursor: default; }
+  body.light { background: #ebf1f8; color: #1a1c25; }
+  .wrap { height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 2px; }
+  video { width: 210px; height: auto; display: block; background: #020202; }
+  body.light video { background: #ebf1f8; }
+  h1 { margin: 4px 0 0; font-size: 22px; letter-spacing: -.04em; font-weight: 900; }
+  p { margin: 3px 0 0; color: #aeb8ca; font-size: 13px; }
+  body.light p { color: #6b7384; }
+  .ver { margin-top: 6px; font-size: 11px; font-weight: 800; color: #7f8ba0;
+    border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.06);
+    border-radius: 999px; padding: 3px 9px; }
+  body.light .ver { color: #6b7384; border-color: rgba(30,36,56,.16); background: rgba(30,36,56,.05); }
+  .bar { margin-top: 16px; width: 170px; height: 6px; background: #172033;
+    border-radius: 99px; overflow: hidden; }
+  body.light .bar { background: #cdd3df; }
+  .bar i { display: block; height: 100%; width: 42%;
+    background: linear-gradient(90deg, #ff8a00, #e244c6, #a33cff);
+    border-radius: 99px; animation: load 1.1s ease-in-out infinite; }
+  @keyframes load { 0% { transform: translateX(-115%); } 100% { transform: translateX(285%); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <video id="cube" autoplay muted loop playsinline></video>
+  <h1>Strata Mixer</h1>
+  <p>Проверка обновлений</p>
+  <span class="ver" id="ver">v1.1</span>
+  <div class="bar"><i></i></div>
+</div>
+<script>
+  // Hash format: "theme|version" (e.g. "light|v1.1"). Falls back to the
+  // dark theme + raw version string for backward compatibility.
+  var theme = 'dark', ver = 'v1.1';
+  try {
+    var raw = decodeURIComponent(location.hash.slice(1));
+    var parts = raw.split('|');
+    if (parts[0] === 'light' || parts[0] === 'dark') { theme = parts[0]; ver = parts[1] || ver; }
+    else if (raw) { ver = raw; }
+  } catch (e) {}
+  if (theme === 'light') document.body.classList.add('light');
+  var cubeName = theme === 'light' ? 'white' : 'black';
+  var cube = document.getElementById('cube');
+  // The splash only ever plays the looped «waiting» clip while the app loads.
+  cube.src = 'cube-' + cubeName + '-waiting.mp4';
+  document.getElementById('ver').textContent = ver;
+</script>
+</body>
+</html>

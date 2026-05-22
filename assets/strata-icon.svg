@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Strata logo icon</title>
+  <desc id="desc">Sharp glossy black Strata icon with mirrored orange and violet edge light, no white dots.</desc>
+  <defs>
+    <path id="iconShape" d="M169 329C169 216 242 144 356 144H644C758 144 831 216 831 329V641C831 755 758 827 644 827H356C242 827 169 755 169 641V329Z"/>
+
+    <linearGradient id="blackBody" x1="216" y1="181" x2="790" y2="805" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38312c"/>
+      <stop offset="0.33" stop-color="#222426"/>
+      <stop offset="0.68" stop-color="#07090e"/>
+      <stop offset="1" stop-color="#04050a"/>
+    </linearGradient>
+
+    <linearGradient id="orangeEdge" x1="146" y1="154" x2="388" y2="396" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffe66a"/>
+      <stop offset="0.22" stop-color="#ffad17"/>
+      <stop offset="0.58" stop-color="#ff5a00"/>
+      <stop offset="1" stop-color="#ff5a00" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <linearGradient id="violetEdge" x1="854" y1="817" x2="612" y2="575" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#df68ff"/>
+      <stop offset="0.25" stop-color="#9838ff"/>
+      <stop offset="0.6" stop-color="#333cff"/>
+      <stop offset="1" stop-color="#333cff" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <radialGradient id="simpleGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(336 300) rotate(40) scale(440 315)">
+      <stop offset="0" stop-color="#5a4a3f" stop-opacity="0.62"/>
+      <stop offset="0.42" stop-color="#272727" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#050608" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="topHighlight" x1="249" y1="164" x2="732" y2="214" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff9b16" stop-opacity="0.46"/>
+      <stop offset="0.34" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.72" stop-color="#ffffff" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="edgeStroke" x1="177" y1="158" x2="832" y2="825" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b1a18"/>
+      <stop offset="0.42" stop-color="#050608"/>
+      <stop offset="0.72" stop-color="#080810"/>
+      <stop offset="1" stop-color="#1b112f"/>
+    </linearGradient>
+
+    <clipPath id="bodyClip">
+      <use href="#iconShape"/>
+    </clipPath>
+  </defs>
+
+  <use href="#iconShape" fill="url(#blackBody)"/>
+
+  <g clip-path="url(#bodyClip)">
+    <use href="#iconShape" transform="translate(-28 -28)" fill="url(#orangeEdge)"/>
+    <use href="#iconShape" transform="translate(28 28)" fill="url(#violetEdge)"/>
+    <path d="M169 329C169 216 242 144 356 144H644C758 144 831 216 831 329V641C831 755 758 827 644 827H356C242 827 169 755 169 641V329Z" fill="url(#simpleGlow)"/>
+    <path d="M212 352C212 252 276 190 376 190H624C724 190 788 252 788 352V617C788 718 724 780 624 780H376C276 780 212 718 212 617V352Z" fill="url(#blackBody)" opacity="0.74"/>
+    <path d="M216 219C274 164 356 153 483 153H642C751 153 819 218 819 324V391C796 254 718 183 604 183H359C280 183 225 204 198 260C186 285 178 317 173 356C177 296 190 244 216 219Z" fill="url(#topHighlight)"/>
+  </g>
+
+  <path d="M188 335C188 230 253 164 358 164H642C747 164 812 230 812 335V635C812 741 747 807 642 807H358C253 807 188 741 188 635V335Z" fill="none" stroke="#ffffff" stroke-opacity="0.04" stroke-width="3"/>
+</svg>

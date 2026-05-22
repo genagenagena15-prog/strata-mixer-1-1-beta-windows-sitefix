@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Strata Mixer</title>
+    <script>
+      // Apply the saved theme before first paint so it survives restarts
+      // without a flash of the wrong theme.
+      try {
+        document.documentElement.setAttribute(
+          'data-theme',
+          localStorage.getItem('strata_theme') === 'light' ? 'light' : 'dark'
+        );
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
