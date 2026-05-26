@@ -1292,3 +1292,38 @@
 .titlebar.mac .theme-toggle:hover{background:#182235;color:#fff}
 [data-theme="light"] .titlebar.mac .theme-toggle{color:#4b4f60}
 [data-theme="light"] .titlebar.mac .theme-toggle:hover{background:rgba(30,36,56,.09);color:#1b1f2c}
+
+/* Muted "Назад" button in onboarding — should be visible but not draw attention */
+.ed-onboard-back{width:auto!important;padding:0 10px!important;border-radius:8px!important;font-size:11px!important;font-weight:600!important;opacity:.45!important;letter-spacing:.02em}
+.ed-onboard-back:hover:not(:disabled){opacity:.85!important}
+.ed-onboard-back:disabled{opacity:.18!important}
+
+/* Mask layer — shape picker in properties panel */
+.ed-mask-shapes{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:8px 0 4px}
+.ed-mask-shape{display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 4px;border:1px solid rgba(140,140,146,.28);background:#15151a;border-radius:9px;color:#cbcbd0;cursor:pointer;transition:border-color .12s,background .12s}
+.ed-mask-shape:hover{border-color:rgba(232,121,249,.55)}
+.ed-mask-shape.active{border-color:#e879f9;background:linear-gradient(135deg,rgba(232,121,249,.18),rgba(163,60,255,.10));color:#fff;box-shadow:0 0 14px rgba(232,121,249,.22)}
+.ed-mask-shape-glyph{font-size:18px;line-height:1}
+.ed-mask-shape-lbl{font-size:11px;font-weight:700;letter-spacing:.02em}
+[data-theme="light"] .ed-mask-shape{background:#fff;border-color:rgba(40,46,70,.18);color:#3a3e4d}
+[data-theme="light"] .ed-mask-shape.active{background:linear-gradient(135deg,rgba(232,121,249,.16),rgba(163,60,255,.08));color:#5e2f7f}
+
+.ed-codec-warn{margin:0 0 10px;padding:10px 12px;border-radius:9px;border:1px solid rgba(255,138,0,.45);background:rgba(255,138,0,.08);color:#ff9821;font-size:12px;line-height:1.45;font-weight:600}
+[data-theme="light"] .ed-codec-warn{color:#a35200;background:rgba(255,138,0,.08);border-color:rgba(255,138,0,.45)}
+
+/* Mask "Apply" — small accent button in the prop-head row */
+.ed-prop-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.ed-mask-apply{height:28px;padding:0 12px;border-radius:8px;border:0;background:linear-gradient(135deg,#e879f9,#a855f7);color:#fff;font-size:11px;font-weight:800;letter-spacing:.04em;cursor:pointer;box-shadow:0 0 12px rgba(232,121,249,.32);transition:transform .12s,box-shadow .12s}
+.ed-mask-apply:hover{transform:translateY(-1px);box-shadow:0 0 20px rgba(232,121,249,.5)}
+
+/* Transitions strength buttons */
+.ed-trans-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:6px}
+.ed-trans-btn{height:36px;font-weight:700;letter-spacing:.02em;border-radius:9px;border:1px solid rgba(140,140,146,.26);background:#15151a;color:#cbcbd0;transition:border-color .12s,background .12s,color .12s,transform .12s}
+.ed-trans-btn:hover{transform:translateY(-1px)}
+.ed-trans-low{border-color:rgba(253,224,71,.35)}
+.ed-trans-low:hover{border-color:#fde047;background:rgba(253,224,71,.08);color:#fde047}
+.ed-trans-mid{border-color:rgba(250,160,32,.42)}
+.ed-trans-mid:hover{border-color:#f59e0b;background:rgba(250,160,32,.10);color:#fbbf24}
+.ed-trans-high{border-color:rgba(248,113,113,.45)}
+.ed-trans-high:hover{border-color:#ef4444;background:rgba(248,113,113,.10);color:#fca5a5}
+[data-theme="light"] .ed-trans-btn{background:#fff;color:#3a3e4d;border-color:rgba(40,46,70,.18)}

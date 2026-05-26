@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.2';
+const APP_VERSION = 'v1.2.3';
 const DONATE_WALLET = 'TGoUEoM6AjG6KjnXJi9hFYRn54c6HsTybE';
 
 const A = {
@@ -1133,6 +1133,11 @@ function Editor({ state, setState }) {
   const videoOverlayRefs = useRef({});
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
+  // Parallel <audio> tags that play the audio track from each videoOverlay
+  // layer. The video elements themselves stay muted (used for canvas frame
+  // capture only), so we mirror them with audio-only HTML elements driven
+  // by the same timeline sync logic.
+  const videoAudioRefs = useRef({});
   const imgCacheRef = useRef(new Map());
   const renderFrameRef = useRef(null);
   const rafRef = useRef(null);
@@ -1234,12 +1239,17 @@ function Editor({ state, setState }) {
     return () => clearTimeout(t);
   }, [onboardStep, layers, edPropTab, totalDuration]);
 
+  // Snapshot the FULL editor state so Ctrl+Z restores everything, not just
+  // layers (also: duration, canvas size, bg, fade, video range, etc.).
   function pushUndo() {
-    setUndoStack(s => [...s.slice(-29), {
-      layers: JSON.parse(JSON.stringify(state.layers)),
-      videoStart: state.videoStart,
-      videoEnd: state.videoEnd,
-    }]);
+    const snap = JSON.parse(JSON.stringify(state));
+    setUndoStack(s => {
+      const top = s[s.length - 1];
+      // Skip if the top of the stack is already identical (avoid duplicate
+      // entries when auto-snapshot races an explicit pushUndo).
+      if (top && JSON.stringify(top) === JSON.stringify(snap)) return s;
+      return [...s.slice(-29), snap];
+    });
   }
 
   const addLayer = (layer) => { pushUndo(); set('layers', (l) => [...l, layer]); setSelectedId(layer.id); setSelectedIds(new Set()); setEdPropTab('props'); };
@@ -1292,6 +1302,140 @@ function Editor({ state, setState }) {
   function addZoom() {
     addLayer({ id: uid(), type: 'zoom', startTime: 0, endTime: Math.min(2, dur), strength: 30 });
   }
+  // Auto-find the nearest clip edge on the timeline so transitions snap to
+  // the place where two clips meet. Falls back to the playhead if no clips.
+  function nearestClipBoundary() {
+    const edges = [];
+    layers.forEach(l => {
+      if (['videoOverlay','maskedVideo','mainVideo','audio','image'].includes(l.type)) {
+        edges.push(l.startTime || 0);
+        edges.push(l.endTime ?? dur);
+      }
+    });
+    if (!edges.length) return currentTime;
+    let best = edges[0], bestDist = Math.abs(currentTime - edges[0]);
+    for (const b of edges) {
+      const d = Math.abs(currentTime - b);
+      if (d < bestDist) { bestDist = d; best = b; }
+    }
+    return best;
+  }
+  function addTransition(strength) {
+    // Combined "punch" transition: a quick flash overlay + camera shake, both
+    // scaled by strength. Auto-sized and auto-positioned at the nearest clip
+    // boundary so it sits across the cut.
+    const presets = {
+      low:  { duration: 0.25, amp: 14, flash: 0.55 },
+      mid:  { duration: 0.35, amp: 32, flash: 0.85 },
+      high: { duration: 0.50, amp: 60, flash: 1.00 },
+    };
+    const p = presets[strength] || presets.mid;
+    const cx = nearestClipBoundary();
+    const half = p.duration / 2;
+    const ls = Math.max(0, Math.min(dur - p.duration, cx - half));
+    addLayer({ id: uid(), type: 'transition', strength,
+      startTime: ls, endTime: ls + p.duration,
+      amp: p.amp, flash: p.flash });
+  }
+  function addMaskRegion() {
+    // Clipping mask: everything composed BELOW this layer is shown only inside
+    // the mask shape; pixels outside become the background colour.
+    // Default to a circle sized in PIXELS (equal w/h), not in % of the canvas —
+    // otherwise a vertical (e.g. 1080×1920) project gets an oblong ellipse.
+    const sizePx = Math.round(Math.min(outWidth, outHeight) * 0.5);
+    const wPct = (sizePx / outWidth) * 100;
+    const hPct = (sizePx / outHeight) * 100;
+    addLayer({ id: uid(), type: 'mask', startTime: 0, endTime: dur, x: 50, y: 50, width: wPct, height: hPct, shape: 'circle', radius: 12 });
+  }
+
+  // Switching to circle/square should snap to equilateral pixel dimensions.
+  // Rounded keeps whatever the user has tuned.
+  function changeMaskShape(layerId, newShape) {
+    if (newShape !== 'circle' && newShape !== 'square') {
+      updLayer(layerId, 'shape', newShape);
+      return;
+    }
+    set('layers', ls => ls.map(x => {
+      if (x.id !== layerId) return x;
+      const curWpx = (x.width / 100) * outWidth;
+      const curHpx = (x.height / 100) * outHeight;
+      const sizePx = Math.max(curWpx, curHpx);
+      const wPct = clamp((sizePx / outWidth) * 100, 5, 100);
+      const hPct = clamp((sizePx / outHeight) * 100, 5, 100);
+      return { ...x, shape: newShape, width: wPct, height: hPct };
+    }));
+  }
+  function applyMask(maskId) {
+    // Find the closest videoOverlay BELOW the mask in stack order, convert it
+    // into a maskedVideo carrying the mask's shape/bounds, then drop both the
+    // mask and the source clip from the layer list.
+    const maskIdx = layers.findIndex(l => l.id === maskId);
+    if (maskIdx < 0) return;
+    const mask = layers[maskIdx];
+    let srcIdx = -1;
+    for (let i = maskIdx - 1; i >= 0; i--) {
+      if (layers[i].type === 'videoOverlay') { srcIdx = i; break; }
+    }
+    if (srcIdx < 0) { alert('Под маской нет видео-клипа. Поставь маску над видео и попробуй снова.'); return; }
+    const src = layers[srcIdx];
+    // Compute which region of the SOURCE video was under the mask at this
+    // moment, so the cut-out shows exactly those pixels (not the centre).
+    // Source-video pixels:
+    const vidEl = videoOverlayRefs.current[src.id];
+    if (!vidEl || !vidEl.videoWidth) {
+      alert('Видео ещё не подгрузилось (возможно идёт перекодировка из HEVC). Подожди пару секунд и нажми Применить снова.');
+      return;
+    }
+    const vAspect = src.aspect || (vidEl.videoWidth / vidEl.videoHeight);
+    const sw = vidEl.videoWidth;
+    const sh = vidEl.videoHeight;
+    // Video bounds on canvas (matches getLayerPx for videoOverlay):
+    const vwC = (src.size || 40) / 100 * outWidth;
+    const vhC = vwC / vAspect;
+    const vxC = (src.x / 100) * outWidth - vwC / 2;
+    const vyC = (src.y / 100) * outHeight - vhC / 2;
+    // Mask bounds on canvas:
+    const mwC = (mask.width / 100) * outWidth;
+    const mhC = (mask.height / 100) * outHeight;
+    const mxC = (mask.x / 100) * outWidth - mwC / 2;
+    const myC = (mask.y / 100) * outHeight - mhC / 2;
+    // Mask region projected onto the source video's pixel space:
+    const srcCrop = {
+      x: ((mxC - vxC) / vwC) * sw,
+      y: ((myC - vyC) / vhC) * sh,
+      w: (mwC / vwC) * sw,
+      h: (mhC / vhC) * sh,
+    };
+    pushUndo();
+    const masked = {
+      // Reuse the source clip's id so the underlying <video> element keeps its
+      // current decoded frames — otherwise React mounts a fresh <video> tag
+      // that needs ~200ms to load, and the user sees a blank cut-out in the
+      // gap. Same id = same DOM element = instant frame after Apply.
+      id: src.id,
+      type: 'maskedVideo',
+      file: src.file,
+      startTime: src.startTime,
+      endTime: src.endTime,
+      srcStart: src.srcStart || 0,
+      srcDuration: src.srcDuration,
+      speed: src.speed,
+      reversed: src.reversed,
+      volume: src.volume ?? 100,
+      ccB: src.ccB, ccC: src.ccC, ccS: src.ccS,
+      // Cut-out geometry inherited from the mask:
+      x: mask.x, y: mask.y, width: mask.width, height: mask.height,
+      shape: mask.shape, radius: mask.radius || 0,
+      // Which slice of the source video was under the mask at Apply time.
+      // The cut-out keeps showing THESE pixels even after you drag it elsewhere.
+      srcCrop,
+    };
+    set('layers', (ls) => ls
+      .filter(l => l.id !== mask.id)
+      .map(l => l.id === src.id ? masked : l));
+    setSelectedId(masked.id);
+    setSelectedIds(new Set());
+  }
   function addTextOverlay() {
     const sysFont = systemFonts[0];
     addLayer({ id: Date.now(), type: 'text', text: '', color: '#ffffff', size: 48, opacity: 100, align: 'center', x: 50, y: 80, startTime: 0, endTime: dur, fontFamily: sysFont?.name || 'Arial', fontFile: sysFont?.file || '' });
@@ -1299,7 +1443,10 @@ function Editor({ state, setState }) {
   async function addVideoOverlay() {
     const files = await window.strata?.pickFiles?.();
     const f = files?.[0];
-    if (f) addLayer({ id: Date.now(), type: 'videoOverlay', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 40 });
+    if (!f) return;
+    const id = Date.now();
+    addLayer({ id, type: 'videoOverlay', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 40 });
+    ensureProxy(id, f);
   }
   async function addAudioFile() {
     const f = await window.strata?.pickAudio?.();
@@ -1307,6 +1454,19 @@ function Editor({ state, setState }) {
   }
 
   const uid = () => 'L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+  // Silently make sure each video file has a Chromium-friendly preview source.
+  // Probes first (fast); only re-encodes if HEVC/AV1/ProRes etc. Result is
+  // cached by file path so reopening or duplicating the layer is instant.
+  function ensureProxy(layerId, filePath) {
+    if (!window.strata?.makeProxy || !filePath) return;
+    window.strata.makeProxy({ file: filePath }).then(res => {
+      if (res?.ok && res.proxyPath) {
+        setState(s => ({ ...s, layers: s.layers.map(x =>
+          x.id === layerId ? { ...x, _proxyFile: res.proxyPath } : x) }));
+      }
+    }).catch(() => {});
+  }
   // Drag-and-drop any media into the editor: videos / images / audio land on
   // the timeline as layers. The first dropped video becomes the main video.
   function addMediaPaths(paths) {
@@ -1330,10 +1490,116 @@ function Editor({ state, setState }) {
     // Auto-select the freshly added layer.
     setSelectedId(added[added.length - 1].id);
     setSelectedIds(new Set());
+    // Background: kick off proxy generation for any HEVC/AV1 videos so the
+    // preview "just plays" without the user seeing codec errors.
+    added.filter(l => l.type === 'videoOverlay').forEach(l => ensureProxy(l.id, l.file));
   }
   function onEditorDrop(e) {
     e.preventDefault();
     addMediaPaths(Array.from(e.dataTransfer?.files || []).map((f) => window.strata?.getPathForFile?.(f)));
+  }
+
+  // Merge 2+ selected video/audio clips into one.
+  // - Same source file + source-contiguous → instant in-renderer merge (undo-split case).
+  // - Different files / non-contiguous → ffmpeg pre-renders a single merged file.
+  async function mergeSelected() {
+    const ids = selectedIds.size > 1 ? [...selectedIds] : (selectedId ? [selectedId] : []);
+    const picked = layers.filter(l => ids.includes(l.id) && (l.type === 'videoOverlay' || l.type === 'audio'));
+    if (picked.length < 2) {
+      alert('Выбери 2 или больше видео/аудио клипа (Ctrl+клик на таймлайне).');
+      return;
+    }
+    if (!picked.every(c => c.type === picked[0].type)) {
+      alert('Выбраны клипы разных типов (видео + аудио). Объедини по отдельности.');
+      return;
+    }
+    const isAudio = picked[0].type === 'audio';
+
+    // Detect the simple split-undo case: same file + source-contiguous slices.
+    picked.sort((a, b) => (a.srcStart || 0) - (b.srcStart || 0));
+    const sameFile = picked.every(c => c.file === picked[0].file);
+    let sourceContiguous = sameFile;
+    for (let i = 0; sourceContiguous && i < picked.length - 1; i++) {
+      const endA = (picked[i].srcStart || 0) + ((picked[i].endTime ?? dur) - (picked[i].startTime || 0));
+      const startB = picked[i + 1].srcStart || 0;
+      if (Math.abs(endA - startB) > 0.05) sourceContiguous = false;
+    }
+
+    if (sameFile && sourceContiguous) {
+      // Fast path — keeps the original file reference, no re-encode.
+      const first = picked[0];
+      const totalLen = picked.reduce((sum, c) => sum + ((c.endTime ?? dur) - (c.startTime || 0)), 0);
+      const startsAt = Math.min(...picked.map(c => c.startTime || 0));
+      const merged = {
+        ...first,
+        startTime: startsAt,
+        endTime: Math.min(dur, startsAt + totalLen),
+        srcStart: first.srcStart || 0,
+      };
+      pushUndo();
+      const keepIds = new Set(picked.map(c => c.id).filter(id => id !== first.id));
+      set('layers', ls => ls
+        .filter(l => !keepIds.has(l.id))
+        .map(l => l.id === first.id ? merged : l));
+      setSelectedId(first.id);
+      setSelectedIds(new Set());
+      return;
+    }
+
+    // Heavy path — ffmpeg concat. Play order = timeline order so the merged
+    // clip sounds/looks the way the user arranged them.
+    picked.sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
+    const clips = picked.map(c => ({
+      file: c.file,
+      srcStart: c.srcStart || 0,
+      length: (c.endTime ?? dur) - (c.startTime || 0),
+      speed: c.speed || 100,
+      reversed: !!c.reversed,
+    }));
+    const startsAt = Math.min(...picked.map(c => c.startTime || 0));
+    const totalLen = clips.reduce((s, c) => s + c.length, 0);
+
+    setSaveFinishing(false);
+    setSaveProgress(0);
+    const offProg = window.strata?.onMergeProgress?.((d) => {
+      setSaveProgress(Math.max(0, Math.min(99, Math.round(d.percent || 0))));
+    });
+
+    let res;
+    try {
+      res = await window.strata?.mergeClips?.({
+        clips, w: outWidth, h: outHeight, isAudio,
+      });
+    } catch (e) { res = { ok: false, error: String(e.message || e) }; }
+
+    offProg?.();
+    setSaveProgress(null);
+
+    if (!res?.ok) {
+      alert('Не получилось объединить: ' + (res?.error || 'неизвестная ошибка'));
+      return;
+    }
+
+    pushUndo();
+    const first = picked[0];
+    const merged = {
+      ...first,
+      file: res.path,
+      startTime: startsAt,
+      endTime: Math.min(dur, startsAt + totalLen),
+      srcStart: 0,
+      srcDuration: totalLen,
+      speed: 100,
+      reversed: false,
+      // Reset codec-specific cached metadata that no longer matches the new file.
+      aspect: undefined,
+    };
+    const keepIds = new Set(picked.map(c => c.id).filter(id => id !== first.id));
+    set('layers', ls => ls
+      .filter(l => !keepIds.has(l.id))
+      .map(l => l.id === first.id ? merged : l));
+    setSelectedId(first.id);
+    setSelectedIds(new Set());
   }
 
   function splitAtPlayhead() {
@@ -1409,7 +1675,7 @@ function Editor({ state, setState }) {
       }
     }
     layers.forEach(l => {
-      if (l.type === 'videoOverlay') {
+      if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
         const el = videoOverlayRefs.current[l.id];
         if (!el) return;
         let t;
@@ -1424,7 +1690,37 @@ function Editor({ state, setState }) {
         } else {
           t = srcOff + Math.max(0, currentTime - (l.startTime || 0)) * spd;
         }
-        if (Math.abs(el.currentTime - t) > 0.08) el.currentTime = t;
+        // When the timeline is PLAYING, let the element play naturally and
+        // only resync if it drifts a lot (>0.3s). When paused/scrubbing we
+        // keep the element pinned tightly to the playhead.
+        const inRange = currentTime >= (l.startTime || 0) && currentTime <= (l.endTime ?? dur);
+        const tightSync = !playing;
+        const driftLimit = tightSync ? 0.08 : 0.3;
+        if (Math.abs(el.currentTime - t) > driftLimit) {
+          try { el.currentTime = t; } catch {}
+        }
+        try { el.playbackRate = spd; } catch {}
+        // Actually play the hidden <video> so frames decode smoothly — the
+        // canvas renderer copies the live frames to its cache each RAF tick.
+        // Reverse can't be played natively; that case still uses scrubbing.
+        if (playing && inRange && !l.reversed) {
+          if (el.paused) el.play().catch(() => {});
+        } else if (!el.paused) {
+          try { el.pause(); } catch {}
+        }
+
+        // Mirror the video's audio track via a parallel hidden <audio> element
+        // so the user actually hears the clip in preview. Reversed clips have
+        // no live audio (HTML5 can't play in reverse) — silenced.
+        const aEl = videoAudioRefs.current[l.id];
+        if (aEl) {
+          if (Math.abs(aEl.currentTime - t) > 0.12) aEl.currentTime = t;
+          try { aEl.playbackRate = spd; } catch {}
+          aEl.volume = Math.max(0, Math.min(1, ((l.volume ?? 100) / 100)));
+          if (playing && inRange && !l.reversed && !l.muted) {
+            if (aEl.paused) aEl.play().catch(() => {});
+          } else if (!aEl.paused) aEl.pause();
+        }
       } else if (l.type === 'audio') {
         const el = audioLayerRefs.current[l.id];
         if (!el) return;
@@ -1454,22 +1750,79 @@ function Editor({ state, setState }) {
     return () => { running = false; cancelAnimationFrame(rafRef.current); };
   }, []);
 
-  // Ctrl+Z undo
+  // Subscribe to proxy-encode progress events. The backend emits the
+  // current % per source file; we mirror it onto every layer using that file.
+  useEffect(() => {
+    const off = window.strata?.onProxyProgress?.((d) => {
+      if (!d?.file) return;
+      setState(s => ({ ...s, layers: s.layers.map(x => (x.file === d.file && x._proxyMaking)
+        ? { ...x, _proxyProgress: Math.round(d.percent || 0) } : x) }));
+    });
+    return () => off?.();
+  }, []);
+
+  // Ctrl+Z undo — restores the full previous editor state. Registered on
+  // capture phase so it always wins over inputs / focused buttons.
   useEffect(() => {
     const handler = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
-        e.preventDefault();
-        setUndoStack(s => {
-          if (!s.length) return s;
-          const prev = s[s.length - 1];
-          setState(st => ({ ...st, ...prev }));
-          return s.slice(0, -1);
-        });
+      if (!((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z' || e.code === 'KeyZ') && !e.shiftKey && !e.altKey)) return;
+      // Flush any pending auto-snapshot so the in-flight state change made
+      // micro-seconds ago is recorded BEFORE we pop the stack.
+      if (snapshotTimerRef.current) {
+        clearTimeout(snapshotTimerRef.current);
+        snapshotTimerRef.current = null;
+        const prevJson = lastSnapshotRef.current;
+        if (prevJson && prevJson !== JSON.stringify(state)) {
+          setUndoStack(s => {
+            const top = s[s.length - 1];
+            if (top && JSON.stringify(top) === prevJson) return s;
+            return [...s.slice(-29), JSON.parse(prevJson)];
+          });
+          lastSnapshotRef.current = JSON.stringify(state);
+        }
       }
+      e.preventDefault();
+      e.stopPropagation();
+      setUndoStack(s => {
+        if (!s.length) return s;
+        const prev = s[s.length - 1];
+        // Replace the whole state so duration, canvas, bg etc. all restore.
+        setState(() => JSON.parse(JSON.stringify(prev)));
+        // Move focus off any input so the next keystroke isn't intercepted.
+        try { document.activeElement?.blur?.(); } catch {}
+        undoApplyingRef.current = true;
+        return s.slice(0, -1);
+      });
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, []);
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
+  }, [state]);
+
+  // Auto-snapshot: any time state actually changes, push the PREVIOUS state
+  // onto the undo stack after a short debounce. This catches everything that
+  // doesn't call pushUndo() explicitly — slider tweaks, text edits, color
+  // picks, duration changes, canvas resize, bg colour, fade, etc.
+  const lastSnapshotRef = useRef(null);
+  const snapshotTimerRef = useRef(null);
+  const undoApplyingRef = useRef(false);
+  useEffect(() => {
+    const curJson = JSON.stringify(state);
+    // First render — just record baseline, don't push to stack.
+    if (lastSnapshotRef.current === null) { lastSnapshotRef.current = curJson; return; }
+    // Skip the snapshot triggered by Ctrl+Z restoring state.
+    if (undoApplyingRef.current) { undoApplyingRef.current = false; lastSnapshotRef.current = curJson; return; }
+    if (curJson === lastSnapshotRef.current) return;
+    const prevJson = lastSnapshotRef.current;
+    clearTimeout(snapshotTimerRef.current);
+    snapshotTimerRef.current = setTimeout(() => {
+      setUndoStack(s => {
+        const top = s[s.length - 1];
+        if (top && JSON.stringify(top) === prevJson) return s; // dedupe
+        return [...s.slice(-29), JSON.parse(prevJson)];
+      });
+      lastSnapshotRef.current = curJson;
+    }, 400);
+  }, [state]);
 
   // Spacebar toggles playback, Delete removes selected layers.
   function copySelected() {
@@ -1585,59 +1938,60 @@ function Editor({ state, setState }) {
       const hsign = handle.includes('e') ? 1 : handle.includes('w') ? -1 : 0;
       const vsign = handle.includes('s') ? 1 : handle.includes('n') ? -1 : 0;
       const isCorner = hsign !== 0 && vsign !== 0;
-      // Resize anchored to the OPPOSITE edge/corner: the side you don't drag
-      // stays put. Hold Shift on a corner to keep the original proportions.
+      // Center-based resize: both sides grow/shrink symmetrically from the
+      // layer's center. The dragged edge tracks the cursor (Δ added once),
+      // the opposite edge mirrors (Δ subtracted) — so total dimension changes
+      // by 2Δ and the centre stays put.
       const startCx = (L.x / 100) * W, startCy = (L.y / 100) * H;
       const move = (ev) => {
         const dxPx = ((ev.clientX - sx) / r.width) * W;
         const dyPx = ((ev.clientY - sy) / r.height) * H;
         const keepAspect = ev.shiftKey;
-        if (L.type === 'blur') {
+        if (L.type === 'blur' || L.type === 'mask' || L.type === 'maskedVideo') {
           let nw = startW, nh = startH;
-          if (hsign) nw = Math.max(0.05 * W, startW + dxPx * hsign);
-          if (vsign) nh = Math.max(0.05 * H, startH + dyPx * vsign);
-          const ncx = hsign ? startCx + (nw - startW) / 2 * hsign : startCx;
-          const ncy = vsign ? startCy + (nh - startH) / 2 * vsign : startCy;
+          if (hsign) nw = Math.max(0.05 * W, startW + dxPx * hsign * 2);
+          if (vsign) nh = Math.max(0.05 * H, startH + dyPx * vsign * 2);
+          if (keepAspect && isCorner) {
+            const ratio = startW / startH;
+            if (Math.abs(nw / startW - 1) > Math.abs(nh / startH - 1)) nh = nw / ratio;
+            else nw = nh * ratio;
+          }
           set('layers', (ls) => ls.map(x => x.id === id ? { ...x,
             width: Math.max(5, Math.min(100, nw / W * 100)),
             height: Math.max(5, Math.min(100, nh / H * 100)),
-            x: clamp(ncx / W * 100, 0, 100), y: clamp(ncy / H * 100, 0, 100) } : x));
+            x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
           return;
         }
         if (L.type === 'text') {
           let ratio = 1;
-          if (hsign) ratio = (startW + dxPx * hsign) / startW;
-          else if (vsign) ratio = (startH + dyPx * vsign) / startH;
+          if (hsign) ratio = (startW + dxPx * hsign * 2) / startW;
+          else if (vsign) ratio = (startH + dyPx * vsign * 2) / startH;
           ratio = Math.max(0.1, ratio);
           const ns = Math.max(8, Math.min(400, Math.round((L.size || 48) * ratio)));
-          const ncx = hsign ? startCx + (startW * (ratio - 1)) / 2 * hsign : startCx;
-          const ncy = vsign ? startCy + (startH * (ratio - 1)) / 2 * vsign : startCy;
           set('layers', (ls) => ls.map(x => x.id === id ? { ...x, size: ns,
-            x: clamp(ncx / W * 100, 0, 100), y: clamp(ncy / H * 100, 0, 100) } : x));
+            x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
           return;
         }
         // media layers: image / mainVideo / videoOverlay
         let nw, nh;
         if (isCorner) {
-          nw = Math.max(0.03 * W, startW + dxPx * hsign);
-          nh = Math.max(0.03 * H, startH + dyPx * vsign);
+          nw = Math.max(0.03 * W, startW + dxPx * hsign * 2);
+          nh = Math.max(0.03 * H, startH + dyPx * vsign * 2);
           if (keepAspect) {
             const s = Math.max(nw / startW, nh / startH);
             nw = startW * s; nh = startH * s;
           }
         } else if (hsign) {
-          nw = Math.max(0.03 * W, startW + dxPx * hsign);
+          nw = Math.max(0.03 * W, startW + dxPx * hsign * 2);
           nh = nw * (startH / startW);
         } else {
-          nh = Math.max(0.03 * H, startH + dyPx * vsign);
+          nh = Math.max(0.03 * H, startH + dyPx * vsign * 2);
           nw = nh * (startW / startH);
         }
         const nsize = Math.max(3, Math.min(400, nw / W * 100));
         const naspect = nw / nh;
-        const ncx = hsign ? startCx + (nw - startW) / 2 * hsign : startCx;
-        const ncy = vsign ? startCy + (nh - startH) / 2 * vsign : startCy;
         set('layers', (ls) => ls.map(x => x.id === id ? { ...x, size: nsize, aspect: naspect,
-          x: clamp(ncx / W * 100, 0, 100), y: clamp(ncy / H * 100, 0, 100) } : x));
+          x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
       };
       const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
       window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
@@ -1735,13 +2089,40 @@ function Editor({ state, setState }) {
     };
   }
 
+  // Stop video + audio playback. Called whenever the user grabs the playhead
+  // (timeline ruler or playback bar scrub) so scrubbing doesn't fight playback.
+  function pausePlayback() {
+    const v = videoRef.current;
+    try { if (v && !v.paused) v.pause(); } catch {}
+    setPlaying(false);
+  }
+
+  // Snap a candidate time `t` to the nearest clip edge / 0 / dur, when held.
+  // Mirrors the per-layer snap behaviour so scrubbing feels consistent.
+  function snapTime(t, shiftKey) {
+    if (!shiftKey) return t;
+    const targets = [0, dur];
+    for (const o of layers) {
+      targets.push(o.startTime || 0);
+      targets.push(o.endTime ?? dur);
+    }
+    let best = t, bd = dur * 0.025;
+    for (const tg of targets) {
+      if (Math.abs(t - tg) < bd) { bd = Math.abs(t - tg); best = tg; }
+    }
+    return best;
+  }
+
   function timelineSeek(e) {
     if (!timelineRef.current) return;
     const r = timelineRef.current.getBoundingClientRect();
-    seekTo(Math.max(0, Math.min(dur, ((e.clientX - r.left) / r.width) * dur)));
+    let t = Math.max(0, Math.min(dur, ((e.clientX - r.left) / r.width) * dur));
+    t = snapTime(t, e.shiftKey);
+    seekTo(t);
   }
   function onRulerPointerDown(e) {
     e.preventDefault();
+    pausePlayback();
     timelineSeek(e);
     const move = ev => timelineSeek(ev);
     const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
@@ -1752,9 +2133,14 @@ function Editor({ state, setState }) {
   async function saveAs(fmt, qual) {
     const ext = fmt === 'mp3' ? 'mp3' : fmt === 'webm' ? 'webm' : 'mp4';
     // The bottom-most video layer is the export base; every other layer is an overlay.
+    // For audio-only projects (no video at all), fall back to the first audio
+    // layer as input 0 so ffmpeg has a real source to read from.
     const vids = layers.filter(l => l.type === 'videoOverlay' && !l.hidden);
+    const auds = layers.filter(l => l.type === 'audio' && !l.hidden);
     const baseVid = vids[0] || null;
-    const baseFile = baseVid?.file || file || null;
+    const baseAud = (!baseVid && auds.length > 0) ? auds[0] : null;
+    const baseFile = baseVid?.file || baseAud?.file || file || null;
+    if (!baseFile) { alert('Нет ни одного видео или аудио для сохранения.'); return; }
     const outPath = await window.strata?.pickSaveAs?.(fileName(baseFile || '').replace(/\.[^.]+$/, '') + `_edit.${ext}`, fmt);
     if (!outPath) return;
     setSaveDialogOpen(false);
@@ -1769,13 +2155,24 @@ function Editor({ state, setState }) {
         setSaveProgress(Math.round(d.percent || 0));
       }
     });
+    // When the base file IS an audio layer (audio-only project), give the
+    // backend the real source/timeline split so trimming works — otherwise it
+    // dumps the whole original file ignoring atrim.
+    const baseAudioPayload = baseAud ? {
+      srcStart: baseAud.srcStart || 0,
+      length: Math.max(0.01, (baseAud.endTime ?? totalDuration) - (baseAud.startTime || 0)),
+      startTime: baseAud.startTime || 0,
+      volume: baseAud.volume ?? 100,
+    } : null;
     const result = await window.strata?.editVideo?.({
       file: baseFile,
-      videoStart: baseVid ? (baseVid.startTime || 0) : (videoStart || 0),
-      videoEnd: baseVid ? (baseVid.endTime ?? totalDuration) : (videoEnd || totalDuration),
+      videoStart: baseVid ? (baseVid.startTime || 0) : baseAud ? (baseAud.startTime || 0) : (videoStart || 0),
+      videoEnd: baseVid ? (baseVid.endTime ?? totalDuration) : baseAud ? (baseAud.endTime ?? totalDuration) : (videoEnd || totalDuration),
       totalDuration,
       mainVideo: baseVid ? { ...baseVid, type: 'mainVideo' } : (layers.find(l => l.type === 'mainVideo' && !l.hidden) || null),
-      layers: layers.filter(l => !l.hidden && l !== baseVid && l.type !== 'mainVideo'),
+      baseAudio: baseAudioPayload,
+      // Exclude whichever layer became input 0 so it isn't doubled.
+      layers: layers.filter(l => !l.hidden && l !== baseVid && l !== baseAud && l.type !== 'mainVideo'),
       outWidth, outHeight, bgColor, fadeIn, fadeOut, outPath,
       format: fmt, quality: qual, custom: saveCustom
     });
@@ -1795,11 +2192,17 @@ function Editor({ state, setState }) {
     if (l.type === 'videoOverlay') return '#38bdf8';
     if (l.type === 'audio') return '#34d399';
     if (l.type === 'zoom') return '#fb923c';
+    if (l.type === 'mask') return '#e879f9';
+    if (l.type === 'maskedVideo') return '#c084fc';
+    if (l.type === 'transition') return '#fde047';
     return '#aaa';
   }
   function lIcon(l) {
     if (l.type === 'mainVideo') return '🎬';
     if (l.type === 'audio') return '🎵';
+    if (l.type === 'mask') return '◐';
+    if (l.type === 'maskedVideo') return '◐';
+    if (l.type === 'transition') return '⚡';
     return l.type === 'text' ? 'T' : l.type === 'blur' ? '◎' : l.type === 'image' ? '🖼' : '🎬';
   }
   function lName(l) {
@@ -1808,6 +2211,12 @@ function Editor({ state, setState }) {
     if (l.type === 'text') return l.text?.slice(0, 8) || 'Текст';
     if (l.type === 'blur') return 'Блюр';
     if (l.type === 'zoom') return 'Зум';
+    if (l.type === 'mask') return 'Маска';
+    if (l.type === 'maskedVideo') return 'Вырезка' + rev;
+    if (l.type === 'transition') {
+      const lbl = { low: 'слаб.', mid: 'сред.', high: 'сильн.' }[l.strength] || '';
+      return 'Переход ' + lbl;
+    }
     return compactName(fileName(l.file || ''), 9) + rev;
   }
 
@@ -1840,7 +2249,7 @@ function Editor({ state, setState }) {
       const w = (layer.size || 30) / 100 * W, h = w / aspect;
       return { w, h, x: (layer.x / 100) * W - w / 2, y: (layer.y / 100) * H - h / 2 };
     }
-    if (layer.type === 'blur') {
+    if (layer.type === 'blur' || layer.type === 'mask' || layer.type === 'maskedVideo') {
       const w = (layer.width || 50) / 100 * W, h = (layer.height || 30) / 100 * H;
       return { w, h, x: (layer.x / 100) * W - w / 2, y: (layer.y / 100) * H - h / 2 };
     }
@@ -1910,6 +2319,44 @@ function Editor({ state, setState }) {
           ctx.filter = 'none';
           ctx.restore();
         }
+      } else if (layer.type === 'mask') {
+        // Clipping mask: keep canvas pixels only INSIDE the shape, rest erased
+        // and refilled with the background colour so the mask reads as a hole.
+        const b = getLayerPx(layer);
+        const r = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
+        // 1) Snapshot the current composition (everything below the mask).
+        const tmp = blurTmpRef.current || (blurTmpRef.current = document.createElement('canvas'));
+        if (tmp.width !== W) tmp.width = W;
+        if (tmp.height !== H) tmp.height = H;
+        const tctx = tmp.getContext('2d');
+        tctx.clearRect(0, 0, W, H);
+        try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+        // 2) Wipe the main canvas back to bg colour.
+        ctx.save();
+        ctx.fillStyle = bgColor || '#000000';
+        ctx.fillRect(0, 0, W, H);
+        // 3) Re-draw the snapshot clipped by the shape.
+        ctx.beginPath();
+        if (layer.shape === 'circle') {
+          ctx.ellipse(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, 0, 0, Math.PI * 2);
+        } else if (layer.shape === 'rounded') {
+          // Manual rounded-rect path (works in older Chromium without roundRect).
+          const x0 = b.x, y0 = b.y, x1 = b.x + b.w, y1 = b.y + b.h;
+          ctx.moveTo(x0 + r, y0);
+          ctx.lineTo(x1 - r, y0);
+          ctx.arcTo(x1, y0, x1, y0 + r, r);
+          ctx.lineTo(x1, y1 - r);
+          ctx.arcTo(x1, y1, x1 - r, y1, r);
+          ctx.lineTo(x0 + r, y1);
+          ctx.arcTo(x0, y1, x0, y1 - r, r);
+          ctx.lineTo(x0, y0 + r);
+          ctx.arcTo(x0, y0, x0 + r, y0, r);
+        } else {
+          ctx.rect(b.x, b.y, b.w, b.h);
+        }
+        ctx.clip();
+        try { ctx.drawImage(tmp, 0, 0); } catch(e) {}
+        ctx.restore();
       } else if (layer.type === 'text') {
         const fs = layer.size || 48;
         ctx.save();
@@ -1940,6 +2387,99 @@ function Editor({ state, setState }) {
           try { ctx.drawImage(cache, b.x, b.y, b.w, b.h); } catch(e) {}
         }
         if (hasCC) ctx.restore();
+      } else if (layer.type === 'maskedVideo') {
+        const ov = videoOverlayRefs.current[layer.id];
+        const b = getLayerPx(layer);
+        const r = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
+        // Frame cache — keeps the last successfully decoded video frame so the
+        // cut-out doesn't go black during seek/play transients (same trick the
+        // plain videoOverlay branch uses).
+        let cache = videoFrameCacheRef.current.get(layer.id);
+        // Refresh cache from the live video element when it's ready.
+        if (ov && ov.readyState >= 2 && ov.videoWidth) {
+          if (!cache) { cache = document.createElement('canvas'); videoFrameCacheRef.current.set(layer.id, cache); }
+          if (cache.width !== ov.videoWidth) cache.width = ov.videoWidth;
+          if (cache.height !== ov.videoHeight) cache.height = ov.videoHeight;
+          try { cache.getContext('2d').drawImage(ov, 0, 0); } catch(e) {}
+        }
+        ctx.save();
+        // Build the cut-out shape and clip to it.
+        ctx.beginPath();
+        if (layer.shape === 'circle') {
+          ctx.ellipse(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, 0, 0, Math.PI * 2);
+        } else if (layer.shape === 'rounded') {
+          const x0 = b.x, y0 = b.y, x1 = b.x + b.w, y1 = b.y + b.h;
+          ctx.moveTo(x0 + r, y0);
+          ctx.lineTo(x1 - r, y0);
+          ctx.arcTo(x1, y0, x1, y0 + r, r);
+          ctx.lineTo(x1, y1 - r);
+          ctx.arcTo(x1, y1, x1 - r, y1, r);
+          ctx.lineTo(x0 + r, y1);
+          ctx.arcTo(x0, y1, x0, y1 - r, r);
+          ctx.lineTo(x0, y0 + r);
+          ctx.arcTo(x0, y0, x0 + r, y0, r);
+        } else {
+          ctx.rect(b.x, b.y, b.w, b.h);
+        }
+        ctx.clip();
+        // Optional CC.
+        const ccf = `brightness(${100 + (layer.ccB || 0)}%) contrast(${layer.ccC ?? 100}%) saturate(${layer.ccS ?? 100}%)`;
+        if (ccf !== 'brightness(100%) contrast(100%) saturate(100%)') ctx.filter = ccf;
+        // Always draw from the cache canvas — drawImage from a canvas is more
+        // reliable than from a live <video> element that may be mid-seek.
+        const src = (cache && cache.width) ? cache : null;
+        if (src) {
+          if (layer.srcCrop) {
+            const c = layer.srcCrop;
+            const sx = Math.max(0, Math.min(src.width - 1, c.x));
+            const sy = Math.max(0, Math.min(src.height - 1, c.y));
+            const sw = Math.max(1, Math.min(src.width - sx, c.w));
+            const sh = Math.max(1, Math.min(src.height - sy, c.h));
+            try { ctx.drawImage(src, sx, sy, sw, sh, b.x, b.y, b.w, b.h); } catch(e) {}
+          } else {
+            const vAsp = src.width / src.height;
+            const bAsp = b.w / b.h;
+            let dw, dh, dx, dy;
+            if (vAsp > bAsp) { dh = b.h; dw = dh * vAsp; dx = b.x + (b.w - dw) / 2; dy = b.y; }
+            else             { dw = b.w; dh = dw / vAsp; dx = b.x; dy = b.y + (b.h - dh) / 2; }
+            try { ctx.drawImage(src, dx, dy, dw, dh); } catch(e) {}
+          }
+        }
+        ctx.restore();
+      } else if (layer.type === 'transition') {
+        // Shake + flash combo. Applies to everything composed below.
+        const tls = layer.startTime || 0, tle = layer.endTime ?? dur;
+        const span = Math.max(0.01, tle - tls);
+        const tProg = Math.max(0, Math.min(1, (currentTime - tls) / span));
+        const t = currentTime;
+        const amp = (layer.amp || 30);
+        // Two-axis noisy shake using stacked sines, attenuated toward the end.
+        const decay = 1 - tProg * 0.85;
+        const ox = (Math.sin(t * 113) * 0.6 + Math.sin(t * 187) * 0.4) * amp * decay;
+        const oy = (Math.cos(t * 97)  * 0.6 + Math.cos(t * 151) * 0.4) * amp * decay;
+        // Snapshot current canvas, redraw shifted (so the shake affects every
+        // layer below). Background gets refilled with bg color underneath.
+        const tmp = blurTmpRef.current || (blurTmpRef.current = document.createElement('canvas'));
+        if (tmp.width !== W) tmp.width = W;
+        if (tmp.height !== H) tmp.height = H;
+        const tctx = tmp.getContext('2d');
+        tctx.clearRect(0, 0, W, H);
+        try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+        ctx.fillStyle = bgColor || '#000000';
+        ctx.fillRect(0, 0, W, H);
+        try { ctx.drawImage(tmp, ox, oy); } catch(e) {}
+        // White flash: spike at the front of the transition then fade.
+        const flashMax = layer.flash ?? 0.85;
+        let alpha;
+        if (tProg < 0.15) alpha = (tProg / 0.15) * flashMax;
+        else              alpha = Math.max(0, flashMax * (1 - (tProg - 0.15) / 0.85));
+        if (alpha > 0.001) {
+          ctx.save();
+          ctx.globalAlpha = Math.min(1, alpha);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, W, H);
+          ctx.restore();
+        }
       } else if (layer.type === 'zoom') {
         // Zoom ramps the whole composition: 1× → max at the midpoint → 1× at the end.
         const zls = layer.startTime || 0, zle = layer.endTime ?? dur;
@@ -2059,13 +2599,9 @@ function Editor({ state, setState }) {
             <h2>{ONBOARD_STEPS[onboardStep].t}</h2>
             <p>{ONBOARD_STEPS[onboardStep].d}</p>
             <div className="ed-onboard-nav">
-              <button className="ed-onboard-arrow" disabled={onboardStep <= 0} title="Назад"
-                onClick={() => setOnboardStep(s => Math.max(0, s - 1))}>‹</button>
               <div className="ed-onboard-dots">
                 {ONBOARD_STEPS.map((_, i) => <i key={i} className={i === onboardStep ? 'on' : i < onboardStep ? 'done' : ''} />)}
               </div>
-              <button className="ed-onboard-arrow" disabled={onboardStep >= ONBOARD_STEPS.length - 1} title="Вперёд"
-                onClick={() => setOnboardStep(s => Math.min(ONBOARD_STEPS.length - 1, s + 1))}>›</button>
             </div>
             <label className="ed-onboard-skip">
               <input type="checkbox" checked={onboardSkip} onChange={e => setOnboardSkip(e.target.checked)} />
@@ -2076,7 +2612,7 @@ function Editor({ state, setState }) {
                 ? <button className="btn primary" onClick={closeOnboard}>Все понял</button>
                 : ONBOARD_STEPS[onboardStep].manual
                   ? <button className="btn primary" onClick={() => setOnboardStep(s => s + 1)}>Понял</button>
-                  : <button className="btn primary" onClick={closeOnboard}>Я всё знаю</button>}
+                  : null}
             </div>
           </div>
         </div>,
@@ -2148,7 +2684,13 @@ function Editor({ state, setState }) {
             onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(heightStr)||1920));setHeightStr(String(v));set('outHeight',v);}}
             onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
         </div>
-        <button className="btn primary ed-save-btn" data-onb="save" onClick={() => setSaveDialogOpen(true)} disabled={!layers.some(l=>l.type==='videoOverlay')||saveProgress!==null}>Сохранить</button>
+        <button className="btn primary ed-save-btn" data-onb="save" onClick={() => {
+          // Audio-only project? Default the save format to MP3 so the dialog is sensible.
+          const hasVideo = layers.some(l => l.type === 'videoOverlay');
+          const hasAudio = layers.some(l => l.type === 'audio');
+          if (!hasVideo && hasAudio) setSaveFmt('mp3');
+          setSaveDialogOpen(true);
+        }} disabled={!layers.some(l=>l.type==='videoOverlay'||l.type==='audio')||saveProgress!==null}>Сохранить</button>
       </div>
 
       {/* ── WORKSPACE: Preview + Properties ── */}
@@ -2169,21 +2711,43 @@ function Editor({ state, setState }) {
             style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0, pointerEvents:'none' }} />}
           {file && <video ref={videoRevRef} key={`rev-${file}`} src={fileUrl(file)} muted playsInline preload="auto"
             style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0, pointerEvents:'none' }} />}
-          {layers.filter(l => l.type === 'videoOverlay').map(l => (
-            <video key={l.id}
+          {/* Audio-only mirror of each video layer's soundtrack. Use proxy
+              when available so HEVC/AV1 files actually play in preview. */}
+          {layers.filter(l => l.type === 'videoOverlay' || l.type === 'maskedVideo').map(l => (
+            <audio key={`a-${l.id}-${l._proxyFile ? 'p' : 'o'}`}
+              ref={el => { if (el) videoAudioRefs.current[l.id] = el; else delete videoAudioRefs.current[l.id]; }}
+              src={fileUrl(l._proxyFile || l.file)} preload="auto"
+              style={{ display:'none' }} />
+          ))}
+          {layers.filter(l => l.type === 'videoOverlay' || l.type === 'maskedVideo').map(l => (
+            <video key={`${l.id}-${l._proxyFile ? 'p' : 'o'}`}
               ref={el => { if (el) videoOverlayRefs.current[l.id] = el; else delete videoOverlayRefs.current[l.id]; }}
-              src={fileUrl(l.file)} muted playsInline preload="auto"
+              src={fileUrl(l._proxyFile || l.file)} muted playsInline preload="auto"
+              onError={() => {
+                // Silent safety net: if the proactive proxy didn't fire (e.g.
+                // a file that probed as supported but turned out to fail at
+                // decode time), kick off a forced proxy build now. No UI.
+                if (l._proxyFile) return;
+                window.strata?.makeProxy?.({ file: l.file, force: true }).then(res => {
+                  if (res?.ok && res.proxyPath) {
+                    setState(s => ({ ...s, layers: s.layers.map(x =>
+                      x.id === l.id ? { ...x, _proxyFile: res.proxyPath } : x) }));
+                  }
+                });
+              }}
               onLoadedMetadata={(e) => {
                 const d = e.target.duration;
                 if (!(d > 0)) return;
                 setState((s) => {
                   const next = { ...s };
-                  if (Math.abs(s.totalDuration - 10) < 0.01) next.totalDuration = d;
+                  const autoFit = Math.abs(s.totalDuration - 10) < 0.01;
+                  if (autoFit) next.totalDuration = d;
                   next.layers = s.layers.map((lay) => {
                     if (lay.id !== l.id) return lay;
                     const srcDur = lay.srcDuration || d;
                     const maxEnd = (lay.startTime || 0) + Math.max(0.1, srcDur - (lay.srcStart || 0));
-                    return { ...lay, srcDuration: srcDur, endTime: Math.min(lay.endTime ?? maxEnd, maxEnd) };
+                    const newEnd = autoFit ? maxEnd : Math.min(lay.endTime ?? maxEnd, maxEnd);
+                    return { ...lay, srcDuration: srcDur, endTime: newEnd };
                   });
                   return next;
                 });
@@ -2194,6 +2758,29 @@ function Editor({ state, setState }) {
             <audio key={l.id}
               ref={el => { if (el) audioLayerRefs.current[l.id] = el; else delete audioLayerRefs.current[l.id]; }}
               src={fileUrl(l.file)} preload="auto"
+              onLoadedMetadata={(e) => {
+                const d = e.target.duration;
+                if (!(d > 0) || !isFinite(d)) return;
+                setState((s) => {
+                  const next = { ...s };
+                  // Auto-fit the project length to this audio if the user hasn't
+                  // touched the duration yet (still the default 10s).
+                  const autoFit = Math.abs(s.totalDuration - 10) < 0.01;
+                  if (autoFit) next.totalDuration = d;
+                  next.layers = s.layers.map((lay) => {
+                    if (lay.id !== l.id) return lay;
+                    const srcDur = lay.srcDuration || d;
+                    const maxEnd = (lay.startTime || 0) + Math.max(0.1, srcDur - (lay.srcStart || 0));
+                    // If we just expanded the project to fit this audio, also
+                    // stretch the clip itself to span the full new duration.
+                    const newEnd = autoFit ? maxEnd : Math.min(lay.endTime ?? maxEnd, maxEnd);
+                    // Remember real source length so the right-handle drag can't
+                    // stretch the clip past it (matches video-layer behaviour).
+                    return { ...lay, srcDuration: srcDur, endTime: newEnd };
+                  });
+                  return next;
+                });
+              }}
               style={{ display:'none' }} />
           ))}
 
@@ -2248,8 +2835,13 @@ function Editor({ state, setState }) {
             <button className="ed-pb-btn" title="+5 сек" onClick={() => seekTo(Math.min(dur, currentTime+5))}>⏭</button>
             <div className="ed-scrub" onPointerDown={e => {
               e.preventDefault();
+              pausePlayback();
               const r = e.currentTarget.getBoundingClientRect();
-              const seek = (ev) => seekTo(Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur)));
+              const seek = (ev) => {
+                let t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
+                t = snapTime(t, ev.shiftKey);
+                seekTo(t);
+              };
               seek(e);
               const move = (ev) => seek(ev);
               const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
@@ -2309,6 +2901,59 @@ function Editor({ state, setState }) {
             </div>
           )}
 
+          {/* Mask + masked-video share the same shape-editor block. */}
+          {(sel?.type === 'mask' || sel?.type === 'maskedVideo') && (() => {
+            const locked = sel.shape === 'circle' || sel.shape === 'square';
+            // For "Размер" slider in locked mode: edit the larger pixel dim.
+            const sizePx = Math.max((sel.width / 100) * outWidth, (sel.height / 100) * outHeight);
+            const updSize = (px) => set('layers', ls => ls.map(x => x.id === sel.id ? {
+              ...x,
+              width: clamp((px / outWidth) * 100, 5, 100),
+              height: clamp((px / outHeight) * 100, 5, 100),
+            } : x));
+            const maxPx = Math.max(outWidth, outHeight);
+            return (
+              <div className="ed-prop-block ed-prop-sel">
+                <div className="ed-prop-head">
+                  <span>{sel.type === 'mask' ? '◐ Маска' : `◐ Вырезка · ${compactName(fileName(sel.file||''), 12)}`}</span>
+                  {sel.type === 'mask' && (
+                    <button className="ed-mask-apply" onClick={() => applyMask(sel.id)} title="Применить — превратит видео под маской в подвижную вырезку выбранной формы">
+                      Применить
+                    </button>
+                  )}
+                </div>
+                <div className="ed-mask-shapes">
+                  {[['square','◼','Квадрат'],['rounded','▢','Скругл.'],['circle','●','Круг']].map(([id,glyph,lbl]) => (
+                    <button key={id} type="button" className={`ed-mask-shape${sel.shape===id?' active':''}`}
+                      onClick={()=>changeMaskShape(sel.id,id)} title={lbl}>
+                      <span className="ed-mask-shape-glyph">{glyph}</span>
+                      <span className="ed-mask-shape-lbl">{lbl}</span>
+                    </button>
+                  ))}
+                </div>
+                {locked ? (
+                  <Slider label="Размер, px" value={Math.round(sizePx)} min="40" max={maxPx} onChange={updSize} />
+                ) : (
+                  <>
+                    <Slider label="Ширина, %" value={sel.width} min="5" max="100" onChange={v=>updLayer(sel.id,'width',v)} />
+                    <Slider label="Высота, %" value={sel.height} min="5" max="100" onChange={v=>updLayer(sel.id,'height',v)} />
+                  </>
+                )}
+                {sel.shape === 'rounded' && (
+                  <Slider label="Скругление углов, %" value={sel.radius ?? 12} min="0" max="50" onChange={v=>updLayer(sel.id,'radius',v)} />
+                )}
+                {sel.type === 'maskedVideo' && (
+                  <Slider label="Громкость, %" value={sel.volume??100} min="0" max="200" onChange={v=>updLayer(sel.id,'volume',v)} />
+                )}
+                <p className="ed-effects-hint">
+                  {sel.type === 'mask'
+                    ? 'Маска обрезает всё что под ней. Нажми «Применить» — видео-клип превратится в подвижную вырезку.'
+                    : 'Перетащи вырезку мышкой по превью. Уголки рамки меняют размер от центра.'}
+                </p>
+              </div>
+            );
+          })()}
+
           {sel?.type === 'zoom' && (
             <div className="ed-prop-block ed-prop-sel">
               <div className="ed-prop-head">Зум</div>
@@ -2316,6 +2961,39 @@ function Editor({ state, setState }) {
               <p className="ed-effects-hint">Длительность зума = длина клипа на таймлайне. Разгон до максимума за первую половину, плавный возврат — за вторую.</p>
             </div>
           )}
+
+          {sel?.type === 'transition' && (() => {
+            const presets = { low: { duration: 0.25, amp: 14, flash: 0.55 }, mid: { duration: 0.35, amp: 32, flash: 0.85 }, high: { duration: 0.50, amp: 60, flash: 1.00 } };
+            const applyStrength = (s) => {
+              const p = presets[s]; if (!p) return;
+              // Re-centre around the current mid-point so the cut stays aligned.
+              const mid = ((sel.startTime || 0) + (sel.endTime ?? dur)) / 2;
+              const newStart = Math.max(0, Math.min(dur - p.duration, mid - p.duration / 2));
+              set('layers', ls => ls.map(x => x.id === sel.id
+                ? { ...x, strength: s, amp: p.amp, flash: p.flash, startTime: newStart, endTime: newStart + p.duration }
+                : x));
+            };
+            return (
+              <div className="ed-prop-block ed-prop-sel">
+                <div className="ed-prop-head">⚡ Переход</div>
+                <div className="ed-trans-grid">
+                  <button type="button" className={`ed-mask-shape ${sel.strength === 'low' ? 'active' : ''}`} onClick={() => applyStrength('low')}>
+                    <span className="ed-mask-shape-glyph">·</span>
+                    <span className="ed-mask-shape-lbl">Слабый</span>
+                  </button>
+                  <button type="button" className={`ed-mask-shape ${sel.strength === 'mid' ? 'active' : ''}`} onClick={() => applyStrength('mid')}>
+                    <span className="ed-mask-shape-glyph">‧</span>
+                    <span className="ed-mask-shape-lbl">Средний</span>
+                  </button>
+                  <button type="button" className={`ed-mask-shape ${sel.strength === 'high' ? 'active' : ''}`} onClick={() => applyStrength('high')}>
+                    <span className="ed-mask-shape-glyph">⚡</span>
+                    <span className="ed-mask-shape-lbl">Сильный</span>
+                  </button>
+                </div>
+                <p className="ed-effects-hint">Переход стоит на стыке двух клипов. Можешь подвинуть на таймлайне как обычный слой.</p>
+              </div>
+            );
+          })()}
 
           {/* Text properties */}
           {sel?.type === 'text' && (
@@ -2423,7 +3101,17 @@ function Editor({ state, setState }) {
                 <div className="ed-effects-add">
                   <button className="ed-effect-btn" data-onb="blur" onClick={addBlurRegion}>Блюр</button>
                   <button className="ed-effect-btn" onClick={addZoom}>Зум</button>
+                  <button className="ed-effect-btn" onClick={addMaskRegion}>Маска</button>
                   <button className="ed-effect-btn" data-onb="text" onClick={addTextOverlay}>Текст</button>
+                </div>
+              </div>
+              <div className="ed-effects-section">
+                <div className="ed-effects-title">Переходы</div>
+                <div className="ed-effects-desc">Встанут на ближайший стык клипов на таймлайне. Длительность подбирается автоматически.</div>
+                <div className="ed-effects-add ed-trans-grid">
+                  <button className="ed-effect-btn ed-trans-btn ed-trans-low"  onClick={() => addTransition('low')}>Слабый</button>
+                  <button className="ed-effect-btn ed-trans-btn ed-trans-mid"  onClick={() => addTransition('mid')}>Средний</button>
+                  <button className="ed-effect-btn ed-trans-btn ed-trans-high" onClick={() => addTransition('high')}>Сильный</button>
                 </div>
               </div>
             </div>
@@ -2438,6 +3126,7 @@ function Editor({ state, setState }) {
           {/* Timeline toolbar */}
           <div className="ed-tl-bar">
             <button className="etl-add-btn" onClick={splitAtPlayhead} disabled={!sel} title="Разрезать клип по позиции воспроизведения">✂ Разрезать</button>
+            <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+клик по клипам на таймлайне для мультивыбора)">⛓ Объединить</button>
             <div style={{flex:1}} />
             <div className="ed-zoom">
               <span className="ed-zoom-lbl">Масштаб</span>

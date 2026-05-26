@@ -754,6 +754,161 @@ ipcMain.handle('saveas:pick', async (_event, defaultName, format) => {
   return result.filePath || '';
 });
 
+// Preview proxy generator: re-encodes a video (commonly HEVC/AV1 that
+// Chromium can't decode) to H.264 + AAC at original resolution so the editor
+// preview works. The original file path is still used for the final export.
+ipcMain.handle('editor:makeProxy', async (event, payload) => {
+  const { file, force } = payload || {};
+  if (!file) return { ok: false, error: 'no file' };
+  const ffmpeg = findFfmpeg();
+  if (!ffmpeg) return { ok: false, error: 'FFmpeg не найден' };
+
+  // Probe first so we don't waste time/disk on files Chromium already plays.
+  if (!force) {
+    try {
+      const probe = await probeMediaInfo(ffmpeg, file);
+      const raw = String(probe.raw || '');
+      const needsProxy = /\b(hevc|av1)\b/i.test(raw) || /h\.?265/i.test(raw) || /\bprores\b/i.test(raw);
+      if (!needsProxy) {
+        return { ok: true, proxyPath: null, supported: true };
+      }
+    } catch {} // if probe fails, fall through and attempt the proxy anyway
+  }
+
+  // Stable cache key based on file path so multiple layers reusing the same
+  // source share one proxy, and re-opening the project reuses it too.
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(file).digest('hex').slice(0, 12);
+  const tmpDir = path.join(app.getPath('temp'), 'strata-proxy');
+  try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+  const proxyPath = path.join(tmpDir, `proxy-${hash}.mp4`);
+
+  // Reuse if proxy already exists and is newer than source.
+  try {
+    const srcStat = fs.statSync(file);
+    const dstStat = fs.statSync(proxyPath);
+    if (dstStat.mtimeMs >= srcStat.mtimeMs && dstStat.size > 1024) {
+      return { ok: true, proxyPath, cached: true };
+    }
+  } catch {}
+
+  const args = [
+    '-y', '-i', file,
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k',
+    '-movflags', '+faststart',
+    proxyPath,
+  ];
+
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    let stderr = ''; let totalDur = 0;
+    proc.stderr.on('data', d => {
+      const s = d.toString(); stderr += s;
+      if (!totalDur) {
+        const dm = s.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (dm) totalDur = (+dm[1]) * 3600 + (+dm[2]) * 60 + parseFloat(dm[3]);
+      }
+      const tm = s.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (tm && totalDur > 0) {
+        const t = (+tm[1]) * 3600 + (+tm[2]) * 60 + parseFloat(tm[3]);
+        try { event.sender.send('editor:proxy-progress', { file, percent: Math.min(99, (t / totalDur) * 100) }); } catch {}
+      }
+    });
+    proc.on('error', e => resolve({ ok: false, error: String(e.message || e) }));
+    proc.on('close', code => {
+      if (code === 0) resolve({ ok: true, proxyPath, cached: false });
+      else resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-300)}` });
+    });
+  });
+});
+
+// Concatenate multiple clips (possibly from different source files) into one
+// normalised MP4/MP3, returning the temp path so the editor can replace the
+// selection with a single layer pointing at the merged file.
+ipcMain.handle('editor:concatClips', async (event, payload) => {
+  const { clips = [], w = 1080, h = 1920, isAudio = false } = payload || {};
+  if (clips.length < 2) return { ok: false, error: 'нужно минимум 2 клипа' };
+  const ffmpeg = findFfmpeg();
+  if (!ffmpeg) return { ok: false, error: 'FFmpeg не найден' };
+
+  // Probe each source to know if it has audio (so we can substitute silence).
+  const probes = await Promise.all(clips.map(c => probeMediaInfo(ffmpeg, c.file).catch(() => ({}))));
+
+  const inputArgs = [];
+  const filterParts = [];
+  const outPairs = [];
+
+  clips.forEach((c, i) => {
+    inputArgs.push('-i', c.file);
+    const srcStart = Math.max(0, Number(c.srcStart) || 0);
+    const speed = Math.max(0.1, (c.speed || 100) / 100);
+    const len = Math.max(0.1, Number(c.length) || 1);
+    const srcEnd = srcStart + len * speed;
+    const hasAud = !!probes[i]?.hasAudio;
+
+    // Build atempo chain (atempo only accepts 0.5..2.0, chain if needed).
+    let r = speed; const atempos = [];
+    while (r > 2) { atempos.push('atempo=2.0'); r /= 2; }
+    while (r < 0.5) { atempos.push('atempo=0.5'); r *= 2; }
+    atempos.push(`atempo=${r.toFixed(4)}`);
+
+    if (isAudio) {
+      filterParts.push(`[${i}:a]atrim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempos.join(',')}[a${i}]`);
+      outPairs.push(`[a${i}]`);
+    } else {
+      // Normalise video to target canvas: trim, retime, scale-fit + pad, format.
+      filterParts.push(`[${i}:v]trim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},setpts=(PTS-STARTPTS)/${speed.toFixed(4)},scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(${w}-iw)/2:(${h}-ih)/2,setsar=1,format=yuv420p[v${i}]`);
+      if (hasAud) {
+        filterParts.push(`[${i}:a]atrim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempos.join(',')}[a${i}]`);
+      } else {
+        // Generate silent track of the right output duration.
+        filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${len.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`);
+      }
+      outPairs.push(`[v${i}][a${i}]`);
+    }
+  });
+
+  let mapArgs;
+  if (isAudio) {
+    filterParts.push(`${outPairs.join('')}concat=n=${clips.length}:v=0:a=1[outa]`);
+    mapArgs = ['-map', '[outa]', '-c:a', 'libmp3lame', '-b:a', '192k'];
+  } else {
+    filterParts.push(`${outPairs.join('')}concat=n=${clips.length}:v=1:a=1[outv][outa]`);
+    mapArgs = ['-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'];
+  }
+
+  // Generate temp output path so renderer doesn't need filesystem access.
+  const ext = isAudio ? 'mp3' : 'mp4';
+  const tmpDir = path.join(app.getPath('temp'), 'strata-merge');
+  try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+  const outPath = path.join(tmpDir, `merge-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`);
+
+  const args = ['-y', ...inputArgs, '-filter_complex', filterParts.join(';'), ...mapArgs, outPath];
+
+  // Total output duration for progress (sum of post-tempo durations = sum of len).
+  const totalDur = clips.reduce((s, c) => s + Math.max(0.1, Number(c.length) || 0), 0);
+
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    let stderr = '';
+    proc.stderr.on('data', d => {
+      const s = d.toString(); stderr += s;
+      const tm = s.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (tm && totalDur > 0) {
+        const t = (+tm[1]) * 3600 + (+tm[2]) * 60 + parseFloat(tm[3]);
+        try { event.sender.send('editor:merge-progress', { percent: Math.min(99, (t / totalDur) * 100) }); } catch {}
+      }
+    });
+    proc.on('error', e => resolve({ ok: false, error: String(e.message || e) }));
+    proc.on('close', code => {
+      if (code === 0) resolve({ ok: true, path: outPath });
+      else resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-400)}` });
+    });
+  });
+});
+
 ipcMain.handle('video:edit', async (_event, payload) => {
   const { outWidth, outHeight, bgColor = '#000000', fadeIn = 0, fadeOut = 0, outPath, format = 'mp4', quality = 'normal' } = payload;
   let file = payload.file;
@@ -770,6 +925,24 @@ ipcMain.handle('video:edit', async (_event, payload) => {
   const srcProbe = await probeMediaInfo(ffmpeg, payload.file).catch(() => ({}));
   const srcDurReal = Math.max(0.5, srcProbe.duration || totalDuration || 1);
   const srcMbReal = fileSizeMb(payload.file);
+
+  // Probe every file the filter graph will reference. We need both:
+  //  - hasAudio: skip [idx:a] for silent sources or the graph fails to parse.
+  //  - width/height: clamp srcCrop coords for maskedVideo so ffmpeg's crop
+  //    filter doesn't bail when the renderer guessed dimensions wrong (e.g.
+  //    HEVC proxy wasn't loaded yet at Apply time).
+  const mediaProbeMap = new Map();
+  mediaProbeMap.set(payload.file, srcProbe || {});
+  await Promise.all(
+    (payload.layers || []).filter(l => l && l.file && (l.type === 'videoOverlay' || l.type === 'maskedVideo' || l.type === 'audio'))
+      .map(async (l) => {
+        if (mediaProbeMap.has(l.file)) return;
+        try { const p = await probeMediaInfo(ffmpeg, l.file); mediaProbeMap.set(l.file, p || {}); }
+        catch { mediaProbeMap.set(l.file, {}); }
+      })
+  );
+  const audioProbeMap = new Map();
+  for (const [f, info] of mediaProbeMap.entries()) audioProbeMap.set(f, !!info.hasAudio);
 
   // ── Pre-process reversed layers (separate FFmpeg pass to avoid PTS issues) ──
   const tmpRevFiles = [];
@@ -833,6 +1006,9 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     const totalDur = Math.max(0.1, totalDuration);
     const bgHex = (bgColor || '#000000').replace('#', '0x');
     const isAudioOnly = format === 'mp3';
+    // Declared at executor scope so the audio-mixing block below can read it
+    // even when isAudioOnly skipped the video graph entirely.
+    const videoOverlayInputs = [];
 
     if (!isAudioOnly) {
       const mv = mainVideoForFilter;
@@ -854,10 +1030,73 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       }
       videoStream = '[vscaled]';
 
-      let blurCount = 0, imgCount = 0, vidovCount = 0, txtCount = 0, zoomCount = 0;
-      const videoOverlayInputs = [];
+      let blurCount = 0, imgCount = 0, vidovCount = 0, txtCount = 0, zoomCount = 0, maskCount = 0, transCount = 0;
       (layers || []).forEach((layer) => {
-        if (layer.type === 'blur') {
+        if (layer.type === 'transition') {
+          // Camera shake + white flash. Implemented as:
+          //   1) scale-up + crop with time-varying offset = shake
+          //   2) overlay only inside [startTime, endTime]
+          //   3) overlay a white frame with fade-in/out alpha for the flash
+          const i = transCount++;
+          const ts = Number(layer.startTime) || 0;
+          const te = Number(layer.endTime) || ts + 0.3;
+          const span = Math.max(0.05, te - ts);
+          const ampPx = Number(layer.amp) || 30;
+          const flashMax = Math.max(0, Math.min(1, layer.flash ?? 0.85));
+          // Scale factor to keep the cropped frame inside the original size.
+          // Headroom margin grows with shake amplitude.
+          const margin = Math.max(0.04, ampPx / Math.min(evenW, evenH));
+          const sx = (1 + margin * 2);
+          const bigW = Math.round(evenW * sx);
+          const bigH = Math.round(evenH * sx);
+          // Decay over time + shifted sine packets for a noisy look. The expr
+          // gets wrapped in single quotes below, so commas inside max() and
+          // function args are passed through literally — no \\, escape.
+          const xExpr = `(${bigW}-${evenW})/2 + (sin(t*113)*0.6 + sin(t*187)*0.4) * ${ampPx} * max(0, 1 - (t - ${ts}) / ${span} * 0.85)`;
+          const yExpr = `(${bigH}-${evenH})/2 + (cos(t*97)*0.6 + cos(t*151)*0.4) * ${ampPx} * max(0, 1 - (t - ${ts}) / ${span} * 0.85)`;
+          const enableShake = `enable='between(t,${ts.toFixed(3)},${te.toFixed(3)})'`;
+          // Split → produce a shaken copy → overlay onto the original only in enable range.
+          filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+          filterParts.push(`[trS${i}]scale=${bigW}:${bigH},crop=${evenW}:${evenH}:'${xExpr}':'${yExpr}'[trShaken${i}]`);
+          filterParts.push(`[trM${i}][trShaken${i}]overlay=0:0:${enableShake}[trAfterShake${i}]`);
+          videoStream = `[trAfterShake${i}]`;
+          // White flash overlay: opaque white frame with a quick alpha ramp.
+          // fade in 15% of span, fade out the rest.
+          const fadeIn = Math.max(0.02, span * 0.15);
+          const fadeOut = Math.max(0.02, span - fadeIn);
+          filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${span.toFixed(3)},format=rgba,fade=t=in:st=0:d=${fadeIn.toFixed(3)}:alpha=1,fade=t=out:st=${fadeIn.toFixed(3)}:d=${fadeOut.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${ts.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trFlash${i}]`);
+          filterParts.push(`${videoStream}[trFlash${i}]overlay=0:0:enable='between(t,${ts.toFixed(3)},${te.toFixed(3)})'[trDone${i}]`);
+          videoStream = `[trDone${i}]`;
+        } else if (layer.type === 'mask') {
+          // Clipping mask: keep current videoStream pixels only inside the
+          // chosen shape; outside becomes the project background colour.
+          const i = maskCount++;
+          const mw = Math.max(2, Math.round((layer.width / 100) * evenW));
+          const mh = Math.max(2, Math.round((layer.height / 100) * evenH));
+          const cxPx = Math.round((layer.x / 100) * evenW);
+          const cyPx = Math.round((layer.y / 100) * evenH);
+          const x0 = cxPx - mw / 2, y0 = cyPx - mh / 2;
+          const x1 = cxPx + mw / 2, y1 = cyPx + mh / 2;
+          // Same rule as maskedVideo: no \, escaping inside single-quoted expr.
+          let alphaExpr;
+          if (layer.shape === 'circle') {
+            const rx = mw / 2, ry = mh / 2;
+            alphaExpr = `if(lte(pow((X-${cxPx})/${rx},2)+pow((Y-${cyPx})/${ry},2),1),255,0)`;
+          } else {
+            const rPct = layer.shape === 'rounded' ? Math.max(0, layer.radius || 0) : 0;
+            const R = Math.min(mw, mh) / 2 * (rPct / 100);
+            const ix0 = x0 + R, iy0 = y0 + R, ix1 = x1 - R, iy1 = y1 - R;
+            alphaExpr = `if(lte(pow(X-clip(X,${ix0},${ix1}),2)+pow(Y-clip(Y,${iy0},${iy1}),2),${R * R}),255,0)`;
+          }
+          const enable = `enable='between(t,${layer.startTime},${layer.endTime})'`;
+          // bg fill + grayscale shape (white inside / black outside). alphamerge
+          // uses the luma of input2 as the new alpha of input1.
+          filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[mbg${i}]`);
+          filterParts.push(`color=c=black:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)},format=gray,geq=lum='${alphaExpr}'[mma${i}]`);
+          filterParts.push(`${videoStream}[mma${i}]alphamerge[mclip${i}]`);
+          filterParts.push(`[mbg${i}][mclip${i}]overlay=0:0:${enable}[vmask${i}]`);
+          videoStream = `[vmask${i}]`;
+        } else if (layer.type === 'blur') {
           const i = blurCount++;
           // Centre-based coordinates matching getLayerPx in the preview
           const bw = Math.max(2, Math.round((layer.width / 100) * evenW));
@@ -884,6 +1123,83 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           filterParts.push(`[${idx}:v]scale=${scaleW}:${scaleH},format=rgba,colorchannelmixer=aa=${alpha}[img${i}]`);
           filterParts.push(`${videoStream}[img${i}]overlay=${x}:${y}:${enable}[vimg${i}]`);
           videoStream = `[vimg${i}]`;
+        } else if (layer.type === 'maskedVideo') {
+          // Cut-out: scale the video to fill the cut-out box (cover), build an
+          // alpha shape, alphamerge, then overlay at the box position.
+          const i = vidovCount++;
+          inputArgs.push('-i', layer.file);
+          const idx = inputIdx++;
+          videoOverlayInputs.push({ idx, layer });
+          const mw = Math.max(2, Math.round((layer.width / 100) * evenW));
+          const mh = Math.max(2, Math.round((layer.height / 100) * evenH));
+          const cxPx = Math.round((layer.x / 100) * evenW);
+          const cyPx = Math.round((layer.y / 100) * evenH);
+          const bx = cxPx - mw / 2, by = cyPx - mh / 2;
+          // geq expression is wrapped in single quotes below, so commas inside
+          // it are literal — DO NOT escape them with \, (that breaks the expr
+          // parser and the alpha mask comes out fully transparent → no video).
+          let alphaExpr;
+          if (layer.shape === 'circle') {
+            const rx = mw / 2, ry = mh / 2;
+            alphaExpr = `if(lte(pow((X-${mw/2})/${rx},2)+pow((Y-${mh/2})/${ry},2),1),255,0)`;
+          } else {
+            const rPct = layer.shape === 'rounded' ? Math.max(0, layer.radius || 0) : 0;
+            const R = Math.min(mw, mh) / 2 * (rPct / 100);
+            alphaExpr = `if(lte(pow(X-clip(X,${R},${mw - R}),2)+pow(Y-clip(Y,${R},${mh - R}),2),${R * R}),255,0)`;
+          }
+          const enable = `enable='between(t,${layer.startTime},${layer.endTime})'`;
+          const ovSp = Math.max(0.1, (layer.speed || 100) / 100);
+          const ovDur = Math.max(0.1, (layer.endTime ?? totalDur) - (layer.startTime || 0));
+          const ovSrc = layer.srcStart || 0;
+          const ccB = (layer.ccB || 0) / 100;
+          const ccC = (layer.ccC == null ? 100 : layer.ccC) / 100;
+          const ccS = (layer.ccS == null ? 100 : layer.ccS) / 100;
+          const ccPart = (ccB !== 0 || ccC !== 1 || ccS !== 1)
+            ? `,eq=brightness=${ccB.toFixed(3)}:contrast=${ccC.toFixed(3)}:saturation=${ccS.toFixed(3)}`
+            : '';
+          // Trim, retime, then crop the EXACT source region the user picked
+          // with the mask (srcCrop) and scale it to the cut-out box. Clamp the
+          // crop window to the real input dimensions so ffmpeg doesn't bail
+          // when the renderer guessed wrong (e.g. proxy not loaded at Apply).
+          let cropPart;
+          const probe = mediaProbeMap.get(layer.file) || {};
+          const inW = Number(probe.width) > 0 ? Number(probe.width) : null;
+          const inH = Number(probe.height) > 0 ? Number(probe.height) : null;
+          if (layer.srcCrop && inW && inH) {
+            const c = layer.srcCrop;
+            let cx = Math.max(0, Math.min(inW - 1, Math.round(c.x)));
+            let cy = Math.max(0, Math.min(inH - 1, Math.round(c.y)));
+            let cw = Math.max(1, Math.min(inW - cx, Math.round(c.w)));
+            let ch = Math.max(1, Math.min(inH - cy, Math.round(c.h)));
+            // If srcCrop coords were computed against fake dimensions, scale
+            // them back into real input space proportionally (best-effort).
+            // We detect this by checking if the requested crop exceeds the
+            // file's bounds — if so, treat the original c.x..c.x+c.w as a
+            // fraction of an assumed 1920×1080 / 1080×1920 frame and remap.
+            const reqExceeds = (c.x + c.w > inW * 1.05) || (c.y + c.h > inH * 1.05) || (c.x < 0) || (c.y < 0);
+            if (reqExceeds) {
+              // Renderer probably defaulted to 1920x1080. Rescale srcCrop
+              // proportionally to actual dims.
+              const assumedW = c.x + c.w > 1080 ? 1920 : 1080;
+              const assumedH = c.y + c.h > 1080 ? 1920 : 1080;
+              cx = Math.max(0, Math.min(inW - 1, Math.round((c.x / assumedW) * inW)));
+              cy = Math.max(0, Math.min(inH - 1, Math.round((c.y / assumedH) * inH)));
+              cw = Math.max(1, Math.min(inW - cx, Math.round((c.w / assumedW) * inW)));
+              ch = Math.max(1, Math.min(inH - cy, Math.round((c.h / assumedH) * inH)));
+            }
+            cropPart = `crop=${cw}:${ch}:${cx}:${cy},scale=${mw}:${mh}`;
+          } else {
+            cropPart = `scale=${mw}:${mh}:force_original_aspect_ratio=increase,crop=${mw}:${mh}`;
+          }
+          filterParts.push(`[${idx}:v]trim=start=${ovSrc}:end=${(ovSrc + ovDur * ovSp).toFixed(3)},setpts=(PTS-STARTPTS)/${ovSp}+${layer.startTime || 0}/TB,${cropPart}${ccPart},format=rgba[mvfit${i}]`);
+          // Alpha mask: alphamerge takes the LUMA (Y) of the 2nd input as the
+          // new alpha for the 1st — so we need a grayscale stream where the
+          // shape is white (255) and outside is black (0), NOT an alpha-only
+          // stream. Use format=gray + geq=lum=...
+          filterParts.push(`color=c=black:s=${mw}x${mh}:r=30:d=${totalDur.toFixed(3)},format=gray,geq=lum='${alphaExpr}'[mvmask${i}]`);
+          filterParts.push(`[mvfit${i}][mvmask${i}]alphamerge[mvcut${i}]`);
+          filterParts.push(`${videoStream}[mvcut${i}]overlay=${bx}:${by}:${enable}[vmcut${i}]`);
+          videoStream = `[vmcut${i}]`;
         } else if (layer.type === 'videoOverlay') {
           const i = vidovCount++;
           inputArgs.push('-i', layer.file);
@@ -960,10 +1276,28 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     const mvVol = (mainVideoForFilter?.volume ?? 100);
     const audioLayers = (layers || []).filter(l => l.type === 'audio');
     let audioMap = '0:a?';
+    // baseAudio is set by the renderer when input 0 IS an audio file (audio-only
+    // project). It carries the real source/timeline split so trimming works.
+    const baseAud = payload.baseAudio;
 
-    if (mvVol !== 100 || audioLayers.length > 0 || videoOverlayInputs.length > 0) {
-      // Base video audio — cut to the base clip's range, placed on the timeline.
-      filterParts.push(`[0:a]atrim=${videoStart.toFixed(3)}:${videoEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${Math.round(videoStart*1000)}|${Math.round(videoStart*1000)},volume=${(mvVol / 100).toFixed(3)}[auMain]`);
+    if (mvVol !== 100 || audioLayers.length > 0 || videoOverlayInputs.length > 0 || baseAud) {
+      const baseHasAudio = audioProbeMap.get(payload.file) !== false;
+      // Base audio — for audio-only projects use baseAudio's real coordinates;
+      // for video projects, use the main video's video-range (back-compat).
+      // If the base file has no audio stream, synthesise silence so the filter
+      // graph remains valid.
+      if (baseAud) {
+        const baSrcStart = Math.max(0, Number(baseAud.srcStart) || 0);
+        const baLen = Math.max(0.01, Number(baseAud.length) || 1);
+        const baSrcEnd = baSrcStart + baLen;
+        const baDelayMs = Math.round((Number(baseAud.startTime) || 0) * 1000);
+        const baVol = ((Number(baseAud.volume) || 100) / 100).toFixed(3);
+        filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}|${baDelayMs},volume=${baVol}[auMain]`);
+      } else if (baseHasAudio) {
+        filterParts.push(`[0:a]atrim=${videoStart.toFixed(3)}:${videoEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${Math.round(videoStart*1000)}|${Math.round(videoStart*1000)},volume=${(mvVol / 100).toFixed(3)}[auMain]`);
+      } else {
+        filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
+      }
       const mixInputs = ['[auMain]'];
       // Every overlay video carries its own audio, cut to its clip (split-aware).
       videoOverlayInputs.forEach(({ idx, layer }, i) => {
@@ -974,6 +1308,13 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const oVol = (layer.volume ?? 100) / 100;
         const oDelay = Math.round(oStart * 1000);
         const oSp = Math.max(0.1, (layer.speed || 100) / 100);
+        const ovHasAudio = audioProbeMap.get(layer.file) !== false;
+        if (!ovHasAudio) {
+          // Silent overlay — keep the timeline structure intact for amix.
+          filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${oLen.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${oDelay}|${oDelay}[auVov${i}]`);
+          mixInputs.push(`[auVov${i}]`);
+          return;
+        }
         let atParts = [], atRem = oSp;
         while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
         while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }

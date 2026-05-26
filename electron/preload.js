@@ -8,6 +8,18 @@ contextBridge.exposeInMainWorld('strata', {
   pickFolder: () => ipcRenderer.invoke('folder:pick'),
   pickSaveAs: (defaultName, format) => ipcRenderer.invoke('saveas:pick', defaultName, format),
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
+  mergeClips: (payload) => ipcRenderer.invoke('editor:concatClips', payload),
+  onMergeProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('editor:merge-progress', handler);
+    return () => ipcRenderer.removeListener('editor:merge-progress', handler);
+  },
+  makeProxy: (payload) => ipcRenderer.invoke('editor:makeProxy', payload),
+  onProxyProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('editor:proxy-progress', handler);
+    return () => ipcRenderer.removeListener('editor:proxy-progress', handler);
+  },
   listFonts: () => ipcRenderer.invoke('fonts:list'),
   onEditProgress: (callback) => {
     const handler = (_event, data) => callback(data);
