@@ -19,7 +19,7 @@ run('npx', [
   `--arch=${arch}`,
   '--out=release-mac',
   '--overwrite',
-  '--icon=assets/strata_mixer_1_1d.icns',
+  '--icon=assets/strata_mixer_v1_2_4.icns',
   '--prune=true'
 ]);
 

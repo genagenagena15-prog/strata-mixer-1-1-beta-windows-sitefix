@@ -290,7 +290,7 @@
 
 /* 1.1c built-in help */
 .sidebar-bottom-actions{margin-top:auto;display:flex;align-items:center;gap:8px;justify-content:flex-start;flex-wrap:wrap;padding-top:10px}
-.help-mini-btn{height:28px;padding:0 12px;border-radius:999px;border:1px solid rgba(140,140,146,.22);background:rgba(26,26,30,.72);color:#bdbdc3;font-weight:850;font-size:12px;box-shadow:none}
+.help-mini-btn{height:28px;padding:0 12px;border-radius:999px;border:1px solid rgba(140,140,146,.22);background:rgba(26,26,30,.72);color:#bdbdc3;font-weight:850;font-size:12px;box-shadow:none;display:inline-flex;align-items:center;justify-content:center;line-height:1}
 .help-mini-btn:hover{color:#fff;border-color:rgba(163,60,255,.58);box-shadow:0 0 18px rgba(163,60,255,.12)}
 .help-modal{width:min(760px,calc(100vw - 42px));max-height:min(720px,calc(100vh - 42px));overflow:hidden;border:1px solid rgba(140,140,146,.25);background:linear-gradient(135deg,rgba(20,20,24,.99),rgba(17,13,35,.98));border-radius:22px;padding:18px;box-shadow:0 24px 80px rgba(0,0,0,.62)}
 .help-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:14px}.help-head h2{margin:0;font-size:22px}.help-head p{margin:6px 0 0;color:#adadb3}.help-head button{width:34px;height:34px;border-radius:11px;border:1px solid rgba(140,140,146,.22);background:#19191c;color:#fff;font-size:20px}.help-head button:hover{border-color:rgba(255,138,0,.55);box-shadow:0 0 18px rgba(255,138,0,.16)}
@@ -697,7 +697,12 @@
 .etl-track-row:hover{background:rgba(255,255,255,.025)}
 .etl-track-row.etl-selected{background:rgba(255,138,0,.14);box-shadow:inset 3px 0 0 #ff8a00}
 .etl-track-row .etl-label-col{flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;padding:4px 6px}
-.etl-track-label{font-size:11px;color:#b0b0b6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px;line-height:1.3}
+.etl-track-label{font-size:11px;color:#b0b0b6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px;line-height:1.3;display:inline-flex;align-items:center;gap:5px}
+.etl-track-label.etl-missing{color:#ff6b6b;font-weight:600}
+/* Per-layer-type icon shown left of the clip name. PNGs ship as pure black
+   silhouettes — invert to white for dark theme, dim for light theme. */
+.etl-track-icon{width:14px;height:14px;flex-shrink:0;object-fit:contain;filter:brightness(0) invert(1) opacity(.78);pointer-events:none}
+[data-theme="light"] .etl-track-icon{filter:brightness(0) opacity(.62)}
 .etl-track-actions{display:flex;gap:2px;flex-shrink:0}
 .etl-act-btn{width:18px;height:18px;border-radius:5px;border:1px solid rgba(140,140,146,.2);background:#161618;color:#95959b;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
 .etl-act-btn:hover{border-color:#ff8a00;color:#ff8a00}
@@ -720,6 +725,36 @@
 .etl-waveform{position:absolute;inset:3px 18px;display:flex;align-items:center;gap:1.5px;opacity:.55;overflow:hidden;pointer-events:none;z-index:1;}
 .etl-waveform-bar{flex:1 1 2px;min-width:1.5px;max-width:4px;background:rgba(255,210,80,.9);border-radius:1px;}
 .etl-clip-thumb{position:absolute;left:20px;top:3px;bottom:3px;width:auto;max-width:46px;object-fit:cover;border-radius:3px;z-index:2;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.55)}
+/* AE-style thumbnail strip for video clips on the timeline.
+   Each cell is a true 1:1 square — no horizontal stretch — and they're
+   distributed along the clip width so each one sits near its second mark. */
+.etl-clip-thumbstrip{position:absolute;inset:3px;display:flex;gap:0;border-radius:3px;overflow:hidden;z-index:1;pointer-events:none}
+
+/* Cmall reset link under the colour-correction sliders in the Properties tab. */
+.ed-cc-reset{margin-top:8px;background:transparent;border:1px solid rgba(140,140,146,.28);color:#b0b0b6;font-size:11px;border-radius:8px;padding:5px 10px;cursor:pointer}
+.ed-cc-reset:hover{border-color:rgba(255,138,0,.55);color:#fff}
+[data-theme="light"] .ed-cc-reset{color:#5c606d;border-color:rgba(20,24,40,.18)}
+[data-theme="light"] .ed-cc-reset:hover{color:#1a1c25;border-color:rgba(255,138,0,.55)}
+
+/* Long-press reorder: visual cue while user drags a clip up/down to a
+   different track. Clip shrinks slightly and casts a soft shadow; the
+   target row glows so the user sees where it'll drop. */
+.etl-clip.etl-clip-reorder-active{
+  transform:scale(.82);
+  transform-origin:center;
+  filter:brightness(1.05);
+  box-shadow:0 8px 22px rgba(0,0,0,.55),0 0 0 2px rgba(255,255,255,.18)!important;
+  z-index:5!important;
+  transition:transform .15s cubic-bezier(.2,.9,.25,1);
+  cursor:grabbing!important;
+}
+.etl-track-row.etl-reorder-hover{
+  background:rgba(255,138,0,.13)!important;
+  box-shadow:inset 0 0 0 1px rgba(255,138,0,.55)!important;
+}
+/* Cells stretch to fill the strip exactly — no gaps, no empty right margin.
+   object-fit:cover keeps the underlying frame visually correct. */
+.etl-clip-thumbstrip .etl-thumb-cell{flex:1 1 0;min-width:0;height:100%;object-fit:cover;display:block;background:#0d0e10}
 .etl-clip-img .etl-clip-inner-label{left:72px}
 .etl-clip-fx{position:absolute;right:20px;top:3px;display:flex;align-items:center;justify-content:center;height:14px;padding:0 5px;border-radius:4px;font-size:9px;font-weight:900;letter-spacing:.3px;text-transform:uppercase;color:#1a1206;background:linear-gradient(135deg,#ffd24f,#ffa927);box-shadow:0 1px 4px rgba(0,0,0,.5);z-index:3;pointer-events:none;}
 .etl-act-color{flex:0 0 auto;width:18px;height:18px;border-radius:5px;border:1px solid rgba(255,255,255,.3);cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4);padding:0}
@@ -822,9 +857,9 @@
 .ed-save-btn{margin-left:auto;height:34px;padding:0 18px;flex-shrink:0}
 
 /* Workspace */
-.ed-workspace{display:grid;grid-template-columns:1fr 280px;gap:14px;min-height:200px;align-items:stretch}
+.ed-workspace{display:grid;grid-template-columns:1fr 280px;gap:14px;min-height:200px;align-items:start}
 .ed-preview-col{display:flex;flex-direction:column;gap:6px;min-height:0}
-.ed-preview-wrap{position:relative;background:#070709;border-radius:14px;overflow:hidden;display:flex;align-items:center;justify-content:center;min-height:120px}
+.ed-preview-wrap{position:relative;background:#2a2a2a;border-radius:14px;display:flex;align-items:center;justify-content:center;min-height:120px;overflow:hidden}
 .ed-preview-resize{height:7px;border-radius:4px;background:rgba(140,140,146,.14);cursor:ns-resize;transition:background .15s;flex-shrink:0}
 .ed-preview-resize:hover,.ed-preview-resize:active{background:rgba(255,138,0,.45)}
 .ed-tl-section{flex:1 1 0;min-height:160px;display:flex;flex-direction:column;min-width:0}
@@ -852,7 +887,29 @@
 .ed-props-tab.active{background:rgba(255,138,0,.13);border-color:rgba(255,138,0,.45);color:#ff8a00}
 /* Effects panel */
 .ed-effects-panel{display:flex;flex-direction:column;gap:10px}
-.ed-effects-section{border:1px solid rgba(140,140,146,.16);border-radius:14px;padding:14px 12px;background:rgba(12,12,14,.55);display:flex;flex-direction:column;align-items:center;text-align:center;gap:6px}
+/* Effects tab now uses 3 collapsible "buttons" stacked vertically. Each
+   button rolls down with its content on click; the others stay closed. */
+.ed-effects-section{border:1px solid rgba(140,140,146,.22);border-radius:12px;background:rgba(18,18,20,.6);display:flex;flex-direction:column;overflow:hidden;transition:border-color .2s ease, background .2s ease, box-shadow .2s ease;width:100%;box-sizing:border-box}
+.ed-effects-section.open{border-color:rgba(255,138,0,.45);background:rgba(20,20,22,.85);box-shadow:0 0 18px rgba(255,138,0,.10)}
+/* Collapsed toggle has a fixed height so all three buttons line up exactly
+   the same when closed. Open state lets content determine height. */
+.ed-acc-toggle{appearance:none;border:0;background:transparent;width:100%;height:48px;padding:0 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;color:inherit;font:inherit;text-align:left;font-size:13px;font-weight:800;box-sizing:border-box;transition:background .15s ease, color .15s ease}
+.ed-acc-toggle:hover{background:rgba(255,138,0,.06);color:#ff9d2e}
+.ed-effects-section.open .ed-acc-toggle{color:#ff9d2e}
+.ed-acc-toggle .ed-acc-chev{font-size:12px;color:#95959b;transition:transform .3s cubic-bezier(.2,.9,.25,1)}
+.ed-effects-section.open .ed-acc-toggle .ed-acc-chev{transform:rotate(180deg);color:#ff9d2e}
+/* All content (description + buttons) is inside the collapsible body. */
+.ed-acc-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .32s cubic-bezier(.2,.9,.25,1)}
+.ed-effects-section.open .ed-acc-body{grid-template-rows:1fr}
+/* Single wrapping child constrained to grid row — that's the trick that
+   makes EVERYTHING inside collapse cleanly to 0 when grid-row is 0fr. */
+.ed-acc-inner{min-height:0;overflow:hidden;padding:0 14px}
+.ed-effects-section.open .ed-acc-inner{overflow:visible;padding:4px 14px 14px}
+[data-theme="light"] .ed-effects-section{background:rgba(255,255,255,.62);border-color:rgba(20,24,40,.14)}
+[data-theme="light"] .ed-effects-section.open{background:rgba(255,255,255,.86);border-color:rgba(255,138,0,.55)}
+[data-theme="light"] .ed-acc-toggle{color:#1a1c25}
+[data-theme="light"] .ed-acc-toggle:hover{color:#d77400}
+[data-theme="light"] .ed-effects-section.open .ed-acc-toggle{color:#d77400}
 .ed-effects-icon{font-size:32px;line-height:1}
 .ed-effects-title{font-size:13px;font-weight:800;color:#d2d2d6}
 .ed-effects-desc{font-size:11px;color:#85858c;line-height:1.5}
@@ -860,7 +917,46 @@
 .ed-effect-btn{margin-top:6px;width:100%;padding:8px 12px;border-radius:9px;border:1px solid rgba(140,140,146,.3);background:rgba(140,140,146,.08);color:#d2d2d6;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s}
 .ed-effect-btn:hover{background:rgba(255,138,0,.15);border-color:rgba(255,138,0,.4);color:#ff8a00}
 .ed-effect-btn.active{background:rgba(255,138,0,.18);border-color:rgba(255,138,0,.6);color:#ff8a00}
+/* Two-line variant — bold label + small description underneath.
+   Used for effect/transition buttons that need a "what it does" caption. */
+.ed-effect-btn-d{display:flex;flex-direction:column;align-items:center;gap:3px;text-align:center;padding:7px 8px;line-height:1.25}
+.ed-effect-btn-d>small{font-size:10px;font-weight:600;color:#85858c;opacity:.92;letter-spacing:.01em}
+.ed-effect-btn-d:hover>small,.ed-effect-btn-d.active>small{color:inherit;opacity:.85}
+.ed-trans-chip>small{display:block;margin-top:3px;font-size:10px;font-weight:600;color:#85858c;opacity:.92;letter-spacing:.01em;line-height:1.25}
+.ed-trans-chip:hover>small{color:inherit;opacity:.8}
+[data-theme="light"] .ed-effect-btn-d>small,[data-theme="light"] .ed-trans-chip>small{color:#6a6e7a!important}
 .ed-effects-hint{font-size:11px;color:#85858c;margin:6px 0 0;line-height:1.5}
+.ed-effects-hint-section{display:block;margin:0 0 8px;font-size:11.5px;color:#9a9aa1;line-height:1.5}
+
+/* ── Custom in-app save prompt (replaces the native OS confirm dialog) ── */
+.sm-prompt-back{position:fixed;inset:0;background:rgba(6,8,14,.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;z-index:99999;animation:smPromptFade .14s ease-out}
+.sm-prompt-modal{display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto auto;column-gap:18px;row-gap:14px;align-items:start;min-width:380px;max-width:520px;padding:24px 28px 20px;border-radius:16px;background:linear-gradient(180deg,#1c1e26,#14151b);border:1px solid rgba(255,138,0,.22);box-shadow:0 24px 70px rgba(0,0,0,.6),0 0 28px rgba(255,138,0,.08),inset 0 1px 0 rgba(255,255,255,.04);animation:smPromptPop .18s cubic-bezier(.2,1.1,.4,1.05)}
+.sm-prompt-icon{grid-column:1;grid-row:1;width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,rgba(255,138,0,.18),rgba(255,78,53,.10));border:1px solid rgba(255,138,0,.32);color:#ffb14a;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sm-prompt-body{grid-column:2;grid-row:1;min-width:0}
+.sm-prompt-title{margin:2px 0 6px;font-size:16px;font-weight:800;color:#f1f1f4;letter-spacing:.005em;line-height:1.3}
+.sm-prompt-detail{margin:0;font-size:13px;line-height:1.55;color:#a5acbb}
+.sm-prompt-actions{grid-column:1 / -1;grid-row:2;display:flex;gap:10px;justify-content:flex-end;align-items:center;flex-wrap:wrap;margin-top:6px}
+.sm-prompt-btn{padding:9px 18px;border-radius:10px;border:1px solid transparent;font-size:13px;font-weight:700;cursor:pointer;transition:transform .12s ease,box-shadow .15s ease,background .15s,color .15s,border-color .15s;letter-spacing:.01em;background:transparent;color:#d2d2d6;outline:none}
+.sm-prompt-btn:focus-visible{box-shadow:0 0 0 2px rgba(255,138,0,.5)}
+.sm-prompt-btn-ghost{color:#85858c;border-color:rgba(140,140,146,.22)}
+.sm-prompt-btn-ghost:hover{color:#d2d2d6;border-color:rgba(140,140,146,.45);background:rgba(140,140,146,.06)}
+.sm-prompt-btn-secondary{color:#d2d2d6;border-color:rgba(140,140,146,.3);background:rgba(140,140,146,.08)}
+.sm-prompt-btn-secondary:hover{border-color:rgba(140,140,146,.55);background:rgba(140,140,146,.16)}
+.sm-prompt-btn-primary{color:#fff;background:linear-gradient(135deg,#ff8a00,#ff4e35);border-color:rgba(255,255,255,.08);box-shadow:0 6px 18px rgba(255,78,53,.28)}
+.sm-prompt-btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 26px rgba(255,138,0,.35),0 0 14px rgba(255,78,53,.18)}
+.sm-prompt-btn-primary:active{transform:translateY(0)}
+@keyframes smPromptFade{from{opacity:0}to{opacity:1}}
+@keyframes smPromptPop{from{opacity:0;transform:translateY(6px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+/* Light theme variant — soft surface, warm accent stays orange */
+[data-theme="light"] .sm-prompt-back{background:rgba(230,234,240,.55)}
+[data-theme="light"] .sm-prompt-modal{background:linear-gradient(180deg,#ffffff,#eef2f8);border-color:rgba(255,138,0,.32);box-shadow:0 20px 56px rgba(30,36,56,.18),0 0 22px rgba(255,138,0,.08)}
+[data-theme="light"] .sm-prompt-title{color:#1a1c25}
+[data-theme="light"] .sm-prompt-detail{color:#5c606d}
+[data-theme="light"] .sm-prompt-btn-ghost{color:#5c606d;border-color:rgba(30,36,56,.12)}
+[data-theme="light"] .sm-prompt-btn-ghost:hover{color:#1a1c25;border-color:rgba(30,36,56,.28);background:rgba(30,36,56,.04)}
+[data-theme="light"] .sm-prompt-btn-secondary{color:#262934;background:rgba(30,36,56,.05);border-color:rgba(30,36,56,.16)}
+[data-theme="light"] .sm-prompt-btn-secondary:hover{background:rgba(30,36,56,.1);border-color:rgba(30,36,56,.3)}
 /* Reversed badge on canvas overlay */
 .ed-reversed-badge{position:absolute;top:3px;left:3px;font-size:13px;line-height:1;pointer-events:none;z-index:5;text-shadow:0 1px 3px #000;opacity:.9}
 .ed-props::-webkit-scrollbar{width:5px}
@@ -903,11 +999,20 @@
 
 @media(max-width:1100px){.ed-workspace{grid-template-columns:1fr}.ed-props{max-height:300px}}
 
-/* Editor-mode: fill height, no external scroll */
-.main-scroll.editor-mode{overflow:hidden!important;padding-bottom:22px!important;display:flex!important;flex-direction:column!important;height:100%!important}
+/* Editor-mode: natural content height. Scroll only appears when the window
+   can't fit everything (small monitors). On big monitors the editor takes
+   its desired size — preview no longer stretches to fill the whole window. */
+.main-scroll.editor-mode{overflow-y:auto!important;overflow-x:hidden!important;padding-bottom:22px!important;display:flex!important;flex-direction:column!important;height:100%!important}
 .main-scroll.editor-mode .compact-header{flex-shrink:0}
-.main-scroll.editor-mode .page-animate{flex:1 1 0;min-height:0;display:flex;flex-direction:column}
-.main-scroll.editor-mode .editor-page{flex:1 1 0;min-height:0}
+/* All editor sections sit at natural content height — the timeline goes
+   directly under the preview, no big empty gap. If the window can't fit
+   it all, the main-scroll's overflow-y:auto adds a right-side scrollbar. */
+.main-scroll.editor-mode .page-animate{flex:0 0 auto;min-height:0;display:flex;flex-direction:column}
+.main-scroll.editor-mode .editor-page{flex:0 0 auto;min-height:0}
+.main-scroll.editor-mode .ed-tl-section{flex:0 0 auto}
+/* Workspace height = its natural content so the timeline sits right
+   under the preview's resize handle (no big grey gap by default). */
+.main-scroll.editor-mode .ed-workspace{min-height:0}
 
 /* Clip glow when track is selected */
 .etl-track-row.etl-selected .etl-clip{box-shadow:0 0 0 2px rgba(255,138,0,.9),0 0 12px rgba(255,138,0,.4)!important;border-color:rgba(255,255,255,.7)!important}
@@ -1227,9 +1332,9 @@
 .nuc-btn:hover{filter:brightness(1.08)}
 .nuc-btn:active{transform:scale(.98)}
 
-.notif-toasts{position:fixed;top:48px;right:16px;z-index:9200;display:flex;flex-direction:column;gap:9px;width:330px;pointer-events:none}
+.notif-toasts{position:fixed;top:48px;left:12px;z-index:9200;display:flex;flex-direction:column;gap:9px;width:330px;pointer-events:none}
 .notif-toast{pointer-events:auto;display:flex;gap:10px;padding:11px 12px;border-radius:12px;background:#121b2c;border:1px solid rgba(122,139,174,.22);box-shadow:0 16px 40px rgba(0,0,0,.5);cursor:pointer;animation:toastIn .26s cubic-bezier(.2,.9,.25,1)}
-@keyframes toastIn{from{opacity:0;transform:translateX(44px)}to{opacity:1;transform:translateX(0)}}
+@keyframes toastIn{from{opacity:0;transform:translateX(-44px)}to{opacity:1;transform:translateX(0)}}
 .notif-toast.update-ready{border-color:rgba(64,210,140,.45);background:linear-gradient(135deg,#13202a,#15281f)}
 .nt-icon{flex:0 0 auto;display:flex;align-items:flex-start;color:#ffb35c;padding-top:1px}
 .notif-toast.update-ready .nt-icon{color:#3ddc91}
@@ -1318,6 +1423,14 @@
 
 /* Transitions strength buttons */
 .ed-trans-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:6px}
+/* Transition kind picker — each chip directly adds a transition of that
+   kind. Laid out as a 2×2 grid so they look like neat buttons. */
+.ed-trans-chips{display:flex;flex-wrap:wrap;gap:6px}
+.ed-trans-chips-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.ed-trans-chip{padding:10px 12px;border-radius:10px;border:1px solid rgba(140,140,146,.28);background:rgba(140,140,146,.08);color:#d2d2d6;font-size:12.5px;font-weight:700;cursor:pointer;transition:background .15s, border-color .15s, color .15s, transform .15s ease, box-shadow .15s ease;text-align:center}
+.ed-trans-chip:hover{border-color:rgba(255,138,0,.6);color:#ff9d2e;background:rgba(255,138,0,.08);transform:translateY(-1px);box-shadow:0 0 14px rgba(255,138,0,.12)}
+[data-theme="light"] .ed-trans-chip{background:rgba(255,255,255,.6);color:#1a1c25;border-color:rgba(20,24,40,.18)}
+[data-theme="light"] .ed-trans-chip:hover{border-color:rgba(255,138,0,.6);color:#d77400;background:rgba(255,138,0,.08)}
 .ed-trans-btn{height:36px;font-weight:700;letter-spacing:.02em;border-radius:9px;border:1px solid rgba(140,140,146,.26);background:#15151a;color:#cbcbd0;transition:border-color .12s,background .12s,color .12s,transform .12s}
 .ed-trans-btn:hover{transform:translateY(-1px)}
 .ed-trans-low{border-color:rgba(253,224,71,.35)}
@@ -1327,3 +1440,279 @@
 .ed-trans-high{border-color:rgba(248,113,113,.45)}
 .ed-trans-high:hover{border-color:#ef4444;background:rgba(248,113,113,.10);color:#fca5a5}
 [data-theme="light"] .ed-trans-btn{background:#fff;color:#3a3e4d;border-color:rgba(40,46,70,.18)}
+
+/* ─── Settings/Watermark embedded inside Format/Unique card ─────────── */
+.settings-grid.settings-embedded,.wm-embedded{margin-top:22px;padding-top:22px;border-top:1px solid rgba(140,140,146,.18)}
+.wm-embedded .wm-hint-line{margin:0 0 12px;font-size:13px}
+/* Strip the sub-card styling when settings render inline — no double borders.
+   Use heavy selectors to outrank both themes' generic .settings-block rules.  */
+html .settings-grid.settings-embedded > .settings-block,
+[data-theme="light"] .settings-grid.settings-embedded > .settings-block,
+[data-theme="dark"] .settings-grid.settings-embedded > .settings-block{
+  background:transparent!important;background-color:transparent!important;
+  border:0!important;padding:0!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;box-shadow:none!important;
+}
+html .settings-grid.settings-embedded > .settings-block + .settings-block,
+[data-theme="light"] .settings-grid.settings-embedded > .settings-block + .settings-block,
+[data-theme="dark"] .settings-grid.settings-embedded > .settings-block + .settings-block{
+  padding-top:18px!important;border-top:1px solid rgba(140,140,146,.18)!important;
+}
+.settings-grid.settings-embedded > .settings-block h3{margin:0 0 14px;font-size:14px}
+html .wm-embedded .wm-card,
+[data-theme="light"] .wm-embedded .wm-card,
+[data-theme="dark"] .wm-embedded .wm-card{
+  background:transparent!important;background-color:transparent!important;
+  border:0!important;padding:0!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;box-shadow:none!important;
+}
+
+/* ─── Editor compact header: title + action buttons (no info chips) ────── */
+.compact-header.editor-header{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.editor-header-actions{display:flex;align-items:center;gap:14px}
+
+/* Smooth hover animations for editor toolbar + header action buttons — match
+   the feel of the .ed-effect-btn buttons in the layer panel. */
+.ed-file-btn,
+.ed-preset-btn,
+.ed-clear-btn,
+.ed-learn-btn,
+.ed-header-save-btn,
+.editor-header-actions .ed-file-btn{
+  transition:background .18s ease, border-color .18s ease, color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+.ed-file-btn:hover:not(:disabled),
+.ed-preset-btn:hover:not(:disabled):not(.active){
+  transform:translateY(-1px);
+  box-shadow:0 0 18px rgba(255,138,0,.14);
+}
+.ed-clear-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 0 18px rgba(255,98,98,.18)}
+.ed-learn-btn:hover{transform:translateY(-1px);box-shadow:0 0 18px rgba(163,60,255,.18)}
+.ed-header-save-btn{transition:background .18s ease, box-shadow .18s ease, transform .18s ease, filter .18s ease}
+.ed-header-save-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 0 28px rgba(255,138,0,.4);filter:brightness(1.06)}
+
+/* ─── Editor confirm modal ─────────────────────────────────────────────── */
+.ed-confirm-modal{width:min(360px,86vw);max-height:none;padding:18px 18px 16px!important}
+.ed-confirm-modal h2{margin:0 0 6px;font-size:17px}
+.ed-confirm-text{margin:0 0 14px;color:#b0b0b6;font-size:13px;line-height:1.45}
+.ed-confirm-actions{justify-content:flex-end;gap:8px;margin-top:0}
+.ed-confirm-actions .btn{min-height:34px;padding:0 16px;font-size:13px}
+.btn.ed-confirm-danger{background:linear-gradient(135deg,#ff4855,#d4233d);box-shadow:0 0 22px rgba(255,72,85,.24);border:0}
+[data-theme="light"] .ed-confirm-text{color:#2a2d38!important}
+[data-theme="light"] .btn.ed-confirm-danger{background:linear-gradient(135deg,#ff5564,#e0334a);color:#fff}
+.editor-header-actions .ed-file-btn{height:36px;padding:0 14px}
+.editor-header-actions .ed-header-save-btn{height:36px;min-height:36px;padding:0 22px;font-weight:850}
+
+/* ─── Light theme: frosted-glass popups (replaces heavy shadows) ────────── */
+[data-theme="light"] .info-help .help-tip,
+[data-theme="light"] .help em,
+[data-theme="light"] .info-help em{
+  background:rgba(255,255,255,.38)!important;
+  -webkit-backdrop-filter:blur(22px) saturate(1.6)!important;
+  backdrop-filter:blur(22px) saturate(1.6)!important;
+  border:1px solid rgba(255,255,255,.45)!important;
+  color:#1a1c25!important;
+  box-shadow:0 6px 18px rgba(20,24,40,.10)!important;
+}
+[data-theme="light"] .donate-modal,
+[data-theme="light"] .help-modal,
+[data-theme="light"] .result-modal,
+[data-theme="light"] .editor-save-modal-card,
+[data-theme="light"] .save-fmt-dialog{
+  background:rgba(255,255,255,.38)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.6)!important;
+  backdrop-filter:blur(28px) saturate(1.6)!important;
+  border:1px solid rgba(255,255,255,.5)!important;
+  box-shadow:0 10px 28px rgba(20,24,40,.12)!important;
+  color:#15171f!important;
+}
+[data-theme="light"] .donate-modal h1,[data-theme="light"] .donate-modal h2,[data-theme="light"] .donate-modal h3,[data-theme="light"] .donate-modal p,
+[data-theme="light"] .help-modal h1,[data-theme="light"] .help-modal h2,[data-theme="light"] .help-modal h3,[data-theme="light"] .help-modal p,
+[data-theme="light"] .result-modal h1,[data-theme="light"] .result-modal h2,[data-theme="light"] .result-modal h3,[data-theme="light"] .result-modal p,
+[data-theme="light"] .editor-save-modal-card h1,[data-theme="light"] .editor-save-modal-card h2,[data-theme="light"] .editor-save-modal-card p,
+[data-theme="light"] .save-fmt-dialog h1,[data-theme="light"] .save-fmt-dialog h2,[data-theme="light"] .save-fmt-dialog p{color:#15171f!important}
+[data-theme="light"] .notif-panel{
+  background:rgba(255,255,255,.38)!important;
+  -webkit-backdrop-filter:blur(24px) saturate(1.5);
+  backdrop-filter:blur(24px) saturate(1.5);
+  border:1px solid rgba(255,255,255,.5);
+  box-shadow:0 8px 22px rgba(20,24,40,.10);
+}
+[data-theme="light"] .notif-toast,
+[data-theme="light"] .notif-toast.update-ready{
+  background:rgba(255,255,255,.38)!important;
+  -webkit-backdrop-filter:blur(20px) saturate(1.5);
+  backdrop-filter:blur(20px) saturate(1.5);
+  border:1px solid rgba(255,255,255,.5);
+  box-shadow:0 6px 18px rgba(20,24,40,.10);
+}
+
+/* ─── Dark theme: same frosted-glass treatment for modals & popups ──── */
+:root .info-help .help-tip,
+:root .help em,
+:root .info-help em{
+  background:rgba(40,40,42,.5)!important;
+  -webkit-backdrop-filter:blur(22px) saturate(1.4)!important;
+  backdrop-filter:blur(22px) saturate(1.4)!important;
+  border:1px solid rgba(255,255,255,.10)!important;
+  box-shadow:0 8px 22px rgba(0,0,0,.45)!important;
+}
+:root .donate-modal,
+:root .help-modal,
+:root .result-modal,
+:root .editor-save-modal-card,
+:root .save-fmt-dialog{
+  background:rgba(38,38,42,.5)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.4)!important;
+  backdrop-filter:blur(28px) saturate(1.4)!important;
+  border:1px solid rgba(255,255,255,.08)!important;
+  box-shadow:0 12px 32px rgba(0,0,0,.5)!important;
+}
+/* Notif panel + all toasts share the EXACT same look as .donate-modal. */
+:root .notif-panel,
+:root .notif-panel.notif-panel,
+:root .notif-toast,
+:root .notif-toast.update-ready,
+:root .notif-toast.info,
+:root .notif-toast.update-mac{
+  background:rgba(38,38,42,.5)!important;
+  background-color:rgba(38,38,42,.5)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.4)!important;
+  backdrop-filter:blur(28px) saturate(1.4)!important;
+  border:1px solid rgba(255,255,255,.08)!important;
+  box-shadow:0 12px 32px rgba(0,0,0,.5)!important;
+  border-radius:22px!important;
+}
+[data-theme="light"] .notif-panel,
+[data-theme="light"] .notif-toast,
+[data-theme="light"] .notif-toast.update-ready,
+[data-theme="light"] .notif-toast.info,
+[data-theme="light"] .notif-toast.update-mac{
+  background:rgba(255,255,255,.82)!important;
+  background-color:rgba(255,255,255,.82)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.6)!important;
+  backdrop-filter:blur(28px) saturate(1.6)!important;
+  border:1px solid rgba(255,255,255,.65)!important;
+  box-shadow:0 10px 28px rgba(20,24,40,.12)!important;
+  color:#15171f!important;
+}
+
+/* ─── Solid (non-glass) override for the Save dialog, notification
+       panel and all toasts — they need full opacity, not see-through. ──── */
+:root .editor-save-modal-card,
+:root .save-fmt-dialog,
+:root .notif-panel,
+:root .notif-toast,
+:root .notif-toast.update-ready,
+:root .notif-toast.info,
+:root .notif-toast.update-mac{
+  background:#202024!important;
+  background-color:#202024!important;
+  -webkit-backdrop-filter:none!important;
+  backdrop-filter:none!important;
+  border:1px solid rgba(255,255,255,.10)!important;
+  box-shadow:0 14px 38px rgba(0,0,0,.55)!important;
+}
+/* Light theme: restore the frosted-glass look — keep the soft gray tint
+   for the panel (which the user liked), white tint for the save dialog and
+   toasts. Backdrop blur lets the page show through with the proper feel. */
+html[data-theme="light"] .notif-panel,
+html[data-theme="light"] .notif-panel.notif-panel{
+  background:rgba(232,234,240,.62)!important;
+  background-color:rgba(232,234,240,.62)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.6)!important;
+  backdrop-filter:blur(28px) saturate(1.6)!important;
+  border:1px solid rgba(255,255,255,.55)!important;
+  box-shadow:0 10px 28px rgba(20,24,40,.14)!important;
+  color:#15171f!important;
+}
+html[data-theme="light"] .notif-panel-head{
+  background:transparent!important;
+  border-bottom:1px solid rgba(20,24,40,.10)!important;
+  color:#15171f!important;
+}
+html[data-theme="light"] .notif-toast,
+html[data-theme="light"] .notif-toast.update-ready,
+html[data-theme="light"] .notif-toast.info,
+html[data-theme="light"] .notif-toast.update-mac{
+  background:rgba(255,255,255,.55)!important;
+  background-color:rgba(255,255,255,.55)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.6)!important;
+  backdrop-filter:blur(28px) saturate(1.6)!important;
+  border:1px solid rgba(255,255,255,.65)!important;
+  box-shadow:0 10px 28px rgba(20,24,40,.12)!important;
+  color:#15171f!important;
+}
+/* Save dialog needs higher opacity — content (sliders, buttons) must be
+   clearly readable, no busy backdrop bleeding through. */
+html[data-theme="light"] .editor-save-modal-card,
+html[data-theme="light"] .save-fmt-dialog{
+  background:rgba(255,255,255,.92)!important;
+  background-color:rgba(255,255,255,.92)!important;
+  -webkit-backdrop-filter:blur(28px) saturate(1.6)!important;
+  backdrop-filter:blur(28px) saturate(1.6)!important;
+  border:1px solid rgba(255,255,255,.85)!important;
+  box-shadow:0 14px 38px rgba(20,24,40,.18)!important;
+  color:#15171f!important;
+}
+
+/* ─── Donate modal layout refinements ─────────────────────────────────── */
+.donate-modal{position:relative;padding-bottom:30px!important}
+.donate-coin-label{font-size:18px!important;font-weight:900!important;letter-spacing:.02em;color:#ff9821!important}
+.donate-actions-row{display:flex;align-items:center;justify-content:flex-start;gap:10px;margin-top:18px}
+.donate-copy-btn{width:180px;min-height:44px;border:0;background:linear-gradient(135deg,#ff8a00,#ff421b);box-shadow:0 0 24px rgba(255,138,0,.22);border-radius:13px;color:#fff;font-weight:800;padding:0 14px;font-size:13.5px}
+.donate-copy-btn:hover{filter:brightness(1.08)}
+.donate-close-btn{position:absolute;right:24px;bottom:22px;border:1px solid rgba(140,140,146,.24);background:#19191c;border-radius:11px;color:#fff;font-weight:700;padding:0 16px;height:34px;font-size:12.5px}
+.donate-close-btn:hover{border-color:rgba(163,60,255,.55);box-shadow:0 0 18px rgba(163,60,255,.14)}
+[data-theme="light"] .donate-close-btn{background:rgba(255,255,255,.6)!important;color:#1a1c25!important;border-color:rgba(20,24,40,.18)!important}
+[data-theme="light"] .donate-coin-label{color:#e07a1f!important}
+
+/* ─── Notification panel CONTENTS (cards inside the bell dropdown) ──── */
+:root .notif-item,:root .notif-item.fresh,:root .notif-item.is-update{
+  background:#2a2a2e!important;
+  border:1px solid rgba(255,255,255,.08)!important;
+}
+:root .notif-item.fresh{border-left:3px solid #a060ff!important}
+:root .notif-item.is-update{border-left:3px solid #8f5cff!important}
+:root .notif-update-card{
+  background:#2a2a2e!important;
+  border:1px solid rgba(255,255,255,.08)!important;
+}
+:root .notif-update-card.ready{
+  background:#1f3027!important;
+  border-color:rgba(64,210,140,.4)!important;
+}
+[data-theme="light"] .notif-item,
+[data-theme="light"] .notif-item.fresh,
+[data-theme="light"] .notif-item.is-update{
+  background:#f3f4f8!important;
+  border:1px solid rgba(20,24,40,.10)!important;
+  color:#15171f!important;
+}
+[data-theme="light"] .notif-item-title{color:#15171f!important}
+[data-theme="light"] .notif-item-body{color:#3a3e4d!important}
+[data-theme="light"] .notif-item-date{color:#6a6f80!important}
+[data-theme="light"] .notif-update-card{
+  background:#f3f4f8!important;
+  border:1px solid rgba(20,24,40,.10)!important;
+  color:#15171f!important;
+}
+[data-theme="light"] .notif-update-card.ready{
+  background:#e8f5ee!important;
+  border-color:rgba(38,170,110,.4)!important;
+}
+[data-theme="light"] .nuc-title{color:#15171f!important}
+[data-theme="light"] .nuc-text{color:#3a3e4d!important}
+[data-theme="light"] .notif-panel h2,[data-theme="light"] .notif-panel h3,[data-theme="light"] .notif-panel p,
+[data-theme="light"] .notif-toast h2,[data-theme="light"] .notif-toast h3,[data-theme="light"] .notif-toast p,
+[data-theme="light"] .notif-panel .nt-title,[data-theme="light"] .notif-toast .nt-title{color:#15171f!important}
+/* Re-apply light theme on top so it still wins when [data-theme="light"]. */
+[data-theme="light"] .info-help .help-tip,
+[data-theme="light"] .help em,
+[data-theme="light"] .info-help em{background:rgba(255,255,255,.38)!important;border-color:rgba(255,255,255,.45)!important;box-shadow:0 6px 18px rgba(20,24,40,.10)!important}
+[data-theme="light"] .donate-modal,
+[data-theme="light"] .help-modal,
+[data-theme="light"] .result-modal,
+[data-theme="light"] .editor-save-modal-card,
+[data-theme="light"] .save-fmt-dialog{background:rgba(255,255,255,.38)!important;border-color:rgba(255,255,255,.5)!important;box-shadow:0 10px 28px rgba(20,24,40,.12)!important}
+[data-theme="light"] .notif-panel{background:rgba(255,255,255,.38)!important;border-color:rgba(255,255,255,.5)!important;box-shadow:0 8px 22px rgba(20,24,40,.10)!important}
+[data-theme="light"] .notif-toast,
+[data-theme="light"] .notif-toast.update-ready{background:rgba(255,255,255,.38)!important;border-color:rgba(255,255,255,.5)!important;box-shadow:0 6px 18px rgba(20,24,40,.10)!important}

@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.2.3';
+const APP_VERSION = 'v1.2.5';
 const DONATE_WALLET = 'TGoUEoM6AjG6KjnXJi9hFYRn54c6HsTybE';
 
 const A = {
@@ -16,13 +16,25 @@ const A = {
   cubeFinishWhite: new URL('../assets/cube-white-finish.mp4', import.meta.url).href,
   cubeFinishBlack: new URL('../assets/cube-black-finish.mp4', import.meta.url).href,
 };
+// Layer-type icons shown next to the clip name on the timeline track row.
+// One PNG per type (maskedVideo and mainVideo reuse the video icon).
+const LAYER_ICONS = {
+  videoOverlay: new URL('../assets/layer-icons/video.png', import.meta.url).href,
+  mainVideo:    new URL('../assets/layer-icons/video.png', import.meta.url).href,
+  maskedVideo:  new URL('../assets/layer-icons/video.png', import.meta.url).href,
+  image:        new URL('../assets/layer-icons/image.png', import.meta.url).href,
+  audio:        new URL('../assets/layer-icons/audio.png', import.meta.url).href,
+  text:         new URL('../assets/layer-icons/text.png', import.meta.url).href,
+  mask:         new URL('../assets/layer-icons/mask.png', import.meta.url).href,
+  blur:         new URL('../assets/layer-icons/blur.png', import.meta.url).href,
+  zoom:         new URL('../assets/layer-icons/zoom.png', import.meta.url).href,
+  transition:   new URL('../assets/layer-icons/transition.png', import.meta.url).href,
+};
 
 const nav = [
   ['home', 'Главная'],
-  ['format', 'Формат'],
   ['unique', 'Уникализация'],
-  ['watermark', 'Водяной знак'],
-  ['settings', 'Экспорт'],
+  ['format', 'Формат и экспорт'],
   ['editor', 'Редактирование'],
 ];
 
@@ -105,7 +117,6 @@ function App() {
   const [logs, setLogs] = useState([]);
   const [result, setResult] = useState(null);
   const [queueOpen, setQueueOpen] = useState(false);
-  const [details, setDetails] = useState(false);
   const [donateOpen, setDonateOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [theme, setTheme] = useState(() => {
@@ -143,7 +154,7 @@ function App() {
     useGlobalFilename: false, globalFilename: '',
     trimEnabled: false, trimStart: 0, trimEnd: 0,
     watermarkAngle: 0, watermarkBox: true, watermarkAlign: 'center',
-    weightMode: 'auto', processingProfile: 'balance', largeBatchMode: false, parallelJobs: 1, hardwareAccel: 'auto', backgroundMode: false, cleanupTemp: true, resumeMode: true, safeNames: true,
+    weightMode: 'auto', processingProfile: 'balance', largeBatchMode: false, parallelJobs: 1, hardwareAccel: 'auto', backgroundMode: true, cleanupTemp: true, resumeMode: true, safeNames: true,
   });
 
   useEffect(() => {
@@ -160,6 +171,33 @@ function App() {
   const [fileNames, setFileNames] = useState({});
   const [editorState, setEditorState] = useState(EDITOR_DEFAULT);
   const dragIndex = useRef(null);
+  // Listen for project files opened from the OS (double-click .smproj in
+  // Explorer / Finder, or "Open with…"). When one arrives, switch to the
+  // editor tab and replay the project state.
+  useEffect(() => {
+    if (!window.strata?.onProjectOpen) return;
+    const off = window.strata.onProjectOpen((payload) => {
+      if (!payload?.ok || !payload.data?.state) {
+        if (payload && !payload.ok) alert('Не удалось открыть проект: ' + (payload.error || 'неизвестная ошибка'));
+        return;
+      }
+      const s = payload.data.state;
+      setEditorState({
+        file: s.file ?? null,
+        totalDuration: Number(s.totalDuration) || 10,
+        videoStart: Number(s.videoStart) || 0,
+        videoEnd: Number(s.videoEnd) || (Number(s.totalDuration) || 10),
+        layers: Array.isArray(s.layers) ? s.layers : [],
+        outWidth: Number(s.outWidth) || 1080,
+        outHeight: Number(s.outHeight) || 1920,
+        bgColor: s.bgColor || '#000000',
+        fadeIn: Number(s.fadeIn) || 0,
+        fadeOut: Number(s.fadeOut) || 0,
+      });
+      setActive('editor');
+    });
+    return () => { try { off?.(); } catch {} };
+  }, []);
   function removeFileAt(index) {
     setFiles((list) => {
       const removed = list[index];
@@ -230,10 +268,16 @@ function App() {
             <div key={active} className="page-animate">
               {active === 'home' && <Home files={files} visibleFiles={visibleFiles} chooseFiles={chooseFiles} clearFiles={clearFiles} onDrop={onDrop} queueOpen={queueOpen} setQueueOpen={setQueueOpen} settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} totalOutput={totalOutput} removeFileAt={removeFileAt} moveFile={moveFile} dragIndex={dragIndex} fileNames={fileNames} setFileNames={setFileNames} />}
               {active === 'editor' && <Editor state={editorState} setState={setEditorState} />}
-              {active === 'format' && <Format settings={settings} applyFormat={applyFormat} update={update} />}
-              {active === 'unique' && <Unique settings={settings} update={update} applyUnique={applyUnique} />}
-              {active === 'watermark' && <Watermark settings={settings} update={update} chooseWatermark={chooseWatermark} />}
-              {active === 'settings' && <Settings settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} logs={logs} />}
+              {active === 'format' && (
+                <Format settings={settings} applyFormat={applyFormat} update={update}>
+                  <Settings settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} logs={logs} embedded />
+                </Format>
+              )}
+              {active === 'unique' && (
+                <Unique settings={settings} update={update} applyUnique={applyUnique}>
+                  <Watermark settings={settings} update={update} chooseWatermark={chooseWatermark} embedded />
+                </Unique>
+              )}
             </div>
           </div>
           {active !== 'editor' && <BottomProgress progress={progress} result={result} openResults={() => setResult(result)} />}
@@ -303,6 +347,7 @@ function NotificationBell() {
   const [muted, setMuted] = useState(() => { try { return localStorage.getItem(NOTIF_MUTE_KEY) === '1'; } catch { return false; } });
 
   const announcedRef = useRef(null);
+  const firstLoadDoneRef = useRef(false);
   const updateAnnouncedRef = useRef('');
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
@@ -323,13 +368,29 @@ function NotificationBell() {
     const apply = (list) => {
       const arr = Array.isArray(list) ? list : [];
       setNotifs(arr);
-      if (announcedRef.current == null) {
-        announcedRef.current = new Set(arr.map((n) => n.id));
+      // Toast any notification this user hasn't been shown before, on first
+      // fetch or later. Persisted via localStorage so an old anonuncement
+      // doesn't keep popping each launch — but a brand-new one (added after
+      // an app update) gets one toast.
+      const seenSet = loadSeenIds();
+      const fresh = arr.filter((n) => !seenSet.has(n.id) && !announcedRef.current.has(n.id));
+      if (!firstLoadDoneRef.current) {
+        // Seed announcedRef with everything currently seen so subsequent
+        // fetches don't re-toast.
+        announcedRef.current = new Set([...seenSet, ...arr.map(n => n.id)]);
+        if (arr.length > 0) firstLoadDoneRef.current = true;
       } else {
-        arr.filter((n) => !announcedRef.current.has(n.id)).forEach((n) => {
-          announcedRef.current.add(n.id);
-          spawnToast({ kind: 'info', title: n.title || 'Новое сообщение', body: n.body || '' });
-        });
+        fresh.forEach(n => announcedRef.current.add(n.id));
+      }
+      fresh.forEach((n) => {
+        spawnToast({ kind: 'info', title: n.title || 'Новое сообщение', body: n.body || '' });
+      });
+      // Mark them as seen so we never re-toast on next launch.
+      if (fresh.length) {
+        const next = new Set(seenSet);
+        fresh.forEach(n => next.add(n.id));
+        saveSeenIds(next);
+        setSeen(next);
       }
     };
     api.get().then(apply).catch(() => {});
@@ -345,6 +406,11 @@ function NotificationBell() {
       if (s.status === 'downloaded' && s.version && updateAnnouncedRef.current !== s.version) {
         updateAnnouncedRef.current = s.version;
         spawnToast({ kind: 'update-ready', title: 'Обновление готово', body: `Версия ${s.version} загружена. Нажми «Обновить» или просто закрой программу — установится при следующем запуске.` });
+      }
+      // macOS: notify-only flow (DMG is unsigned → no auto-install).
+      if (s.status === 'mac-available' && s.version && updateAnnouncedRef.current !== s.version) {
+        updateAnnouncedRef.current = s.version;
+        spawnToast({ kind: 'update-mac', title: 'Доступна новая версия', body: `Вышла v${s.version}. Нажми «Скачать» — DMG откроется из GitHub, потом перетащи приложение в Applications.` });
       }
     };
     api.getState().then(apply).catch(() => {});
@@ -363,7 +429,7 @@ function NotificationBell() {
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
   }, [open]);
 
-  const updateUnread = update.status === 'downloaded' && update.version && !seen.has('update:' + update.version);
+  const updateUnread = (update.status === 'downloaded' || update.status === 'mac-available') && update.version && !seen.has('update:' + update.version);
   const unreadCount = notifs.filter((n) => !seen.has(n.id)).length + (updateUnread ? 1 : 0);
 
   function togglePanel() {
@@ -372,7 +438,7 @@ function NotificationBell() {
       if (next) {
         const ns = new Set(seen);
         notifs.forEach((n) => ns.add(n.id));
-        if (update.status === 'downloaded' && update.version) ns.add('update:' + update.version);
+        if ((update.status === 'downloaded' || update.status === 'mac-available') && update.version) ns.add('update:' + update.version);
         setSeen(ns);
         persistSeenIds(ns);
       }
@@ -385,7 +451,7 @@ function NotificationBell() {
   }
 
   const ordered = [...notifs].reverse();
-  const showEmpty = ordered.length === 0 && update.status !== 'downloaded' && update.status !== 'downloading';
+  const showEmpty = ordered.length === 0 && update.status !== 'downloaded' && update.status !== 'downloading' && update.status !== 'mac-available';
 
   return <>
     <button ref={btnRef} className={`notif-bell${unreadCount ? ' has-unread' : ''}${open ? ' open' : ''}`} onClick={togglePanel} title="Уведомления" aria-label="Уведомления">
@@ -413,6 +479,13 @@ function NotificationBell() {
               <button className="nuc-btn" onClick={doInstall}>Обновить сейчас</button>
             </div>
           )}
+          {update.status === 'mac-available' && (
+            <div className="notif-update-card ready">
+              <div className="nuc-title">Доступна новая версия{update.version ? ` · v${update.version}` : ''}</div>
+              <div className="nuc-text">На Mac обновление ставится вручную: нажми «Скачать», установи DMG в Applications.</div>
+              <button className="nuc-btn" onClick={doInstall}>Скачать</button>
+            </div>
+          )}
           {update.status === 'downloading' && (
             <div className="notif-update-card">
               <div className="nuc-title">Загрузка обновления{update.version ? ` · v${update.version}` : ''}</div>
@@ -438,7 +511,7 @@ function NotificationBell() {
         {toasts.map((t) => (
           <div key={t.key} className={`notif-toast ${t.kind}`} onClick={() => { togglePanel(); dismissToast(t.key); }}>
             <div className="nt-icon">
-              {t.kind === 'update-ready'
+              {(t.kind === 'update-ready' || t.kind === 'update-mac')
                 ? <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
                 : <BellIcon />}
             </div>
@@ -446,6 +519,7 @@ function NotificationBell() {
               <div className="nt-title">{t.title}</div>
               {t.body && <div className="nt-body">{t.body}</div>}
               {t.kind === 'update-ready' && <button className="nt-btn" onClick={(e) => { e.stopPropagation(); doInstall(); }}>Обновить</button>}
+              {t.kind === 'update-mac' && <button className="nt-btn" onClick={(e) => { e.stopPropagation(); doInstall(); }}>Скачать</button>}
             </div>
             <button className="nt-close" onClick={(e) => { e.stopPropagation(); dismissToast(t.key); }} aria-label="Скрыть">×</button>
           </div>
@@ -511,7 +585,21 @@ function WindowProgressBorder({ progress }) {
   </div>;
 }
 function CompactHeader({ active, files, formatText, totalOutput, settings }) {
-  const titles = { home: 'Главная', format: 'Формат результата', unique: 'Уникализация', watermark: 'Водяной знак', settings: 'Экспорт', editor: 'Редактирование' };
+  const titles = { home: 'Главная', format: 'Формат и экспорт', unique: 'Уникализация и водяной знак', editor: 'Редактирование' };
+  // Editor tab gets a focused header: just the title + the project-level
+  // action buttons. The info chips (видео / формат / копий / выход) only
+  // make sense for the batch-uniqualization pipeline, not for the editor.
+  if (active === 'editor') {
+    const fire = (name) => () => window.dispatchEvent(new CustomEvent(name));
+    return <div className="compact-header slim editor-header">
+      <h1>{titles.editor}</h1>
+      <div className="editor-header-actions">
+        <button className="ed-file-btn" onClick={fire('strata:editor-open-project')} title="Открыть проект (Ctrl+O)">Открыть проект</button>
+        <button className="ed-file-btn" onClick={fire('strata:editor-save-project')} title="Сохранить проект (Ctrl+S)">Сохранить проект</button>
+        <button className="btn primary ed-header-save-btn" onClick={fire('strata:editor-save')} title="Сохранить готовое видео">Сохранить</button>
+      </div>
+    </div>;
+  }
   return <div className="compact-header slim"><h1>{titles[active] || 'Strata Mixer'}</h1><div className="compact-summary"><span>Видео: <b>{files}</b></span><span>Формат: <b>{formatText}</b></span><span>Копий: <b>{settings.copies}</b></span><span>Выход: <b>{totalOutput}</b></span></div></div>;
 }
 
@@ -574,7 +662,7 @@ function Home({ files, visibleFiles, chooseFiles, clearFiles, onDrop, queueOpen,
   </div>;
 }
 
-function Format({ settings, applyFormat, update }) {
+function Format({ settings, applyFormat, update, children }) {
   return <section className="card page-card format-page">
     <div className="format-grid">
       {formats.map((f) => <button className={`format-card ${settings.format === f.id ? 'selected' : ''}`} key={f.id} onClick={() => applyFormat(f.id)}>
@@ -585,20 +673,22 @@ function Format({ settings, applyFormat, update }) {
     {settings.useCustomSize && <div className="custom-size-card"><h3>Свой размер</h3><div className="custom-fields"><label><span>Ширина</span><input type="number" value={settings.customWidth} onChange={(e) => update('customWidth', e.target.value)} /></label><label><span>Высота</span><input type="number" value={settings.customHeight} onChange={(e) => update('customHeight', e.target.value)} /></label></div><div className="quick-sizes">{sizeOptions.map((s) => <button key={s} onClick={() => { const [w,h]=s.split('x'); update('customWidth', Number(w)); update('customHeight', Number(h)); }}>{s}</button>)}</div></div>}
     <div className="fit-section"><h3>Как вписать видео <InfoHelp text={'Если итоговый размер отличается от исходного видео, нужно выбрать как поместить картинку в новый формат. Размытый фон — видео остаётся целиком, свободное место заполняется размытым фоном. Поля — видео целиком, свободное место заполняется тёмными полями. Заполнить кадр — видео заполняет весь размер, лишние края могут быть обрезаны.'} /></h3><p className="fit-note">Выбери, что делать со свободным местом при смене размера видео.</p><div className="seg"><button className={settings.fit === 'blur' ? 'selected' : ''} onClick={() => update('fit', 'blur')}>Размытый фон</button><button className={settings.fit === 'pad' ? 'selected' : ''} onClick={() => update('fit', 'pad')}>Поля</button><button className={settings.fit === 'crop' ? 'selected' : ''} onClick={() => update('fit', 'crop')}>Заполнить кадр</button></div></div>
     <div className="trim-section"><div className="trim-head"><Switch label={<>Обрезка роликов <InfoHelp text={'Применяется ко всем загруженным видео. Например, можно удалить 2 секунды в начале и 1 секунду в конце каждого ролика. Если видео слишком короткое, оно будет отмечено как Rejected.'} /></>} checked={settings.trimEnabled} onChange={(v) => update('trimEnabled', v)} /></div>{settings.trimEnabled && <div className="trim-fields"><label><span>Убрать в начале, сек</span><input type="number" min="0" step="0.1" value={settings.trimStart} onChange={(e)=>update('trimStart', e.target.value)} /></label><label><span>Убрать в конце, сек</span><input type="number" min="0" step="0.1" value={settings.trimEnd} onChange={(e)=>update('trimEnd', e.target.value)} /></label></div>}</div>
+    {children}
   </section>;
 }
 
-function Unique({ settings, update, applyUnique }) {
+function Unique({ settings, update, applyUnique, children }) {
   const details = settings.preset === 'manual';
   return <section className="card page-card compact-content unique-page">
     <div className="format-grid small unique-grid">{uniquePresets.map((p) => <button className={`format-card unique-card ${p.id === 'manual' ? 'manual-card' : ''} ${settings.preset === p.id ? 'selected' : ''}`} key={p.id} onClick={() => applyUnique(p.id)}>
       <h3>{p.title}</h3><p>{p.desc}</p><span className="card-explain">{p.details}</span>{p.id === 'manual' && <b>тонкая настройка</b>}
     </button>)}</div>
     <div className={`manual-panel reveal-panel ${details ? '' : 'locked-panel'}`}><h3>{details ? 'Детальные настройки' : 'Параметры выбранного пресета'}</h3><p className="hint tiny">{details ? 'Manual: значения можно менять вручную.' : 'В Light / Medium / Strong значения показаны для понимания, но заблокированы. Для изменения выбери Manual.'}</p><div className="detail-grid"><Slider disabled={!details} label="Скорость, %" value={settings.speed} min="50" max="150" onChange={(v) => update('speed', v)} /><Switch disabled={!details} label={<>Микрозум <InfoHelp text={'Микрозум добавляет лёгкое движение кадра, но требует пересчёта видео. На больших пачках может заметно замедлить обработку.'} /></>} checked={settings.microzoomEnabled} onChange={(v) => update('microzoomEnabled', v)} /><Slider disabled={!details} label="Сила микрозума" value={settings.microzoom} min="0" max="20" onChange={(v) => update('microzoom', v)} /><Switch disabled={!details} label={<>Шум <InfoHelp text={'Шум уникализирует картинку, но сильно увеличивает нагрузку на обработку и может увеличить вес файла. Для больших пачек лучше ставить небольшое значение.'} /></>} checked={settings.noiseEnabled} onChange={(v) => update('noiseEnabled', v)} /><Slider disabled={!details} label="Сила шума" value={settings.noise} min="0" max="30" onChange={(v) => update('noise', v)} /><Slider disabled={!details} label="Яркость" value={settings.brightness} min="-20" max="20" onChange={(v) => update('brightness', v)} /><Slider disabled={!details} label="Контраст" value={settings.contrast} min="50" max="160" onChange={(v) => update('contrast', v)} /><Slider disabled={!details} label="Насыщенность" value={settings.saturation} min="50" max="180" onChange={(v) => update('saturation', v)} /><Slider disabled={!details} label="Резкость" value={settings.sharpness} min="0" max="200" onChange={(v) => update('sharpness', v)} /></div></div>
+    {children}
   </section>;
 }
 
-function Watermark({ settings, update, chooseWatermark }) {
+function Watermark({ settings, update, chooseWatermark, embedded }) {
   const wmTip = 'Водяной знак накладывается поверх каждого кадра. Картинка-водяной знак может обрабатываться дольше, чем обычный текст, особенно в больших пачках.';
   const layers = settings.textLayers || [];
   const activeId = settings.activeLayerId || (layers[0]?.id);
@@ -618,7 +708,7 @@ function Watermark({ settings, update, chooseWatermark }) {
     if (activeId === id) update('activeLayerId', next[0]?.id || null);
   }
 
-  return <section className="card page-card watermark-page"><p className="hint">Позицию знака можно менять мышкой прямо на предпросмотре слева.</p><div className="wm-grid">
+  const body = <><p className="hint wm-hint-line">Позицию знака можно менять мышкой прямо на предпросмотре слева.</p><div className="wm-grid">
     <div className="wm-card">
       <Switch label={<>Текстовый водяной знак <InfoHelp text={wmTip} /></>} checked={settings.textWatermarkEnabled} onChange={(v) => update('textWatermarkEnabled', v)} />
       {settings.textWatermarkEnabled && <div className="wm-fields">
@@ -642,7 +732,9 @@ function Watermark({ settings, update, chooseWatermark }) {
       </div>}
     </div>
     <div className="wm-card"><Switch label={<>Графический водяной знак <InfoHelp text={wmTip} /></>} checked={settings.imageWatermarkEnabled} onChange={(v) => update('imageWatermarkEnabled', v)} />{settings.imageWatermarkEnabled && <div className="wm-fields"><button className="btn secondary" onClick={chooseWatermark}>Выбрать файл</button><p className="file-name">{settings.imageWatermarkPath ? fileName(settings.imageWatermarkPath) : 'Файл не выбран'}</p><Slider label="Размер" value={settings.imageWatermarkSize} min="5" max="60" onChange={(v) => update('imageWatermarkSize', v)} /><Slider label="Прозрачность" value={settings.imageWatermarkOpacity} min="0" max="100" onChange={(v) => update('imageWatermarkOpacity', v)} /></div>}</div>
-  </div></section>;
+  </div></>;
+  if (embedded) return <div className="wm-embedded">{body}</div>;
+  return <section className="card page-card watermark-page">{body}</section>;
 }
 
 
@@ -655,25 +747,14 @@ function ResultStatus({ type, reason }) {
     {!ok && reason && <small className="reject-tip">{reason}</small>}
   </span>;
 }
-function Results({ result, logs, outputDir }) {
-  const created = result?.createdFiles || [];
-  const failed = result?.failedFiles || [];
-  return <section className="card page-card"><h2>Результаты</h2>{result ? <>
-    <p>Папка: <b>{result.outDir}</b></p>
-    <p>Создано: <b className="ok-text">{created.length}</b> · Не получилось: <b className="bad-text">{failed.length}</b></p>
-    <h3>Созданные файлы</h3>
-    <div className="result-list">{created.length ? created.map((f) => <div className="result-row" key={f}><span title={fileName(f)}>{compactName(f, 28)}</span><ResultStatus type="prepared" /></div>) : <div>Нет созданных файлов</div>}</div>
-    {failed.length > 0 && <><h3>Ошибки</h3><div className="result-list failed-list">{failed.map((x, i) => <div className="result-row" key={i}><span>{x.output ? fileName(x.output) : fileName(x.input)} — {x.reason || 'ошибка обработки'}</span><ResultStatus type="rejected" reason={x.reason || 'Ошибка обработки'} /></div>)}</div></>}
-    <button className="btn secondary" onClick={() => window.strata.openFolder(result.outDir)}>Открыть папку</button>
-  </> : <p className="hint">После обработки здесь появится список созданных файлов и ошибок.</p>}<h3>Журнал</h3><div className="log-box">{logs.length ? logs.map((l, i) => <div key={i}>{l}</div>) : 'Журнал пуст'}</div></section>; }
-function Settings({ settings, update, outputDir, chooseFolder }) {
+function Settings({ settings, update, outputDir, chooseFolder, embedded }) {
   const exportModes = [
     ['max', 'Максимальное'],
     ['normal', 'Обычное'],
     ['fast', 'Быстрое'],
     ['custom', 'Свои настройки'],
   ];
-  return <section className="card page-card settings-page compact-content"><div className="settings-grid">
+  const inner = <div className="settings-grid settings-embedded">
     <div className="settings-block"><h3>Куда сохранить</h3><label className="field"><span>Папка результата</span><div className="path-line"><input readOnly value={outputDir || 'Папка processed рядом с видео'} /><button onClick={chooseFolder}>Выбрать</button></div></label><Switch label="Открывать папку после завершения" checked={settings.openFolderAfter} onChange={(v) => update('openFolderAfter', v)} /><Switch label="Звук после завершения" checked={settings.sound} onChange={(v) => update('sound', v)} /></div>
     <div className="settings-block"><h3>Качество и вес</h3>
       <div className="quality-cards q4">{exportModes.map(([id,t])=>(
@@ -688,9 +769,9 @@ function Settings({ settings, update, outputDir, chooseFolder }) {
         </div>
       )}
     </div>
-    <div className="settings-block full"><h3>Поведение и проверка</h3><div className="toggles-grid"><Switch label="Проверять созданные файлы" checked={settings.checkFiles} onChange={(v) => update('checkFiles', v)} /><Switch label="Показывать журнал только при ошибке" checked={settings.showLogOnError} onChange={(v) => update('showLogOnError', v)} /><Switch label="Удалять временные файлы" checked={settings.cleanupTemp} onChange={(v) => update('cleanupTemp', v)} /><Switch label="Режим большой пачки" checked={settings.largeBatchMode} onChange={(v) => update('largeBatchMode', v)} /><Switch label="Фоновая обработка" checked={settings.backgroundMode} onChange={(v) => update('backgroundMode', v)} /></div></div>
-    <div className="settings-block full"><h3>Скорость и надёжность</h3><div className="export-grid"><label className="field"><span>Аппаратное ускорение</span><select value={settings.hardwareAccel} onChange={(e)=>update('hardwareAccel', e.target.value)}><option value="auto">Авто</option><option value="cpu">CPU</option><option value="nvidia">NVIDIA</option><option value="intel">Intel</option><option value="amd">AMD</option></select></label><label className="field"><span>Одновременно видео</span><input type="number" min="1" max="3" value={settings.parallelJobs} onChange={(e)=>update('parallelJobs', clamp(e.target.value,1,3))} /></label><label className="field"><span>Профиль обработки</span><select value={settings.processingProfile} onChange={(e)=>update('processingProfile', e.target.value)}><option value="fast">Быстро</option><option value="balance">Баланс</option><option value="quality">Качество</option></select></label></div><p className="hint tiny">Для больших пачек безопаснее использовать 1–2 параллельных видео и профиль “Быстро” или “Баланс”. Если ускорение не поддерживается, программа использует CPU.</p></div>
-  </div></section>;
+  </div>;
+  if (embedded) return inner;
+  return <section className="card page-card settings-page compact-content">{inner}</section>;
 }
 function Preview({ settings, update, files = [] }) {
   const stageRef = useRef(null);
@@ -861,18 +942,20 @@ function DonateModal({ onClose }) {
     <div className="donate-body">
       <div className="qr-wrap"><img src={A.donateQr} alt="USDT TRC20 QR" /></div>
       <div className="wallet-box">
-        <span>USDT TRC20</span>
+        <span className="donate-coin-label">USDT TRC20</span>
         <button className="wallet-value" onClick={copyWallet} title="Нажми, чтобы скопировать">{DONATE_WALLET}</button>
         <small>{copied ? 'Кошелёк скопирован' : 'Нажми на кошелёк, чтобы скопировать'}</small>
       </div>
     </div>
-    <div className="modal-actions"><button onClick={copyWallet}>Скопировать кошелёк</button><button onClick={onClose}>Закрыть</button></div>
+    <div className="donate-actions-row">
+      <button className="donate-copy-btn" onClick={copyWallet}>Скопировать кошелёк</button>
+      <button className="donate-close-btn" onClick={onClose}>Закрыть</button>
+    </div>
   </div></div>;
 }
 
 function Slider({ label, value, min, max, onChange, disabled=false }) { return <label className={`slider ${disabled ? 'disabled' : ''}`} aria-disabled={disabled}><span>{label}<b>{value}</b></span><input type="range" min={min} max={max} value={value} aria-disabled={disabled} tabIndex={disabled ? -1 : 0} onChange={(e) => { if (!disabled) onChange(Number(e.target.value)); }} /></label>; }
 function Switch({ label, checked, onChange, disabled=false }) { return <label className={`switch ${disabled ? 'disabled' : ''}`}><input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} /><span className="switch-toggle"/><div className="switch-label">{label}</div></label>; }
-function Select({ label, value, onChange }) { return <label className="field"><span>{label}</span><select value={value} onChange={(e) => onChange(e.target.value)}><option value="bottom-right">Снизу справа</option><option value="bottom-left">Снизу слева</option><option value="top-right">Сверху справа</option><option value="top-left">Сверху слева</option><option value="center">По центру</option></select></label>; }
 function playDoneSound() { try { const ctx = new (window.AudioContext || window.webkitAudioContext)(); [523, 659, 784].forEach((f, i) => { const o = ctx.createOscillator(); const g = ctx.createGain(); o.frequency.value = f; o.type = 'sine'; o.connect(g); g.connect(ctx.destination); g.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.11); g.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + i * 0.11 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.11 + 0.23); o.start(ctx.currentTime + i * 0.11); o.stop(ctx.currentTime + i * 0.11 + 0.25); }); } catch {} }
 
 const EDITOR_DEFAULT = {
@@ -1085,6 +1168,13 @@ function Editor({ state, setState }) {
   // file FFmpeg uses, so preview and output fonts always match.
   const [fontRevision, setFontRevision] = useState(0);
   const loadedFontsRef = useRef(new Set());
+  // Stable string of text-layer fontFiles — recomputed when layers change,
+  // but only TRIGGERS the font-loader effect when the set of fontFiles
+  // actually differs (drag/move/color tweaks no longer wake it up).
+  const textFontKey = useMemo(
+    () => layers.filter(l => l.type === 'text' && l.fontFile).map(l => l.fontFile).sort().join('|'),
+    [layers]
+  );
   useEffect(() => {
     layers.forEach(layer => {
       if (layer.type !== 'text' || !layer.fontFile) return;
@@ -1096,11 +1186,13 @@ function Editor({ state, setState }) {
         .then(f => { document.fonts.add(f); setFontRevision(r => r + 1); })
         .catch(() => { loadedFontsRef.current.delete(id); });
     });
-  }, [layers]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [textFontKey]);
 
   const [widthStr, setWidthStr] = useState(String(outWidth));
   const [heightStr, setHeightStr] = useState(String(outHeight));
   const dimWidthRef = useRef(null);
+  const [dimFocused, setDimFocused] = useState(false);
   const SIZE_PRESETS = [['1080','1920'],['1080','1350'],['1080','1080'],['1920','1080']];
   const isCustomSize = !SIZE_PRESETS.some(([w,h]) => widthStr === w && heightStr === h);
   useEffect(() => { setWidthStr(String(outWidth)); }, [outWidth]);
@@ -1110,11 +1202,14 @@ function Editor({ state, setState }) {
   const [playing, setPlaying] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
   const [edPropTab, setEdPropTab] = useState('props');
+  // Which Effects section is currently expanded (accordion: only one at a time).
+  // Defaults to null so all three start collapsed on tab open.
+  const [effectsOpen, setEffectsOpen] = useState(null);
   const [saveProgress, setSaveProgress] = useState(null);
   const [saveFinishing, setSaveFinishing] = useState(false);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [saveFmt, setSaveFmt] = useState('mp4');
-  const [saveQual, setSaveQual] = useState('normal');
+  const [saveQual, setSaveQual] = useState('max');
   const [saveCustom, setSaveCustom] = useState({ videoBitrate: 0, crf: 23, fps: 0, audioBitrate: 160 });
   const [durStr, setDurStr] = useState(String(totalDuration));
   const [colorMenu, setColorMenu] = useState(null);
@@ -1123,8 +1218,66 @@ function Editor({ state, setState }) {
   });
   const [onboardSkip, setOnboardSkip] = useState(false);
   const [onbRect, setOnbRect] = useState(null);
+  // Dirty flag: true when the project has unsaved changes. Synced to the
+  // main process so it can prompt to save on app quit and on update install.
+  const [dirty, setDirty] = useState(false);
+  // In-app save-prompt modal. null when hidden; { message, detail } when shown.
+  // Main process requests it via 'project:save-prompt-request' IPC and waits
+  // for the user's choice via the response handler below.
+  const [savePromptState, setSavePromptState] = useState(null);
+  useEffect(() => {
+    if (!window.strata?.onSavePromptRequest) return;
+    return window.strata.onSavePromptRequest((payload) => {
+      setSavePromptState(payload || { message: 'Сохранить проект?', detail: '' });
+    });
+  }, []);
+  const answerSavePrompt = (choice) => {
+    setSavePromptState(null);
+    try { window.strata?.savePromptResponse?.(choice); } catch {}
+  };
+  // Keyboard shortcuts when the modal is open: Esc = Cancel, Enter = Save.
+  useEffect(() => {
+    if (!savePromptState) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); answerSavePrompt('cancel'); }
+      else if (e.key === 'Enter') { e.preventDefault(); answerSavePrompt('save'); }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [savePromptState]);
+  // Set right before a state mutation that should NOT be counted as a user
+  // edit (initial mount, project load). The next layers-effect tick reads
+  // and clears it so dirty stays false.
+  const suppressDirtyRef = useRef(true);
+  useEffect(() => {
+    if (suppressDirtyRef.current) { suppressDirtyRef.current = false; return; }
+    setDirty(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layers]);
+  useEffect(() => { try { window.strata?.setDirty?.(dirty); } catch {} }, [dirty]);
   const [zoom, setZoom] = useState(1);
-  const [previewH, setPreviewH] = useState(440);
+  // Compute a sensible initial preview height for the current window — on
+  // small monitors a hard-coded 440 hid the timeline AND the resize handle,
+  // so the user couldn't shrink it. Reserve room for titlebar, editor
+  // header, toolbar, timeline tracks and the props panel below.
+  const [previewH, setPreviewH] = useState(() => {
+    const wh = (typeof window !== 'undefined') ? window.innerHeight : 900;
+    // ≈ 38 titlebar + 48 header + 80 editor toolbar + 200 timeline + 32 padding
+    return Math.max(180, Math.min(440, wh - 420));
+  });
+  // If the window is resized smaller than the current previewH allows,
+  // clamp it down so the timeline and resize handle stay visible.
+  useEffect(() => {
+    const onResize = () => {
+      const wh = window.innerHeight;
+      const maxAllowed = Math.max(180, wh - 380);
+      setPreviewH(h => h > maxAllowed ? maxAllowed : h);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
   const videoRef = useRef(null);
   const timelineRef = useRef(null);
   const tlScrollRef = useRef(null);
@@ -1146,6 +1299,12 @@ function Editor({ state, setState }) {
   const selAnchorRef = useRef(null);
   const layerDragRef = useRef(null);
   const videoFrameCacheRef = useRef(new Map());
+  // Timeline thumbnail cache. Generated once per file via a hidden <video>
+  // element + canvas at low resolution; reused for every clip-instance of
+  // that file (e.g. when you split a clip, both halves share the same pool).
+  // Map<filePath, { thumbs: [{t, url}], dur, loading }>.
+  const thumbsCacheRef = useRef(new Map());
+  const [thumbsRev, setThumbsRev] = useState(0);
   const clipboardRef = useRef(null);
   const zoomTmpRef = useRef(null);
   const [undoStack, setUndoStack] = useState([]);
@@ -1169,10 +1328,19 @@ function Editor({ state, setState }) {
   }
   function clearAll() {
     if (!layers.length) return;
-    if (!window.confirm('Удалить все слои из редактора?')) return;
+    setConfirmClearOpen(true);
+  }
+  function doClearAll() {
     pushUndo();
+    // Purge all per-layer caches before wiping state — otherwise the
+    // bitmaps/canvas backing them stick around in memory until GC.
+    try { videoFrameCacheRef.current.clear(); } catch {}
+    try { imgCacheRef.current.clear(); } catch {}
+    videoOverlayRefs.current = {};
+    audioLayerRefs.current = {};
     setState((s) => ({ ...s, layers: [], file: null }));
     setSelectedId(null); setSelectedIds(new Set());
+    setConfirmClearOpen(false);
   }
   function closeOnboard() {
     setOnboardStep(-1);
@@ -1242,23 +1410,58 @@ function Editor({ state, setState }) {
   // Snapshot the FULL editor state so Ctrl+Z restores everything, not just
   // layers (also: duration, canvas size, bg, fade, video range, etc.).
   function pushUndo() {
-    const snap = JSON.parse(JSON.stringify(state));
-    setUndoStack(s => {
-      const top = s[s.length - 1];
-      // Skip if the top of the stack is already identical (avoid duplicate
-      // entries when auto-snapshot races an explicit pushUndo).
-      if (top && JSON.stringify(top) === JSON.stringify(snap)) return s;
-      return [...s.slice(-29), snap];
-    });
+    const json = JSON.stringify(state);
+    // Skip if the top of the stack is already identical (avoid duplicate
+    // entries when auto-snapshot races an explicit pushUndo).
+    if (lastPushedJsonRef.current === json) return;
+    setUndoStack(s => [...s.slice(-29), JSON.parse(json)]);
+    lastPushedJsonRef.current = json;
   }
 
-  const addLayer = (layer) => { pushUndo(); set('layers', (l) => [...l, layer]); setSelectedId(layer.id); setSelectedIds(new Set()); setEdPropTab('props'); };
+  // Layer types that benefit from a distinct palette color (clip-like
+  // tracks). Effects/text already have semantic colors so they're skipped.
+  const COLOR_CYCLED_TYPES = new Set(['videoOverlay', 'image', 'maskedVideo', 'audio']);
+  function nextPaletteColor(currentLayers) {
+    // Count existing layers with a clipColor from the palette so the new
+    // one picks up the NEXT slot, cycling back to 0 when we wrap.
+    const used = currentLayers.filter(l => COLOR_CYCLED_TYPES.has(l.type) && l.clipColor).length;
+    return CLIP_COLORS[used % CLIP_COLORS.length];
+  }
+  const addLayer = (layer) => {
+    pushUndo();
+    set('layers', (l) => {
+      // Auto-assign the next palette colour to media-like layers that
+      // haven't been given an explicit clipColor yet.
+      const lyr = (!layer.clipColor && COLOR_CYCLED_TYPES.has(layer.type))
+        ? { ...layer, clipColor: nextPaletteColor(l) }
+        : layer;
+      return [...l, lyr];
+    });
+    setSelectedId(layer.id);
+    setSelectedIds(new Set());
+    setEdPropTab('props');
+  };
   const delLayer = (id) => {
     pushUndo();
     if (id === '__mv__') {
       setState(s => ({ ...s, file: null, layers: s.layers.filter(x => x.id !== id) }));
       setSelectedId(null);
       return;
+    }
+    // Release cached bitmaps & DOM refs for the deleted layer so they don't
+    // pile up across a long editing session (image canvases, decoded video
+    // frames per layer-id, etc.).
+    const removed = layers.find(l => l.id === id);
+    if (removed) {
+      try { videoFrameCacheRef.current.delete(id); } catch {}
+      try { delete videoOverlayRefs.current[id]; } catch {}
+      try { delete audioLayerRefs.current[id]; } catch {}
+      // image cache is keyed by file path — only purge if no other layer
+      // still references the same file.
+      if (removed.file && removed.type === 'image') {
+        const stillUsed = layers.some(l => l.id !== id && l.file === removed.file);
+        if (!stillUsed) { try { imgCacheRef.current.delete(removed.file); } catch {} }
+      }
     }
     set('layers', (l) => l.filter(x => x.id !== id));
     setSelectedId((s) => s === id ? null : s);
@@ -1320,22 +1523,37 @@ function Editor({ state, setState }) {
     }
     return best;
   }
-  function addTransition(strength) {
-    // Combined "punch" transition: a quick flash overlay + camera shake, both
-    // scaled by strength. Auto-sized and auto-positioned at the nearest clip
-    // boundary so it sits across the cut.
-    const presets = {
-      low:  { duration: 0.25, amp: 14, flash: 0.55 },
-      mid:  { duration: 0.35, amp: 32, flash: 0.85 },
-      high: { duration: 0.50, amp: 60, flash: 1.00 },
-    };
-    const p = presets[strength] || presets.mid;
+  // Map a 0-100 strength to the kind-specific visual params. Linearly
+  // interpolates between the old low (s=0) and high (s=100) preset values.
+  // - shake:   camera shake + white flash
+  // - whippan: fast horizontal motion-blur sweep
+  // - zoom:    quick zoom punch with blur (up to 3× scale)
+  // - blur:    burst of gaussian blur that resolves
+  function transitionParams(kind, strength) {
+    const s = Math.max(0, Math.min(100, Number(strength) || 50)) / 100;
+    if (kind === 'shake')   return { amp: 14 + (60 - 14) * s,     flash: 0.55 + (1.00 - 0.55) * s };
+    if (kind === 'whippan') return { shift: 35 + (100 - 35) * s,  blur: 10 + (40 - 10) * s };
+    if (kind === 'zoom')    return { scale: 1.5 + (3.0 - 1.5) * s, blur: 4 + (18 - 4) * s };
+    if (kind === 'blur')    return { blur: 10 + (50 - 10) * s };
+    return {};
+  }
+
+  function addTransition(kind, strength = 50) {
+    // Strength = 0-100 → visual intensity (amp / blur / shift / scale).
+    // Duration is fixed at 0.4 s; the user stretches the clip on the
+    // timeline independently — length = how long, slider = how strong.
+    const k = kind || 'shake';
+    const numStrength = Math.max(0, Math.min(100, Number(strength) || 50));
+    const duration = 0.4;
+    const params = transitionParams(k, numStrength);
     const cx = nearestClipBoundary();
-    const half = p.duration / 2;
-    const ls = Math.max(0, Math.min(dur - p.duration, cx - half));
-    addLayer({ id: uid(), type: 'transition', strength,
-      startTime: ls, endTime: ls + p.duration,
-      amp: p.amp, flash: p.flash });
+    const half = duration / 2;
+    const ls = Math.max(0, Math.min(dur - duration, cx - half));
+    addLayer({
+      id: uid(), type: 'transition', kind: k, strength: numStrength,
+      startTime: ls, endTime: ls + duration,
+      ...params,
+    });
   }
   function addMaskRegion() {
     // Clipping mask: everything composed BELOW this layer is shown only inside
@@ -1422,7 +1640,7 @@ function Editor({ state, setState }) {
       speed: src.speed,
       reversed: src.reversed,
       volume: src.volume ?? 100,
-      ccB: src.ccB, ccC: src.ccC, ccS: src.ccS,
+      ccB: src.ccB, ccC: src.ccC, ccS: src.ccS, ccH: src.ccH,
       // Cut-out geometry inherited from the mask:
       x: mask.x, y: mask.y, width: mask.width, height: mask.height,
       shape: mask.shape, radius: mask.radius || 0,
@@ -1440,17 +1658,48 @@ function Editor({ state, setState }) {
     const sysFont = systemFonts[0];
     addLayer({ id: Date.now(), type: 'text', text: '', color: '#ffffff', size: 48, opacity: 100, align: 'center', x: 50, y: 80, startTime: 0, endTime: dur, fontFamily: sysFont?.name || 'Arial', fontFile: sysFont?.file || '' });
   }
+  // Probe a media file for its real duration via a hidden DOM element.
+  // Resolves with 0 on error so callers can fall back to the timeline default.
+  function probeMediaDuration(file) {
+    return new Promise((resolve) => {
+      const isVideo = /\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(file);
+      const el = document.createElement(isVideo ? 'video' : 'audio');
+      el.preload = 'metadata';
+      el.muted = true;
+      el.src = fileUrl(file);
+      const cleanup = () => {
+        el.removeEventListener('loadedmetadata', onMeta);
+        el.removeEventListener('error', onErr);
+      };
+      const onMeta = () => { cleanup(); resolve(Number(el.duration) || 0); };
+      const onErr = () => { cleanup(); resolve(0); };
+      el.addEventListener('loadedmetadata', onMeta, { once: true });
+      el.addEventListener('error', onErr, { once: true });
+      // Hard timeout — some files take forever to even read metadata.
+      setTimeout(() => { cleanup(); resolve(0); }, 4000);
+    });
+  }
   async function addVideoOverlay() {
     const files = await window.strata?.pickFiles?.();
     const f = files?.[0];
     if (!f) return;
     const id = Date.now();
-    addLayer({ id, type: 'videoOverlay', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 40 });
+    // Use the file's real duration — if it's longer than the timeline, grow
+    // the timeline to fit (otherwise the user would have to manually stretch
+    // the clip from 0..10 → 0..15 every time).
+    const probed = await probeMediaDuration(f);
+    const dur0 = probed > 0.1 ? probed : dur;
+    if (probed > totalDuration) set('totalDuration', probed);
+    addLayer({ id, type: 'videoOverlay', file: f, startTime: 0, endTime: dur0, srcDuration: probed > 0 ? probed : undefined, x: 50, y: 50, size: 40 });
     ensureProxy(id, f);
   }
   async function addAudioFile() {
     const f = await window.strata?.pickAudio?.();
-    if (f) addLayer({ id: Date.now(), type: 'audio', file: f, startTime: 0, endTime: dur, volume: 100 });
+    if (!f) return;
+    const probed = await probeMediaDuration(f);
+    const dur0 = probed > 0.1 ? probed : dur;
+    if (probed > totalDuration) set('totalDuration', probed);
+    addLayer({ id: Date.now(), type: 'audio', file: f, startTime: 0, endTime: dur0, srcDuration: probed > 0 ? probed : undefined, volume: 100 });
   }
 
   const uid = () => 'L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -1469,24 +1718,60 @@ function Editor({ state, setState }) {
   }
   // Drag-and-drop any media into the editor: videos / images / audio land on
   // the timeline as layers. The first dropped video becomes the main video.
-  function addMediaPaths(paths) {
+  async function addMediaPaths(paths) {
     const list = (paths || []).filter(Boolean);
     if (!list.length) return;
-    const added = [];
-    for (const p of list) {
+
+    // Pre-build skeletons keeping the original index so the user sees the
+    // same order they dropped the files in.
+    const skeletons = list.map(p => {
       const ext = (p.split('.').pop() || '').toLowerCase();
-      if (['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v'].includes(ext)) {
+      if (['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v'].includes(ext)) return { kind: 'video', path: p };
+      if (['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'].includes(ext)) return { kind: 'image', path: p };
+      if (['mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac'].includes(ext)) return { kind: 'audio', path: p };
+      return null;
+    }).filter(Boolean);
+    if (!skeletons.length) return;
+
+    // Probe all video/audio files in parallel — metadata-only, very fast.
+    // Images have no duration; they'll inherit the (possibly expanded)
+    // timeline length so they cover the whole project by default.
+    const probed = await Promise.all(skeletons.map(s =>
+      (s.kind === 'video' || s.kind === 'audio') ? probeMediaDuration(s.path) : Promise.resolve(0)
+    ));
+    const maxProbed = Math.max(0, ...probed);
+    const newTotal = Math.max(totalDuration, maxProbed);
+
+    const added = [];
+    for (let i = 0; i < skeletons.length; i++) {
+      const s = skeletons[i];
+      const realDur = probed[i] > 0.1 ? probed[i] : newTotal;
+      if (s.kind === 'video') {
         const hasVid = layers.some((l) => l.type === 'videoOverlay') || added.some((l) => l.type === 'videoOverlay');
-        added.push({ id: uid(), type: 'videoOverlay', file: p, startTime: 0, endTime: totalDuration, x: 50, y: 50, size: hasVid ? 40 : 100 });
-      } else if (['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'].includes(ext)) {
-        added.push({ id: uid(), type: 'image', file: p, startTime: 0, endTime: totalDuration, x: 50, y: 50, size: 30, opacity: 100 });
-      } else if (['mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac'].includes(ext)) {
-        added.push({ id: uid(), type: 'audio', file: p, startTime: 0, endTime: totalDuration, volume: 100 });
+        added.push({ id: uid(), type: 'videoOverlay', file: s.path, startTime: 0, endTime: realDur, srcDuration: probed[i] || undefined, x: 50, y: 50, size: hasVid ? 40 : 100 });
+      } else if (s.kind === 'image') {
+        added.push({ id: uid(), type: 'image', file: s.path, startTime: 0, endTime: newTotal, x: 50, y: 50, size: 30, opacity: 100 });
+      } else if (s.kind === 'audio') {
+        added.push({ id: uid(), type: 'audio', file: s.path, startTime: 0, endTime: realDur, srcDuration: probed[i] || undefined, volume: 100 });
       }
     }
     if (!added.length) return;
     pushUndo();
-    setState((s) => ({ ...s, layers: [...s.layers, ...added] }));
+    setState((s) => {
+      // Expand the timeline if any new file is longer than the current
+      // duration (so the user doesn't have to manually stretch).
+      const expandedTotal = Math.max(s.totalDuration, newTotal);
+      // Walk through the added layers and assign the next palette colour
+      // to each clip-like type. Cycle through CLIP_COLORS in order.
+      let used = s.layers.filter(l => COLOR_CYCLED_TYPES.has(l.type) && l.clipColor).length;
+      const tinted = added.map(l => {
+        if (!COLOR_CYCLED_TYPES.has(l.type) || l.clipColor) return l;
+        const col = CLIP_COLORS[used % CLIP_COLORS.length];
+        used += 1;
+        return { ...l, clipColor: col };
+      });
+      return { ...s, totalDuration: expandedTotal, videoEnd: Math.max(s.videoEnd, expandedTotal), layers: [...s.layers, ...tinted] };
+    });
     // Auto-select the freshly added layer.
     setSelectedId(added[added.length - 1].id);
     setSelectedIds(new Set());
@@ -1498,6 +1783,114 @@ function Editor({ state, setState }) {
     e.preventDefault();
     addMediaPaths(Array.from(e.dataTransfer?.files || []).map((f) => window.strata?.getPathForFile?.(f)));
   }
+
+  // ── Project save / open (.smproj) ──────────────────────────────────────────
+  // Pure JSON snapshot of the editor state with volatile fields stripped
+  // (proxy paths, selection, "missing file" flags). Re-opening replays it
+  // into setState and kicks off proxy regen for any HEVC/AV1 videos.
+  // Internal save — returns the IPC result without UI feedback. Called both
+  // from the user-facing saveProject() and from the save-on-quit/update
+  // prompt initiated by the main process (which renders its own dialogs).
+  async function doSaveProject() {
+    if (!window.strata?.saveProject) return { ok: false, error: 'no IPC' };
+    const cleanLayers = layers.map((l) => {
+      const { _proxyFile, _proxyMaking, _missing, ...rest } = l || {};
+      return rest;
+    });
+    const proj = {
+      version: 1,
+      app: 'strata-mixer',
+      savedAt: new Date().toISOString(),
+      suggestedName: (fileName(layers.find(l => l.file)?.file || '') || 'project').replace(/\.[^.]+$/, '') + '.smproj',
+      state: {
+        file: file || null,
+        totalDuration, videoStart, videoEnd,
+        layers: cleanLayers,
+        outWidth, outHeight, bgColor, fadeIn, fadeOut,
+      },
+    };
+    const res = await window.strata.saveProject(proj);
+    if (res?.ok) setDirty(false);
+    return res || { ok: false, error: 'unknown' };
+  }
+  async function saveProject() {
+    const res = await doSaveProject();
+    if (res && !res.ok && !res.canceled) {
+      alert('Не удалось сохранить проект: ' + (res.error || 'неизвестная ошибка'));
+    }
+  }
+
+  async function openProject() {
+    if (!window.strata?.openProject) return;
+    const res = await window.strata.openProject();
+    if (!res) return;
+    if (!res.ok) {
+      if (!res.canceled) alert('Не удалось открыть проект: ' + (res.error || 'формат не распознан'));
+      return;
+    }
+    const s = res.data?.state;
+    if (!s) { alert('Файл проекта пуст или повреждён.'); return; }
+    pushUndo();
+    const restored = {
+      file: s.file ?? null,
+      totalDuration: Number(s.totalDuration) || 10,
+      videoStart: Number(s.videoStart) || 0,
+      videoEnd: Number(s.videoEnd) || (Number(s.totalDuration) || 10),
+      layers: Array.isArray(s.layers) ? s.layers : [],
+      outWidth: Number(s.outWidth) || 1080,
+      outHeight: Number(s.outHeight) || 1920,
+      bgColor: s.bgColor || '#000000',
+      fadeIn: Number(s.fadeIn) || 0,
+      fadeOut: Number(s.fadeOut) || 0,
+    };
+    // Drop bitmap caches from the previous project so we don't carry stale
+    // frames into the new one (and don't leak memory).
+    try { videoFrameCacheRef.current.clear(); } catch {}
+    try { imgCacheRef.current.clear(); } catch {}
+    videoOverlayRefs.current = {};
+    audioLayerRefs.current = {};
+    // The setState below will change `layers`, which would normally flip
+    // dirty=true via the layers-tracking effect. Suppress that one fire so
+    // a freshly loaded project starts clean.
+    suppressDirtyRef.current = true;
+    setState(restored);
+    setDirty(false);
+    setSelectedId(null);
+    setSelectedIds(new Set());
+    // Re-kick proxy generation for video layers whose source still exists.
+    // Missing files stay flagged via _missing — UI shows a warning, export
+    // skips them (or the user re-attaches the file manually).
+    const missing = restored.layers.filter(l => l && l._missing);
+    if (missing.length) {
+      const names = missing.map(l => fileName(l.file || '')).join('\n');
+      alert(`Проект открыт. Не найдено файлов: ${missing.length}\n${names}\n\nЭти слои отмечены красным. Чтобы починить — удали слой и добавь файл заново.`);
+    }
+    restored.layers.forEach((l) => {
+      if (!l._missing && (l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file) {
+        ensureProxy(l.id, l.file);
+      }
+    });
+  }
+
+  // Save-request bridge: when the main process needs the renderer to save
+  // (because the user picked "Сохранить" on the quit/update prompt), run
+  // doSaveProject and report the result back so main can proceed.
+  const doSaveProjectRef = useRef(null);
+  doSaveProjectRef.current = doSaveProject;
+  useEffect(() => {
+    if (!window.strata?.onSaveRequest) return;
+    return window.strata.onSaveRequest(async () => {
+      try {
+        const res = doSaveProjectRef.current
+          ? await doSaveProjectRef.current()
+          : { ok: false, error: 'no impl' };
+        window.strata?.saveRequestResponse?.(res);
+      } catch (e) {
+        window.strata?.saveRequestResponse?.({ ok: false, error: String(e.message || e) });
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Merge 2+ selected video/audio clips into one.
   // - Same source file + source-contiguous → instant in-renderer merge (undo-split case).
@@ -1653,6 +2046,59 @@ function Editor({ state, setState }) {
     else if (v.currentTime > videoEnd) { v.currentTime = videoEnd; setCurrentTime(videoEnd); }
   }, [videoStart, videoEnd]);
 
+  // Generate low-res thumbnail strip for each video file ONCE — reused for
+  // all clips (and split halves) of that file. Saves the browser from
+  // spawning 30+ <video> decoders on every clip render.
+  async function generateThumbsForFile(file) {
+    try {
+      const video = document.createElement('video');
+      video.muted = true;
+      video.preload = 'auto';
+      video.src = fileUrl(file);
+      await new Promise((res, rej) => {
+        const cleanup = () => { video.removeEventListener('loadedmetadata', onMeta); video.removeEventListener('error', onErr); };
+        const onMeta = () => { cleanup(); res(); };
+        const onErr = () => { cleanup(); rej(new Error('video load error')); };
+        video.addEventListener('loadedmetadata', onMeta, { once: true });
+        video.addEventListener('error', onErr, { once: true });
+      });
+      const dur = video.duration;
+      if (!isFinite(dur) || dur < 0.05) return;
+      const canvas = document.createElement('canvas');
+      const W = 96; // low-res — thumbnails on timeline are tiny anyway
+      const H = Math.round(W * (video.videoHeight || 9) / (video.videoWidth || 16)) || 54;
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext('2d');
+      const N = Math.min(30, Math.max(2, Math.round(dur)));
+      const thumbs = [];
+      for (let i = 0; i < N; i++) {
+        const t = (i / Math.max(1, N - 1)) * dur;
+        await new Promise((r) => {
+          const onSeeked = () => { video.removeEventListener('seeked', onSeeked); r(); };
+          video.addEventListener('seeked', onSeeked, { once: true });
+          try { video.currentTime = t; } catch { r(); }
+        });
+        try { ctx.drawImage(video, 0, 0, W, H); } catch {}
+        let url = '';
+        try { url = canvas.toDataURL('image/jpeg', 0.55); } catch {}
+        thumbs.push({ t, url });
+      }
+      thumbsCacheRef.current.set(file, { dur, thumbs, loading: false });
+      setThumbsRev(r => r + 1);
+    } catch {
+      thumbsCacheRef.current.delete(file);
+    }
+  }
+  useEffect(() => {
+    layers.forEach(l => {
+      if ((l.type !== 'videoOverlay' && l.type !== 'maskedVideo') || !l.file) return;
+      if (thumbsCacheRef.current.has(l.file)) return;
+      thumbsCacheRef.current.set(l.file, { loading: true, thumbs: [], dur: 0 });
+      generateThumbsForFile(l.file);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layers]);
+
   // Image cache loader
   useEffect(() => {
     layers.forEach(l => {
@@ -1732,9 +2178,17 @@ function Editor({ state, setState }) {
         else { if (!el.paused) el.pause(); }
       }
     });
-  }, [currentTime, playing]);
+    // Also depend on layers — when the user trims a clip start, srcStart
+    // changes mid-render; without re-running this sync the underlying
+    // <video> stays seeked to the old position and preview keeps showing
+    // the un-trimmed frame.
+  }, [currentTime, playing, layers]);
 
-  // RAF loop for canvas preview
+  // RAF loop for canvas preview — runs always. We can't stop it on pause
+  // because <video>.currentTime is set asynchronously (seek), and the new
+  // frame is decoded slightly later. Painting only once at state-change time
+  // captures the OLD frame; the loop keeps repainting so the new frame shows
+  // as soon as the decoder lands it.
   useEffect(() => {
     let running = true, last = 0;
     const tick = (ts) => {
@@ -1798,6 +2252,45 @@ function Editor({ state, setState }) {
     return () => window.removeEventListener('keydown', handler, true);
   }, [state]);
 
+  // Ctrl+S → save project, Ctrl+O → open project. Capture phase so they win
+  // over focused buttons/inputs; we skip when the user is actually typing.
+  useEffect(() => {
+    const handler = (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k !== 's' && k !== 'o') return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (k === 's') saveProject(); else openProject();
+    };
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
+  }, [state]);
+
+  // The header (CompactHeader, rendered at App level) hosts the project
+  // action buttons. It dispatches CustomEvents so the Editor — which owns
+  // the actual handlers and state — can react. Avoids lifting state up.
+  useEffect(() => {
+    const onOpen = () => openProject();
+    const onSaveProj = () => saveProject();
+    const onSaveExport = () => {
+      const hasVideo = layers.some(l => l.type === 'videoOverlay');
+      const hasAudio = layers.some(l => l.type === 'audio');
+      if (!hasVideo && hasAudio) setSaveFmt('mp3');
+      setSaveDialogOpen(true);
+    };
+    window.addEventListener('strata:editor-open-project', onOpen);
+    window.addEventListener('strata:editor-save-project', onSaveProj);
+    window.addEventListener('strata:editor-save', onSaveExport);
+    return () => {
+      window.removeEventListener('strata:editor-open-project', onOpen);
+      window.removeEventListener('strata:editor-save-project', onSaveProj);
+      window.removeEventListener('strata:editor-save', onSaveExport);
+    };
+  }, [layers]);
+
   // Auto-snapshot: any time state actually changes, push the PREVIOUS state
   // onto the undo stack after a short debounce. This catches everything that
   // doesn't call pushUndo() explicitly — slider tweaks, text edits, color
@@ -1805,21 +2298,28 @@ function Editor({ state, setState }) {
   const lastSnapshotRef = useRef(null);
   const snapshotTimerRef = useRef(null);
   const undoApplyingRef = useRef(false);
+  // Track JSON of the most-recently pushed snapshot so dedup can compare
+  // without re-stringifying the (potentially large) top of the stack.
+  const lastPushedJsonRef = useRef(null);
   useEffect(() => {
-    const curJson = JSON.stringify(state);
-    // First render — just record baseline, don't push to stack.
-    if (lastSnapshotRef.current === null) { lastSnapshotRef.current = curJson; return; }
-    // Skip the snapshot triggered by Ctrl+Z restoring state.
-    if (undoApplyingRef.current) { undoApplyingRef.current = false; lastSnapshotRef.current = curJson; return; }
-    if (curJson === lastSnapshotRef.current) return;
-    const prevJson = lastSnapshotRef.current;
+    // Defer the (expensive) JSON.stringify until the debounce timer fires —
+    // earlier this ran on every Editor re-render which during a clip-drag
+    // means 60 stringifies/sec on potentially 100KB+ state.
+    if (undoApplyingRef.current) { undoApplyingRef.current = false; return; }
     clearTimeout(snapshotTimerRef.current);
     snapshotTimerRef.current = setTimeout(() => {
-      setUndoStack(s => {
-        const top = s[s.length - 1];
-        if (top && JSON.stringify(top) === prevJson) return s; // dedupe
-        return [...s.slice(-29), JSON.parse(prevJson)];
-      });
+      const curJson = JSON.stringify(state);
+      if (lastSnapshotRef.current === null) { lastSnapshotRef.current = curJson; return; }
+      if (curJson === lastSnapshotRef.current) return;
+      const prevJson = lastSnapshotRef.current;
+      // Cheap dedup: skip pushing if we already pushed this exact snapshot
+      // (e.g. an explicit pushUndo() raced this auto-snapshot).
+      if (lastPushedJsonRef.current === prevJson) {
+        lastSnapshotRef.current = curJson;
+        return;
+      }
+      setUndoStack(s => [...s.slice(-29), JSON.parse(prevJson)]);
+      lastPushedJsonRef.current = prevJson;
       lastSnapshotRef.current = curJson;
     }, 400);
   }, [state]);
@@ -1845,20 +2345,24 @@ function Editor({ state, setState }) {
     window.addEventListener('pointerdown', close);
     return () => window.removeEventListener('pointerdown', close);
   }, [colorMenu]);
+  // Keep handlers in a ref so we attach the window listener exactly ONCE,
+  // not every re-render (which during a clip-drag is 60 reattaches/sec).
+  const keyHandlerImplRef = useRef(null);
+  keyHandlerImplRef.current = (e) => {
+    const t = (e.target?.tagName || '').toLowerCase();
+    if (t === 'input' || t === 'textarea' || e.target?.isContentEditable) return;
+    // Capture phase + stopPropagation — Space toggles playback no matter
+    // which control (button, panel, canvas) currently holds focus.
+    if (e.code === 'Space') { e.preventDefault(); e.stopPropagation(); togglePlay(); }
+    else if (e.key === 'Delete') { e.preventDefault(); delSelected(); }
+    else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') { copySelected(); }
+    else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') { e.preventDefault(); pasteClipboard(); }
+  };
   useEffect(() => {
-    const handler = (e) => {
-      const t = (e.target?.tagName || '').toLowerCase();
-      if (t === 'input' || t === 'textarea' || e.target?.isContentEditable) return;
-      // Capture phase + stopPropagation — Space toggles playback no matter
-      // which control (button, panel, canvas) currently holds focus.
-      if (e.code === 'Space') { e.preventDefault(); e.stopPropagation(); togglePlay(); }
-      else if (e.key === 'Delete') { e.preventDefault(); delSelected(); }
-      else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') { copySelected(); }
-      else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') { e.preventDefault(); pasteClipboard(); }
-    };
+    const handler = (e) => keyHandlerImplRef.current?.(e);
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
-  });
+  }, []);
 
   // Drive the playhead when playing a timeline that has no main video.
   useEffect(() => {
@@ -2019,10 +2523,26 @@ function Editor({ state, setState }) {
     return (e) => {
       if (e.target.classList.contains('etl-clip-handle')) return;
       e.stopPropagation();
-      pushUndo();
-      const r = timelineRef.current?.getBoundingClientRect(); if (!r) return;
       const layer = layers.find(l => l.id === id); if (!layer) return;
-      const startX = e.clientX;
+      const startX = e.clientX, startY = e.clientY;
+      const clipEl = e.currentTarget;
+      const LONG_PRESS_MS = 700;
+      const MOVE_THRESHOLD = 5; // px before we commit to horizontal drag
+      let mode = 'pending'; // 'pending' | 'horizontal' | 'reorder'
+      let lpTimer = null;
+      let undoTaken = false;
+      const takeUndoOnce = () => { if (!undoTaken) { pushUndo(); undoTaken = true; } };
+
+      const startHorizontal = () => {
+        mode = 'horizontal';
+        takeUndoOnce();
+      };
+      const startReorder = () => {
+        mode = 'reorder';
+        takeUndoOnce();
+        try { clipEl.classList.add('etl-clip-reorder-active'); } catch {}
+      };
+
       // Drag the whole group when the grabbed clip is multi-selected (mainVideo excluded)
       const group = (selectedIds.has(id) && selectedIds.size > 1)
         ? layers.filter(l => selectedIds.has(l.id) && l.id !== '__mv__')
@@ -2030,29 +2550,74 @@ function Editor({ state, setState }) {
       const starts = {};
       group.forEach(l => { starts[l.id] = { s: l.startTime, len: l.endTime - l.startTime }; });
       if (!starts[id]) starts[id] = { s: layer.startTime, len: layer.endTime - layer.startTime };
-      const move = (ev) => {
-        const r2 = timelineRef.current?.getBoundingClientRect(); if (!r2) return;
-        const dt = ((ev.clientX - startX) / r2.width) * dur;
-        // Hold Shift to snap the clip to nearby clip edges, the playhead and the bounds.
-        const snapTargets = ev.shiftKey
-          ? [0, dur, currentTime, ...layers.filter(o => !starts[o.id]).flatMap(o => [o.startTime || 0, o.endTime ?? dur])]
-          : null;
-        set('layers', (l) => l.map(x => {
-          const st = starts[x.id]; if (!st) return x;
-          let ns = Math.max(0, Math.min(dur - st.len, st.s + dt));
-          if (snapTargets) {
-            let best = ns, bd = dur * 0.025;
-            for (const tg of snapTargets) {
-              if (Math.abs(ns - tg) < bd) { bd = Math.abs(ns - tg); best = tg; }
-              if (Math.abs(ns + st.len - tg) < bd) { bd = Math.abs(ns + st.len - tg); best = tg - st.len; }
-            }
-            ns = Math.max(0, Math.min(dur - st.len, best));
-          }
-          return { ...x, startTime: ns, endTime: ns + st.len };
-        }));
+
+      // Start the long-press timer for reorder mode.
+      lpTimer = setTimeout(() => {
+        if (mode === 'pending') startReorder();
+      }, LONG_PRESS_MS);
+
+      // Pick which track row the cursor is over by walking the DOM.
+      const rowIdFromPoint = (cx, cy) => {
+        const els = document.elementsFromPoint(cx, cy);
+        for (const el of els) {
+          const row = el.closest && el.closest('.etl-track-row');
+          if (row && row.dataset && row.dataset.layerId) return row.dataset.layerId;
+        }
+        return null;
       };
-      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+
+      const move = (ev) => {
+        if (mode === 'pending') {
+          const dx = Math.abs(ev.clientX - startX);
+          const dy = Math.abs(ev.clientY - startY);
+          if (dx > MOVE_THRESHOLD || dy > MOVE_THRESHOLD) {
+            clearTimeout(lpTimer);
+            startHorizontal();
+          } else return;
+        }
+        if (mode === 'horizontal') {
+          const r2 = timelineRef.current?.getBoundingClientRect(); if (!r2) return;
+          const dt = ((ev.clientX - startX) / r2.width) * dur;
+          const snapTargets = ev.shiftKey
+            ? [0, dur, currentTime, ...layers.filter(o => !starts[o.id]).flatMap(o => [o.startTime || 0, o.endTime ?? dur])]
+            : null;
+          set('layers', (l) => l.map(x => {
+            const st = starts[x.id]; if (!st) return x;
+            let ns = Math.max(0, Math.min(dur - st.len, st.s + dt));
+            if (snapTargets) {
+              let best = ns, bd = dur * 0.025;
+              for (const tg of snapTargets) {
+                if (Math.abs(ns - tg) < bd) { bd = Math.abs(ns - tg); best = tg; }
+                if (Math.abs(ns + st.len - tg) < bd) { bd = Math.abs(ns + st.len - tg); best = tg - st.len; }
+              }
+              ns = Math.max(0, Math.min(dur - st.len, best));
+            }
+            return { ...x, startTime: ns, endTime: ns + st.len };
+          }));
+        } else if (mode === 'reorder') {
+          // Highlight the row currently under the cursor so the user sees
+          // where the clip will land when they release.
+          document.querySelectorAll('.etl-track-row.etl-reorder-hover').forEach(el => el.classList.remove('etl-reorder-hover'));
+          const overId = rowIdFromPoint(ev.clientX, ev.clientY);
+          if (overId && overId !== id) {
+            const row = document.querySelector(`.etl-track-row[data-layer-id="${CSS.escape(overId)}"]`);
+            row && row.classList.add('etl-reorder-hover');
+          }
+        }
+      };
+      const up = (ev) => {
+        clearTimeout(lpTimer);
+        try { clipEl.classList.remove('etl-clip-reorder-active'); } catch {}
+        document.querySelectorAll('.etl-track-row.etl-reorder-hover').forEach(el => el.classList.remove('etl-reorder-hover'));
+        if (mode === 'reorder') {
+          const overId = rowIdFromPoint(ev.clientX, ev.clientY);
+          if (overId && overId !== id) reorderLayer(id, overId);
+        }
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
     };
   }
 
@@ -2081,7 +2646,33 @@ function Editor({ state, setState }) {
       const move = (ev) => {
         const r = timelineRef.current?.getBoundingClientRect(); if (!r) return;
         const t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
-        if (isStart) set('layers', (l) => l.map(x => x.id === id ? { ...x, startTime: Math.min(x.endTime - 0.1, t) } : x));
+        if (isStart) {
+          // Trimming the HEAD of a clip: move startTime AND shift srcStart so
+          // the source IN-point moves with it. Without the srcStart update
+          // the export plays the unstrimmed source while the preview seems
+          // fine — they only match when srcStart tracks startTime.
+          set('layers', (l) => l.map(x => {
+            if (x.id !== id) return x;
+            const oldStart = x.startTime || 0;
+            const oldSrc = x.srcStart || 0;
+            const isMedia = x.type === 'videoOverlay' || x.type === 'audio' || x.type === 'maskedVideo';
+            // For media layers, we can only pull the head left by as much
+            // source as we have BEFORE srcStart. Going further would extend
+            // the clip on the timeline past the available source — and the
+            // renderer would either freeze on the last frame or fill black.
+            const minStart = isMedia ? Math.max(0, oldStart - oldSrc) : 0;
+            const newStart = Math.max(minStart, Math.min(x.endTime - 0.1, t));
+            const delta = newStart - oldStart;
+            const next = { ...x, startTime: newStart };
+            if (isMedia) {
+              let newSrc = oldSrc + delta;
+              if (newSrc < 0) newSrc = 0;
+              if (x.srcDuration && newSrc > x.srcDuration - 0.05) newSrc = x.srcDuration - 0.05;
+              next.srcStart = newSrc;
+            }
+            return next;
+          }));
+        }
         else set('layers', (l) => l.map(x => x.id === id ? { ...x, endTime: Math.max(x.startTime + 0.1, x.srcDuration ? Math.min(t, x.startTime + (x.srcDuration - (x.srcStart || 0))) : t) } : x));
       };
       const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
@@ -2137,9 +2728,20 @@ function Editor({ state, setState }) {
     // layer as input 0 so ffmpeg has a real source to read from.
     const vids = layers.filter(l => l.type === 'videoOverlay' && !l.hidden);
     const auds = layers.filter(l => l.type === 'audio' && !l.hidden);
-    const baseVid = vids[0] || null;
-    const baseAud = (!baseVid && auds.length > 0) ? auds[0] : null;
-    const baseFile = baseVid?.file || baseAud?.file || file || null;
+    // Promote the bottom-most videoOverlay to "base" ONLY when it is actually
+    // the bottom-most VISIBLE layer in z-order. If something else (e.g., an
+    // image background) sits lower in the stack, EVERY visual layer must go
+    // through the overlay chain — otherwise the lower image would get
+    // composited ON TOP of the video, ignoring z-order.
+    const visibleVisuals = layers.filter(l => !l.hidden && (l.type === 'videoOverlay' || l.type === 'image' || l.type === 'maskedVideo'));
+    const bottomVisual = visibleVisuals[0];
+    const baseVid = (bottomVisual && bottomVisual.type === 'videoOverlay') ? bottomVisual : null;
+    const baseAud = (!baseVid && !bottomVisual && auds.length > 0) ? auds[0] : null;
+    // Still need SOME file at input [0] for ffmpeg. When the bottom-most layer
+    // is an image, fall back to the bottom-most video file (its [0:v]/[0:a]
+    // are ignored by the renderer since mainVideo is null — the file is also
+    // listed in `layers`, so its frames and audio still play in correct order).
+    const baseFile = baseVid?.file || baseAud?.file || vids[0]?.file || file || null;
     if (!baseFile) { alert('Нет ни одного видео или аудио для сохранения.'); return; }
     const outPath = await window.strata?.pickSaveAs?.(fileName(baseFile || '').replace(/\.[^.]+$/, '') + `_edit.${ext}`, fmt);
     if (!outPath) return;
@@ -2214,8 +2816,11 @@ function Editor({ state, setState }) {
     if (l.type === 'mask') return 'Маска';
     if (l.type === 'maskedVideo') return 'Вырезка' + rev;
     if (l.type === 'transition') {
-      const lbl = { low: 'слаб.', mid: 'сред.', high: 'сильн.' }[l.strength] || '';
-      return 'Переход ' + lbl;
+      const kLbl = { shake: 'Удар', whippan: 'Whip pan', zoom: 'Zoom', blur: 'Blur' }[l.kind || 'shake'] || 'Переход';
+      const s = typeof l.strength === 'number'
+        ? Math.round(l.strength)
+        : (l.strength === 'low' ? 25 : l.strength === 'high' ? 80 : l.strength === 'mid' ? 50 : null);
+      return s != null ? `${kLbl} ${s}%` : kLbl;
     }
     return compactName(fileName(l.file || ''), 9) + rev;
   }
@@ -2224,6 +2829,25 @@ function Editor({ state, setState }) {
     let c = measureCanvasRef.current;
     if (!c) { c = document.createElement('canvas'); measureCanvasRef.current = c; }
     return c.getContext('2d');
+  }
+  // Cache text widths keyed by `text|font|size` — measureText is non-trivial
+  // and was being called once per text layer per render frame. Cleared
+  // periodically so the map doesn't accumulate forever.
+  const textWidthCacheRef = useRef(new Map());
+  function measureTextCached(text, font, fs) {
+    const k = text + '|' + font + '|' + fs;
+    const hit = textWidthCacheRef.current.get(k);
+    if (hit !== undefined) return hit;
+    const mc = measureCtx();
+    mc.font = `${fs}px ${font}`;
+    const tw = mc.measureText(text || ' ').width;
+    textWidthCacheRef.current.set(k, tw);
+    // Bound the cache: drop oldest half when it gets big.
+    if (textWidthCacheRef.current.size > 512) {
+      const keys = [...textWidthCacheRef.current.keys()].slice(0, 256);
+      keys.forEach(kk => textWidthCacheRef.current.delete(kk));
+    }
+    return tw;
   }
 
   // Single source of truth for a layer's on-canvas rectangle (in output pixels).
@@ -2255,9 +2879,7 @@ function Editor({ state, setState }) {
     }
     if (layer.type === 'text') {
       const fs = layer.size || 48;
-      const mc = measureCtx();
-      mc.font = `${fs}px ${fontCss(layer)}`;
-      const tw = mc.measureText(layer.text || ' ').width;
+      const tw = measureTextCached(layer.text || ' ', fontCss(layer), fs);
       const w = tw + 24, h = fs * 1.4;
       const cx = (layer.x / 100) * W;
       const x = layer.align === 'left' ? cx - 12 : layer.align === 'right' ? cx - w + 12 : cx - w / 2;
@@ -2373,8 +2995,8 @@ function Editor({ state, setState }) {
         const b = getLayerPx(layer);
         let cache = videoFrameCacheRef.current.get(layer.id);
         // Per-video colour correction — applied to the whole video layer.
-        const ccf = `brightness(${100 + (layer.ccB || 0)}%) contrast(${layer.ccC ?? 100}%) saturate(${layer.ccS ?? 100}%)`;
-        const hasCC = ccf !== 'brightness(100%) contrast(100%) saturate(100%)';
+        const ccf = `brightness(${100 + (layer.ccB || 0)}%) contrast(${layer.ccC ?? 100}%) saturate(${layer.ccS ?? 100}%) hue-rotate(${layer.ccH ?? 0}deg)`;
+        const hasCC = ccf !== 'brightness(100%) contrast(100%) saturate(100%) hue-rotate(0deg)';
         if (hasCC) { ctx.save(); ctx.filter = ccf; }
         if (ov && ov.readyState >= 2 && ov.videoWidth) {
           try { ctx.drawImage(ov, b.x, b.y, b.w, b.h); } catch(e) {}
@@ -2423,8 +3045,8 @@ function Editor({ state, setState }) {
         }
         ctx.clip();
         // Optional CC.
-        const ccf = `brightness(${100 + (layer.ccB || 0)}%) contrast(${layer.ccC ?? 100}%) saturate(${layer.ccS ?? 100}%)`;
-        if (ccf !== 'brightness(100%) contrast(100%) saturate(100%)') ctx.filter = ccf;
+        const ccf = `brightness(${100 + (layer.ccB || 0)}%) contrast(${layer.ccC ?? 100}%) saturate(${layer.ccS ?? 100}%) hue-rotate(${layer.ccH ?? 0}deg)`;
+        if (ccf !== 'brightness(100%) contrast(100%) saturate(100%) hue-rotate(0deg)') ctx.filter = ccf;
         // Always draw from the cache canvas — drawImage from a canvas is more
         // reliable than from a live <video> element that may be mid-seek.
         const src = (cache && cache.width) ? cache : null;
@@ -2447,38 +3069,87 @@ function Editor({ state, setState }) {
         }
         ctx.restore();
       } else if (layer.type === 'transition') {
-        // Shake + flash combo. Applies to everything composed below.
         const tls = layer.startTime || 0, tle = layer.endTime ?? dur;
         const span = Math.max(0.01, tle - tls);
         const tProg = Math.max(0, Math.min(1, (currentTime - tls) / span));
         const t = currentTime;
-        const amp = (layer.amp || 30);
-        // Two-axis noisy shake using stacked sines, attenuated toward the end.
-        const decay = 1 - tProg * 0.85;
-        const ox = (Math.sin(t * 113) * 0.6 + Math.sin(t * 187) * 0.4) * amp * decay;
-        const oy = (Math.cos(t * 97)  * 0.6 + Math.cos(t * 151) * 0.4) * amp * decay;
-        // Snapshot current canvas, redraw shifted (so the shake affects every
-        // layer below). Background gets refilled with bg color underneath.
+        const kind = layer.kind || 'shake';
+        // Triangle ramp 0 → 1 (mid) → 0; sine version is smoother.
+        const peak = Math.sin(tProg * Math.PI);
+
+        // Reusable snapshot canvas (already used by other layers).
         const tmp = blurTmpRef.current || (blurTmpRef.current = document.createElement('canvas'));
         if (tmp.width !== W) tmp.width = W;
         if (tmp.height !== H) tmp.height = H;
         const tctx = tmp.getContext('2d');
-        tctx.clearRect(0, 0, W, H);
-        try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-        ctx.fillStyle = bgColor || '#000000';
-        ctx.fillRect(0, 0, W, H);
-        try { ctx.drawImage(tmp, ox, oy); } catch(e) {}
-        // White flash: spike at the front of the transition then fade.
-        const flashMax = layer.flash ?? 0.85;
-        let alpha;
-        if (tProg < 0.15) alpha = (tProg / 0.15) * flashMax;
-        else              alpha = Math.max(0, flashMax * (1 - (tProg - 0.15) / 0.85));
-        if (alpha > 0.001) {
-          ctx.save();
-          ctx.globalAlpha = Math.min(1, alpha);
-          ctx.fillStyle = '#ffffff';
+
+        if (kind === 'shake') {
+          // Shake + white flash combo (original).
+          const amp = (layer.amp || 30);
+          const decay = 1 - tProg * 0.85;
+          const ox = (Math.sin(t * 113) * 0.6 + Math.sin(t * 187) * 0.4) * amp * decay;
+          const oy = (Math.cos(t * 97)  * 0.6 + Math.cos(t * 151) * 0.4) * amp * decay;
+          tctx.clearRect(0, 0, W, H);
+          try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          ctx.fillStyle = bgColor || '#000000';
           ctx.fillRect(0, 0, W, H);
+          try { ctx.drawImage(tmp, ox, oy); } catch(e) {}
+          const flashMax = layer.flash ?? 0.85;
+          let alpha;
+          if (tProg < 0.15) alpha = (tProg / 0.15) * flashMax;
+          else              alpha = Math.max(0, flashMax * (1 - (tProg - 0.15) / 0.85));
+          if (alpha > 0.001) {
+            ctx.save();
+            ctx.globalAlpha = Math.min(1, alpha);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, W, H);
+            ctx.restore();
+          }
+        } else if (kind === 'whippan') {
+          // Fast horizontal motion-blur swipe.
+          const shiftMax = (layer.shift || 60) / 100 * W;
+          const blurMax = layer.blur || 22;
+          // The frame goes off to the right (or left) at midpoint, returns.
+          // Direction baked into the sign of the shift curve.
+          const xOff = Math.sin(tProg * Math.PI) * shiftMax; // 0 → +shift → 0
+          const blurNow = blurMax * peak;
+          tctx.clearRect(0, 0, W, H);
+          try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          ctx.fillStyle = bgColor || '#000000';
+          ctx.fillRect(0, 0, W, H);
+          ctx.save();
+          if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
+          try { ctx.drawImage(tmp, xOff, 0); } catch(e) {}
           ctx.restore();
+        } else if (kind === 'zoom') {
+          // Zoom punch — up to 300%, with blur ramping with scale.
+          const scaleMax = layer.scale || 2;
+          const blurMax = layer.blur || 8;
+          const scale = 1 + (scaleMax - 1) * peak;
+          const blurNow = blurMax * peak;
+          if (scale > 1.001 || blurNow > 0.5) {
+            tctx.clearRect(0, 0, W, H);
+            try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+            ctx.clearRect(0, 0, W, H);
+            ctx.save();
+            if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
+            const dw = W * scale, dh = H * scale;
+            try { ctx.drawImage(tmp, (W - dw) / 2, (H - dh) / 2, dw, dh); } catch(e) {}
+            ctx.restore();
+          }
+        } else if (kind === 'blur') {
+          // Burst of gaussian blur that resolves.
+          const blurMax = layer.blur || 25;
+          const blurNow = blurMax * peak;
+          if (blurNow > 0.5) {
+            tctx.clearRect(0, 0, W, H);
+            try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+            ctx.clearRect(0, 0, W, H);
+            ctx.save();
+            ctx.filter = `blur(${blurNow}px)`;
+            try { ctx.drawImage(tmp, 0, 0); } catch(e) {}
+            ctx.restore();
+          }
         }
       } else if (layer.type === 'zoom') {
         // Zoom ramps the whole composition: 1× → max at the midpoint → 1× at the end.
@@ -2518,6 +3189,26 @@ function Editor({ state, setState }) {
   };
 
   return <>
+    {savePromptState && (
+      <div className="sm-prompt-back" onClick={(e) => { if (e.target === e.currentTarget) answerSavePrompt('cancel'); }}>
+        <div className="sm-prompt-modal" role="dialog" aria-modal="true">
+          <div className="sm-prompt-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            </svg>
+          </div>
+          <div className="sm-prompt-body">
+            <h2 className="sm-prompt-title">{savePromptState.message || 'Сохранить проект?'}</h2>
+            {savePromptState.detail && <p className="sm-prompt-detail">{savePromptState.detail}</p>}
+          </div>
+          <div className="sm-prompt-actions">
+            <button className="sm-prompt-btn sm-prompt-btn-ghost" onClick={() => answerSavePrompt('cancel')}>Отмена</button>
+            <button className="sm-prompt-btn sm-prompt-btn-secondary" onClick={() => answerSavePrompt('dont-save')}>Не сохранять</button>
+            <button className="sm-prompt-btn sm-prompt-btn-primary" onClick={() => answerSavePrompt('save')} autoFocus>Сохранить</button>
+          </div>
+        </div>
+      </div>
+    )}
     {saveProgress !== null && (() => {
       const lightTheme = document.documentElement.getAttribute('data-theme') === 'light';
       const cubeBg = lightTheme ? '#ebf1f8' : '#020202';
@@ -2619,6 +3310,18 @@ function Editor({ state, setState }) {
         document.body
       );
     })()}
+    {confirmClearOpen && (
+      <div className="modal-back" onClick={e => { if (e.target === e.currentTarget) setConfirmClearOpen(false); }}>
+        <div className="result-modal ed-confirm-modal">
+          <h2>Очистить редактор?</h2>
+          <p className="ed-confirm-text">Все слои и медиа будут удалены.</p>
+          <div className="modal-actions ed-confirm-actions">
+            <button className="btn" onClick={() => setConfirmClearOpen(false)}>Отмена</button>
+            <button className="btn primary ed-confirm-danger" onClick={doClearAll}>Очистить</button>
+          </div>
+        </div>
+      </div>
+    )}
     {saveDialogOpen && (
       <div className="editor-save-modal" onClick={e => { if (e.target === e.currentTarget) setSaveDialogOpen(false); }}>
         <div className="editor-save-modal-box save-fmt-dialog">
@@ -2674,23 +3377,18 @@ function Editor({ state, setState }) {
               {lbl}
             </button>
           ))}
-          <button className={`ed-preset-btn${isCustomSize?' active':''}`} title="Задать свой размер"
+          <button className={`ed-preset-btn${(isCustomSize||dimFocused)?' active':''}`} title="Задать свой размер"
             onClick={() => dimWidthRef.current?.select()}>Свой</button>
           <input ref={dimWidthRef} className="ed-dim-inp" type="number" value={widthStr} onChange={e=>setWidthStr(e.target.value)}
-            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(widthStr)||1080));setWidthStr(String(v));set('outWidth',v);}}
+            onFocus={()=>setDimFocused(true)}
+            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(widthStr)||1080));setWidthStr(String(v));set('outWidth',v);setDimFocused(false);}}
             onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
           <span className="ed-dim-x">×</span>
           <input className="ed-dim-inp" type="number" value={heightStr} onChange={e=>setHeightStr(e.target.value)}
-            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(heightStr)||1920));setHeightStr(String(v));set('outHeight',v);}}
+            onFocus={()=>setDimFocused(true)}
+            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(heightStr)||1920));setHeightStr(String(v));set('outHeight',v);setDimFocused(false);}}
             onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
         </div>
-        <button className="btn primary ed-save-btn" data-onb="save" onClick={() => {
-          // Audio-only project? Default the save format to MP3 so the dialog is sensible.
-          const hasVideo = layers.some(l => l.type === 'videoOverlay');
-          const hasAudio = layers.some(l => l.type === 'audio');
-          if (!hasVideo && hasAudio) setSaveFmt('mp3');
-          setSaveDialogOpen(true);
-        }} disabled={!layers.some(l=>l.type==='videoOverlay'||l.type==='audio')||saveProgress!==null}>Сохранить</button>
       </div>
 
       {/* ── WORKSPACE: Preview + Properties ── */}
@@ -2785,15 +3483,25 @@ function Editor({ state, setState }) {
           ))}
 
           <div className="ed-preview-wrap" data-onb="preview" style={{ flex: '0 0 auto', height: previewH }}>
-            <div ref={canvasRef} style={{ position:'relative', height:'100%', width:'auto', maxWidth:'100%', aspectRatio:`${outWidth}/${outHeight}`, background:'#000', overflow:'hidden' }}>
-                {/* Canvas renders everything */}
-                <canvas ref={previewCanvasRef}
-                  style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', display:'block', pointerEvents:'none' }} />
-                {/* Orange frame — shows the video bounds in the preview only, never in the export */}
-                <div aria-hidden="true" style={{ position:'absolute', inset:0, border:'3px solid #ff8a00', pointerEvents:'none', zIndex:3 }} />
+            <div ref={canvasRef} style={{ position:'relative', height:'100%', width:'auto', maxWidth:'100%', aspectRatio:`${outWidth}/${outHeight}` }}>
+                {/* Clip layer: only the rendered canvas + orange frame get clipped
+                    to the project rect. The interactive bounding boxes/handles
+                    (rendered as siblings below) are NOT clipped so the user can
+                    still grab corners when a layer is scaled larger than the
+                    preview area. */}
+                <div className="ed-preview-clip" style={{ position:'absolute', inset:0, overflow:'hidden', background:'#000', borderRadius:'10px' }}>
+                  <canvas ref={previewCanvasRef}
+                    style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', display:'block', pointerEvents:'none' }} />
+                  {/* Subtle frame — the project rect is defined by contrast between
+                      the black canvas and the gray preview surround; only a thin
+                      hairline on top to make the edge crisp. */}
+                  <div aria-hidden="true" style={{ position:'absolute', inset:0, border:'1px solid rgba(255,255,255,.12)', pointerEvents:'none', zIndex:3 }} />
+                </div>
                 {/* Invisible hit-area divs for interaction — sized to the real
                     on-canvas rectangle so the bounding box always wraps the
-                    whole element. Corners stretch, edges resize proportionally. */}
+                    whole element. Corners stretch, edges resize proportionally.
+                    These render OUTSIDE the clip — handles stay grabbable even
+                    when the layer extends beyond the preview bounds. */}
                 {layers.filter(l => !l.hidden && l.type !== 'audio').map(layer => {
                   if (layer.type !== 'mainVideo' &&
                       (currentTime < (layer.startTime||0) || currentTime > (layer.endTime??dur))) return null;
@@ -2805,7 +3513,9 @@ function Editor({ state, setState }) {
                       style={{ position:'absolute',
                         left:`${b.x/outWidth*100}%`, top:`${b.y/outHeight*100}%`,
                         width:`${b.w/outWidth*100}%`, height:`${b.h/outHeight*100}%`,
-                        cursor:'move', userSelect:'none', touchAction:'none', background:'transparent' }}>
+                        cursor:'move', userSelect:'none', touchAction:'none', background:'transparent',
+                        border: isSel ? '1px dashed rgba(255,255,255,.85)' : undefined,
+                        boxShadow: isSel ? '0 0 0 1px rgba(0,0,0,.55)' : undefined }}>
                       {layer.reversed && <span className="ed-reversed-badge">⏪</span>}
                       {isSel && ['nw','n','ne','e','se','s','sw','w'].map(h =>
                         <div key={h} className={`preview-rh preview-rh-${h}`}
@@ -2830,9 +3540,7 @@ function Editor({ state, setState }) {
 
           {/* Playback bar */}
           <div className="ed-playback">
-            <button className="ed-pb-btn" title="−5 сек" onClick={() => seekTo(Math.max(0, currentTime-5))}>⏮</button>
             <button className="ed-pb-btn ed-pb-play" onClick={togglePlay}>{playing ? '⏸' : '▶'}</button>
-            <button className="ed-pb-btn" title="+5 сек" onClick={() => seekTo(Math.min(dur, currentTime+5))}>⏭</button>
             <div className="ed-scrub" onPointerDown={e => {
               e.preventDefault();
               pausePlayback();
@@ -2963,34 +3671,23 @@ function Editor({ state, setState }) {
           )}
 
           {sel?.type === 'transition' && (() => {
-            const presets = { low: { duration: 0.25, amp: 14, flash: 0.55 }, mid: { duration: 0.35, amp: 32, flash: 0.85 }, high: { duration: 0.50, amp: 60, flash: 1.00 } };
-            const applyStrength = (s) => {
-              const p = presets[s]; if (!p) return;
-              // Re-centre around the current mid-point so the cut stays aligned.
-              const mid = ((sel.startTime || 0) + (sel.endTime ?? dur)) / 2;
-              const newStart = Math.max(0, Math.min(dur - p.duration, mid - p.duration / 2));
+            // Strength = 0-100 slider that re-derives visual params (amp/blur/
+            // shift/scale) on every change. Duration stays whatever the clip
+            // is currently set to on the timeline.
+            const cur = typeof sel.strength === 'number'
+              ? sel.strength
+              : (sel.strength === 'low' ? 25 : sel.strength === 'high' ? 80 : 50);
+            const applyStrength = (v) => {
+              const params = transitionParams(sel.kind || 'shake', v);
               set('layers', ls => ls.map(x => x.id === sel.id
-                ? { ...x, strength: s, amp: p.amp, flash: p.flash, startTime: newStart, endTime: newStart + p.duration }
+                ? { ...x, strength: Number(v), ...params }
                 : x));
             };
             return (
               <div className="ed-prop-block ed-prop-sel">
                 <div className="ed-prop-head">⚡ Переход</div>
-                <div className="ed-trans-grid">
-                  <button type="button" className={`ed-mask-shape ${sel.strength === 'low' ? 'active' : ''}`} onClick={() => applyStrength('low')}>
-                    <span className="ed-mask-shape-glyph">·</span>
-                    <span className="ed-mask-shape-lbl">Слабый</span>
-                  </button>
-                  <button type="button" className={`ed-mask-shape ${sel.strength === 'mid' ? 'active' : ''}`} onClick={() => applyStrength('mid')}>
-                    <span className="ed-mask-shape-glyph">‧</span>
-                    <span className="ed-mask-shape-lbl">Средний</span>
-                  </button>
-                  <button type="button" className={`ed-mask-shape ${sel.strength === 'high' ? 'active' : ''}`} onClick={() => applyStrength('high')}>
-                    <span className="ed-mask-shape-glyph">⚡</span>
-                    <span className="ed-mask-shape-lbl">Сильный</span>
-                  </button>
-                </div>
-                <p className="ed-effects-hint">Переход стоит на стыке двух клипов. Можешь подвинуть на таймлайне как обычный слой.</p>
+                <Slider label="Сила" value={cur} min="0" max="100" onChange={applyStrength} />
+                <p className="ed-effects-hint">Длина клипа на таймлайне — это длительность перехода. Сила меняет интенсивность эффекта.</p>
               </div>
             );
           })()}
@@ -3025,6 +3722,12 @@ function Editor({ state, setState }) {
               <div className="ed-prop-head">🎬 {compactName(fileName(sel.file||''), 16)}</div>
               <Slider label="Размер, %" value={Math.round(sel.size)} min="5" max="200" onChange={v=>updLayer(sel.id,'size',v)} />
               <Slider label="Громкость, %" value={sel.volume??100} min="0" max="200" onChange={v=>updLayer(sel.id,'volume',v)} />
+              <Slider label="Яркость" value={sel.ccB ?? 0} min="-50" max="50" onChange={v=>updLayer(sel.id,'ccB',v)} />
+              <Slider label="Насыщенность, %" value={sel.ccS ?? 100} min="0" max="200" onChange={v=>updLayer(sel.id,'ccS',v)} />
+              <Slider label="Цветовой тон, °" value={sel.ccH ?? 0} min="-180" max="180" onChange={v=>updLayer(sel.id,'ccH',v)} />
+              {((sel.ccB || 0) !== 0 || (sel.ccS ?? 100) !== 100 || (sel.ccH ?? 0) !== 0) && (
+                <button className="ed-cc-reset" onClick={() => set('layers', l => l.map(x => x.id === sel.id ? { ...x, ccB: 0, ccS: 100, ccH: 0 } : x))}>Сбросить цветокоррекцию</button>
+              )}
             </div>
           )}
 
@@ -3046,30 +3749,34 @@ function Editor({ state, setState }) {
           {/* Effects tab */}
           {edPropTab === 'effects' && (
             <div className="ed-effects-panel">
-              <div className="ed-effects-section" data-onb="videofx">
-                <div className="ed-effects-title">Эффекты видео</div>
-                {sel?.type === 'videoOverlay' ? (() => {
+              <div className={`ed-effects-section${effectsOpen==='videofx'?' open':' collapsed'}`} data-onb="videofx">
+                <button className="ed-effects-title ed-acc-toggle" onClick={()=>setEffectsOpen(o=>o==='videofx'?null:'videofx')} aria-expanded={effectsOpen==='videofx'}>
+                  <span>Эффекты видео</span>
+                  <span className="ed-acc-chev" aria-hidden="true">▾</span>
+                </button>
+                <div className="ed-acc-body"><div className="ed-acc-inner">
+                {sel?.type !== 'videoOverlay' && <p className="ed-effects-hint">Выберите видео-слой на таймлайне.</p>}
+                {sel?.type === 'videoOverlay' && (() => {
                   const speedOn = !!sel.fxSpeed || (sel.speed != null && sel.speed !== 100);
-                  const hasCC = (sel.ccB || 0) !== 0 || (sel.ccC ?? 100) !== 100 || (sel.ccS ?? 100) !== 100;
-                  const colorOn = !!sel.fxColor || hasCC;
                   return (
                     <>
-                      <div className="ed-effects-desc">Выберите эффект — его настройки появятся ниже.</div>
+                      <p className="ed-effects-hint ed-effects-hint-section">Применяются к выбранному видео-слою.</p>
                       <div className="ed-effects-add">
-                        <button className={`ed-effect-btn${sel.reversed ? ' active' : ''}`}
-                          onClick={() => updLayer(sel.id, 'reversed', !sel.reversed)}>Реверс</button>
-                        <button className={`ed-effect-btn${speedOn ? ' active' : ''}`}
+                        <button className={`ed-effect-btn ed-effect-btn-d${sel.reversed ? ' active' : ''}`}
+                          onClick={() => updLayer(sel.id, 'reversed', !sel.reversed)}>
+                          <span>Реверс</span>
+                          <small>проигрывание задом наперёд</small>
+                        </button>
+                        <button className={`ed-effect-btn ed-effect-btn-d${speedOn ? ' active' : ''}`}
                           onClick={() => speedOn
                             ? set('layers', l => l.map(x => x.id === sel.id ? { ...x, fxSpeed: false, speed: 100 } : x))
-                            : updLayer(sel.id, 'fxSpeed', true)}>Скорость</button>
-                        <button className={`ed-effect-btn${colorOn ? ' active' : ''}`}
-                          onClick={() => colorOn
-                            ? set('layers', l => l.map(x => x.id === sel.id ? { ...x, fxColor: false, ccB: 0, ccC: 100, ccS: 100 } : x))
-                            : updLayer(sel.id, 'fxColor', true)}>Цвет</button>
+                            : updLayer(sel.id, 'fxSpeed', true)}>
+                          <span>Скорость</span>
+                          <small>ускоряет или замедляет</small>
+                        </button>
                       </div>
                       {speedOn && (
                         <Slider label="Скорость, %" value={sel.speed ?? 100} min="25" max="400" onChange={v=>setState(s=>{
-                          // Speed reshapes the clip on the timeline: 200% → half as long, 50% → twice.
                           const layers=s.layers.map(x=>{
                             if(x.id!==sel.id)return x;
                             const st=x.startTime||0;
@@ -3081,38 +3788,52 @@ function Editor({ state, setState }) {
                           return {...s,layers,totalDuration:Math.max(s.totalDuration,maxEnd)};
                         })} />
                       )}
-                      {colorOn && (
-                        <>
-                          <div className="ed-effects-subhead">Цветокоррекция</div>
-                          <Slider label="Яркость" value={sel.ccB ?? 0} min="-50" max="50" onChange={v=>updLayer(sel.id,'ccB',v)} />
-                          <Slider label="Контраст, %" value={sel.ccC ?? 100} min="50" max="150" onChange={v=>updLayer(sel.id,'ccC',v)} />
-                          <Slider label="Насыщенность, %" value={sel.ccS ?? 100} min="0" max="200" onChange={v=>updLayer(sel.id,'ccS',v)} />
-                        </>
-                      )}
                     </>
                   );
-                })() : (
-                  <p className="ed-effects-hint">Выберите видео-слой на таймлайне — здесь появятся эффекты.</p>
-                )}
+                })()}
+                </div></div>
               </div>
-              <div className="ed-effects-section">
-                <div className="ed-effects-title">Эффект-слои</div>
-                <div className="ed-effects-desc">Каждый создаётся новым слоем на таймлайне и применяется ко всем слоям под ним.</div>
-                <div className="ed-effects-add">
-                  <button className="ed-effect-btn" data-onb="blur" onClick={addBlurRegion}>Блюр</button>
-                  <button className="ed-effect-btn" onClick={addZoom}>Зум</button>
-                  <button className="ed-effect-btn" onClick={addMaskRegion}>Маска</button>
-                  <button className="ed-effect-btn" data-onb="text" onClick={addTextOverlay}>Текст</button>
-                </div>
+
+              <div className={`ed-effects-section${effectsOpen==='layers'?' open':' collapsed'}`}>
+                <button className="ed-effects-title ed-acc-toggle" onClick={()=>setEffectsOpen(o=>o==='layers'?null:'layers')} aria-expanded={effectsOpen==='layers'}>
+                  <span>Эффект-слои</span>
+                  <span className="ed-acc-chev" aria-hidden="true">▾</span>
+                </button>
+                <div className="ed-acc-body"><div className="ed-acc-inner">
+                  <p className="ed-effects-hint ed-effects-hint-section">Создаёт новый слой и применяется ко всем слоям под собой.</p>
+                  <div className="ed-effects-add">
+                    <button className="ed-effect-btn" data-onb="blur" onClick={addBlurRegion}>Блюр</button>
+                    <button className="ed-effect-btn" onClick={addZoom}>Зум</button>
+                    <button className="ed-effect-btn" onClick={addMaskRegion}>Маска</button>
+                    <button className="ed-effect-btn" data-onb="text" onClick={addTextOverlay}>Текст</button>
+                  </div>
+                </div></div>
               </div>
-              <div className="ed-effects-section">
-                <div className="ed-effects-title">Переходы</div>
-                <div className="ed-effects-desc">Встанут на ближайший стык клипов на таймлайне. Длительность подбирается автоматически.</div>
-                <div className="ed-effects-add ed-trans-grid">
-                  <button className="ed-effect-btn ed-trans-btn ed-trans-low"  onClick={() => addTransition('low')}>Слабый</button>
-                  <button className="ed-effect-btn ed-trans-btn ed-trans-mid"  onClick={() => addTransition('mid')}>Средний</button>
-                  <button className="ed-effect-btn ed-trans-btn ed-trans-high" onClick={() => addTransition('high')}>Сильный</button>
-                </div>
+
+              <div className={`ed-effects-section${effectsOpen==='transitions'?' open':' collapsed'}`}>
+                <button className="ed-effects-title ed-acc-toggle" onClick={()=>setEffectsOpen(o=>o==='transitions'?null:'transitions')} aria-expanded={effectsOpen==='transitions'}>
+                  <span>Переходы</span>
+                  <span className="ed-acc-chev" aria-hidden="true">▾</span>
+                </button>
+                <div className="ed-acc-body"><div className="ed-acc-inner">
+                  <p className="ed-effects-hint ed-effects-hint-section">Используется для склейки двух разных видео, добавляется новым слоем.</p>
+                  {/* Click a kind to add that transition with default strength */}
+                  <div className="ed-trans-chips ed-trans-chips-grid">
+                    {[
+                      { kind: 'shake',   label: 'Удар',       desc: 'тряска + вспышка' },
+                      { kind: 'whippan', label: 'Whip pan',   desc: 'горизонтальный сдвиг' },
+                      { kind: 'zoom',    label: 'Zoom punch', desc: 'резкий зум с блюром' },
+                      { kind: 'blur',    label: 'Blur burst', desc: 'размытие при склейке' },
+                    ].map(({ kind, label, desc }) => (
+                      <button key={kind}
+                        className="ed-trans-chip"
+                        onClick={() => addTransition(kind, 50)}>
+                        {label}
+                        <small>{desc}</small>
+                      </button>
+                    ))}
+                  </div>
+                </div></div>
               </div>
             </div>
           )}
@@ -3158,6 +3879,7 @@ function Editor({ state, setState }) {
                 const clEnd = isMV ? videoEnd : layer.endTime;
                 return (
                   <div key={layer.id}
+                    data-layer-id={layer.id}
                     className={`etl-track-row${(selectedId===layer.id||selectedIds.has(layer.id))?' etl-selected':''}${layer.hidden?' etl-hidden':''}`}
                     onClick={e=>{
                       const idx = timelineLayers.findIndex(l => l.id === layer.id);
@@ -3184,7 +3906,12 @@ function Editor({ state, setState }) {
                       onDragOver={e=>{ e.preventDefault(); e.currentTarget.classList.add('etl-drop-target'); }}
                       onDragLeave={e=>e.currentTarget.classList.remove('etl-drop-target')}
                       onDrop={e=>{ e.preventDefault(); e.currentTarget.classList.remove('etl-drop-target'); reorderLayer(layerDragRef.current, layer.id); layerDragRef.current=null; }}>
-                      <span className="etl-track-label">{lName(layer)}</span>
+                      <span className={`etl-track-label${layer._missing ? ' etl-missing' : ''}`} title={layer._missing ? `Файл не найден: ${layer.file || ''}` : undefined}>
+                        {LAYER_ICONS[layer.type] && (
+                          <img className="etl-track-icon" src={LAYER_ICONS[layer.type]} alt="" aria-hidden="true" />
+                        )}
+                        {layer._missing ? '⚠ ' : ''}{lName(layer)}
+                      </span>
                       <div className="etl-track-actions">
                         <button className="etl-act-color" title="Цвет клипа" style={{background:lColor(layer)}}
                           onPointerDown={e=>e.stopPropagation()}
@@ -3212,14 +3939,47 @@ function Editor({ state, setState }) {
                         {layer.type==='image' && layer.file && (
                           <img className="etl-clip-thumb" src={fileUrl(layer.file)} alt="" aria-hidden="true" />
                         )}
-                        {layer.type==='videoOverlay' && layer.file && (
-                          <video className="etl-clip-thumb" src={fileUrl(layer.file)+'#t=0.1'} muted preload="metadata" aria-hidden="true" />
-                        )}
+                        {layer.type==='videoOverlay' && layer.file && (() => {
+                          const clipDur = Math.max(0.1, (layer.endTime ?? dur) - (layer.startTime || 0));
+                          const srcStart = layer.srcStart || 0;
+                          const n = Math.max(1, Math.min(40, Math.round(clipDur)));
+                          const cache = thumbsCacheRef.current.get(layer.file);
+                          // FAST PATH: cached thumbnails (low-res JPEG <img>).
+                          // No video decoders, no seek latency, instant on split.
+                          if (cache && cache.thumbs && cache.thumbs.length && !cache.loading) {
+                            return <div className="etl-clip-thumbstrip" aria-hidden="true">
+                              {Array.from({ length: n }, (_, i) => {
+                                const t = srcStart + (i / Math.max(1, n - 1)) * clipDur;
+                                // Pick the closest pre-generated thumb.
+                                let bestIdx = 0, bestDist = Infinity;
+                                for (let j = 0; j < cache.thumbs.length; j++) {
+                                  const d = Math.abs(cache.thumbs[j].t - t);
+                                  if (d < bestDist) { bestDist = d; bestIdx = j; }
+                                }
+                                return <img key={i} className="etl-thumb-cell"
+                                  src={cache.thumbs[bestIdx].url} alt="" />;
+                              })}
+                            </div>;
+                          }
+                          // FALLBACK: while the cache is still generating,
+                          // use a small number of <video> elements so the
+                          // user sees SOMETHING right away.
+                          const nFb = Math.min(8, n);
+                          return <div className="etl-clip-thumbstrip" aria-hidden="true">
+                            {Array.from({ length: nFb }, (_, i) => {
+                              const t = srcStart + (i / Math.max(1, nFb - 1)) * clipDur;
+                              return <video key={i}
+                                className="etl-thumb-cell"
+                                src={fileUrl(layer.file) + `#t=${t.toFixed(2)}`}
+                                muted preload="metadata" />;
+                            })}
+                          </div>;
+                        })()}
                         <div className="etl-clip-handle etl-clip-s"
                           data-onb={(selectedId === layer.id && layer.type === 'videoOverlay') ? 'clipstart' : undefined}
                           onPointerDown={makeClipHandleDrag(layer.id,true)} />
                         <span className="etl-clip-inner-label">{lName(layer)}</span>
-                        {layer.type==='videoOverlay' && (layer.reversed || (layer.speed!=null&&layer.speed!==100) || (layer.ccB||0)!==0 || (layer.ccC!=null&&layer.ccC!==100) || (layer.ccS!=null&&layer.ccS!==100)) && (
+                        {layer.type==='videoOverlay' && (layer.reversed || (layer.speed!=null&&layer.speed!==100) || (layer.ccB||0)!==0 || (layer.ccC!=null&&layer.ccC!==100) || (layer.ccS!=null&&layer.ccS!==100) || (layer.ccH||0)!==0) && (
                           <span className="etl-clip-fx" title="Применены эффекты">fx</span>
                         )}
                         <div className="etl-clip-handle etl-clip-e" onPointerDown={makeClipHandleDrag(layer.id,false)} />

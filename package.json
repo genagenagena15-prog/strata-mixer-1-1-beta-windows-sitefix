@@ -1,6 +1,6 @@
 {
   "name": "strata-mixer",
-  "version": "1.2.3",
+  "version": "1.2.5",
   "description": "Strata Mixer v1.2 — программа для уникализации и редактирования видео",
   "main": "electron/main.js",
   "private": true,
@@ -8,18 +8,26 @@
     "dev": "concurrently -k \"vite --port 5180\" \"wait-on http://localhost:5180 && cross-env STRATA_SKIP_UPDATE_CHECK=1 VITE_DEV_PORT=5180 electron .\"",
     "vite-only": "vite --port 5180",
     "build": "vite build",
-    "package": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=win32 --arch=x64 --out=release --overwrite --icon=assets/strata_mixer_1_1d.ico --prune=true",
+    "package": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=win32 --arch=x64 --out=release --overwrite --icon=assets/strata_mixer_v1_2_4.ico --prune=true",
     "prepare-ffmpeg": "node scripts/prepare-ffmpeg.cjs",
-    "package:win": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=win32 --arch=x64 --out=release --overwrite --icon=assets/strata_mixer_1_1d.ico --prune=true",
-    "package:mac-arm64": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=darwin --arch=arm64 --out=release-mac --overwrite --icon=assets/strata_mixer_1_1d.icns --prune=true",
-    "package:mac-x64": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=darwin --arch=x64 --out=release-mac --overwrite --icon=assets/strata_mixer_1_1d.icns --prune=true",
+    "package:win": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=win32 --arch=x64 --out=release --overwrite --icon=assets/strata_mixer_v1_2_4.ico --prune=true",
+    "package:mac-arm64": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=darwin --arch=arm64 --out=release-mac --overwrite --icon=assets/strata_mixer_v1_2_4.icns --prune=true",
+    "package:mac-x64": "npm run build && npm run prepare-ffmpeg && electron-packager . StrataMixer_1_2 --platform=darwin --arch=x64 --out=release-mac --overwrite --icon=assets/strata_mixer_v1_2_4.icns --prune=true",
     "package:mac": "node scripts/build-mac.cjs",
-    "dist:win": "npm run build && npm run prepare-ffmpeg && electron-builder --win"
+    "dist:win": "npm run build && npm run prepare-ffmpeg && electron-builder --win",
+    "release:patch": "node scripts/release.cjs patch",
+    "release:minor": "node scripts/release.cjs minor",
+    "release:major": "node scripts/release.cjs major",
+    "release:dry": "node scripts/release.cjs patch --dry"
   },
   "build": {
     "appId": "com.stratamixer.app",
     "productName": "Strata Mixer",
-    "asar": false,
+    "asar": true,
+    "asarUnpack": [
+      "bin/**/*",
+      "node_modules/ffmpeg-static/**/*"
+    ],
     "artifactName": "StrataMixer-${version}.${ext}",
     "publish": [
       {
@@ -40,7 +48,7 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "assets/strata_mixer_1_1d.ico"
+      "icon": "assets/strata_mixer_v1_2_4.ico"
     },
     "nsis": {
       "oneClick": true,
@@ -51,26 +59,34 @@
     },
     "mac": {
       "target": "dmg",
-      "icon": "assets/strata_mixer_1_1d.icns",
+      "icon": "assets/strata_mixer_v1_2_4.icns",
       "category": "public.app-category.video"
-    }
+    },
+    "fileAssociations": [
+      {
+        "ext": "smproj",
+        "name": "Strata Mixer Project",
+        "description": "Проект Strata Mixer",
+        "icon": "assets/strata_project_b.ico",
+        "role": "Editor"
+      }
+    ]
   },
   "dependencies": {
-    "@electron/remote": "latest",
     "electron-updater": "^6.8.3",
-    "ffmpeg-static": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "ffmpeg-static": "^5.3.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "latest",
-    "concurrently": "latest",
+    "@vitejs/plugin-react": "^6.0.2",
+    "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
-    "electron": "latest",
+    "electron": "^42.1.0",
     "electron-builder": "^26.8.1",
-    "electron-packager": "latest",
-    "vite": "latest",
-    "wait-on": "latest"
+    "electron-packager": "^17.1.2",
+    "vite": "^8.0.13",
+    "wait-on": "^9.0.10"
   },
-  "publicVersion": "v1.2.3"
+  "publicVersion": "v1.2.5"
 }

@@ -7,6 +7,34 @@ contextBridge.exposeInMainWorld('strata', {
   pickMedia: () => ipcRenderer.invoke('media:pick'),
   pickFolder: () => ipcRenderer.invoke('folder:pick'),
   pickSaveAs: (defaultName, format) => ipcRenderer.invoke('saveas:pick', defaultName, format),
+  saveProject: (data) => ipcRenderer.invoke('project:save', data),
+  openProject: () => ipcRenderer.invoke('project:open'),
+  onProjectOpen: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('project:open-from-file', handler);
+    return () => ipcRenderer.removeListener('project:open-from-file', handler);
+  },
+  // ── Dirty-state sync + save-on-quit/update prompt ──────────────────────
+  // Renderer pushes its dirty flag here whenever it changes; main keeps a
+  // cached copy so it can decide on quit/update whether to prompt for save.
+  setDirty: (dirty) => ipcRenderer.send('project:set-dirty', !!dirty),
+  // Main asks the renderer to perform a Save (it has the project state).
+  // Renderer replies with `saveRequestResponse({ ok, path, canceled, error })`.
+  onSaveRequest: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('project:save-request', handler);
+    return () => ipcRenderer.removeListener('project:save-request', handler);
+  },
+  saveRequestResponse: (result) => ipcRenderer.send('project:save-response', result),
+  // Main asks the renderer to show the custom save-prompt modal (in-app
+  // styling instead of the native OS dialog). Renderer replies with one of
+  // 'save' | 'dont-save' | 'cancel'.
+  onSavePromptRequest: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('project:save-prompt-request', handler);
+    return () => ipcRenderer.removeListener('project:save-prompt-request', handler);
+  },
+  savePromptResponse: (choice) => ipcRenderer.send('project:save-prompt-response', choice),
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
   mergeClips: (payload) => ipcRenderer.invoke('editor:concatClips', payload),
   onMergeProgress: (callback) => {

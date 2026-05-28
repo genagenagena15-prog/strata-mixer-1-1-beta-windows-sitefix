@@ -5,7 +5,7 @@ const pngToIcoMod = require('png-to-ico');
 const pngToIco = typeof pngToIcoMod === 'function' ? pngToIcoMod : pngToIcoMod.default;
 
 const svgPath = process.argv[2] || 'C:\\Users\\Гена\\Desktop\\КУБИК\\stratamixerICON.svg';
-const outIco = path.join(__dirname, '..', 'assets', 'strata_mixer_1_1d.ico');
+const outIco = path.join(__dirname, '..', 'assets', 'strata_mixer_v1_2_4.ico');
 const sizes = [16, 24, 32, 48, 64, 128, 256];
 
 (async () => {

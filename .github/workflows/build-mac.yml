@@ -1,39 +1,57 @@
-name: Build macOS DMG
+name: Build & publish macOS
 
-# Run manually from the GitHub "Actions" tab → "Run workflow".
+# Triggers on tag push (vX.Y.Z) — release.cjs creates and pushes this tag
+# after the Windows build is uploaded. Also supports manual dispatch from
+# the Actions tab in case a re-build is needed.
+
 on:
+  push:
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build from (e.g. v1.2.6). Must already exist.'
+        required: true
+        type: string
 
 jobs:
   build-mac:
-    runs-on: macos-latest
+    runs-on: macos-14   # Apple Silicon; cross-compiles x64 via electron prebuilds
+    permissions:
+      contents: read
     steps:
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # On tag push, github.ref_name is the tag itself; on manual
+          # dispatch we use the input.
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build renderer (Vite)
         run: npm run build
 
-      - name: Prepare bundled FFmpeg
+      - name: Prepare bundled ffmpeg (macOS binary from ffmpeg-static)
         run: npm run prepare-ffmpeg
 
-      - name: Build macOS DMG (Apple Silicon)
-        run: npx electron-builder --mac dmg --arm64 --publish never
+      - name: Build & publish .dmg (arm64 + x64)
+        run: npx electron-builder --mac --arm64 --x64 --publish always
         env:
-          # No Apple Developer certificate — build unsigned.
+          # PAT with write access to the releases repo
+          # (genagenagena15-prog/strata-mixer-releases). Add it under
+          # Settings → Secrets and variables → Actions → New repository secret
+          # in the SOURCE repo: name=GH_TOKEN, value=ghp_xxx…
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          # No Apple Developer cert — skip auto-discovery so electron-builder
+          # doesn't error out looking for one. Output .dmg will be unsigned;
+          # users see "unidentified developer" warning the first time.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-
-      - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: StrataMixer-macOS-dmg
-          path: release-installer/*.dmg
-          if-no-files-found: error

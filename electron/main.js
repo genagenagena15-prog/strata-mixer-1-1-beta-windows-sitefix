@@ -2,15 +2,23 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu, Tray, nativeImage, scr
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { spawn, execFileSync } = require('child_process');
+const { spawn } = require('child_process');
 
 let mainWindow = null;
 let splashWindow = null;
 let splashShownAt = 0;
-let currentProc = null;
+const activeProcs = new Set(); // Set of all in-flight ffmpeg processes — Stop kills the whole set, not just the last spawned one.
 let stopRequested = false;
 let tray = null;
 let isQuitting = false;
+// Renderer-reported dirty flag — set via 'project:set-dirty' IPC. Used by
+// before-quit and update:install to decide whether to prompt for a save.
+let rendererDirty = false;
+let _quitCleared = false;
+let savePromptInFlight = false;
+// Track every in-flight tmp file (reverse pre-renders, drawtext temp .txt
+// files, etc.) so app quit cleans them up even if individual flows leaked.
+const liveTmpFiles = new Set();
 
 // Single-instance lock: relaunching while minimized to tray just reveals
 // the existing window instead of spawning a duplicate process.
@@ -18,6 +26,56 @@ const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 }
+
+// ── .smproj file-open handling ─────────────────────────────────────────────
+// When the user double-clicks a project file in Explorer/Finder, the OS
+// either launches us with the path as an argv entry (Windows / Linux) or
+// fires the `open-file` event (macOS). We stash the path here and push it
+// into the renderer once the main window's webContents finishes loading.
+let pendingProjectFile = null;
+function extractProjectPath(argv) {
+  if (!Array.isArray(argv)) return null;
+  for (const a of argv) {
+    if (typeof a === 'string' && /\.smproj$/i.test(a)) {
+      try { if (fs.existsSync(a)) return a; } catch {}
+    }
+  }
+  return null;
+}
+function dispatchPendingProject() {
+  if (!pendingProjectFile || !mainWindow || mainWindow.isDestroyed()) return;
+  const wc = mainWindow.webContents;
+  const send = () => {
+    if (!pendingProjectFile) return;
+    const filePath = pendingProjectFile;
+    pendingProjectFile = null;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(raw);
+      if (Array.isArray(data?.state?.layers)) {
+        data.state.layers = data.state.layers.map(l =>
+          l && l.file && !fs.existsSync(l.file) ? { ...l, _missing: true } : l
+        );
+      }
+      wc.send('project:open-from-file', { ok: true, path: filePath, data });
+    } catch (e) {
+      wc.send('project:open-from-file', { ok: false, error: String(e.message || e) });
+    }
+  };
+  if (wc.isLoading()) wc.once('did-finish-load', send);
+  else send();
+}
+// Capture argv at startup (first launch from Explorer with a .smproj path).
+pendingProjectFile = extractProjectPath(process.argv);
+// macOS opens files via this event — fires BEFORE whenReady() resolves when
+// the app was launched by a double-click, and afterwards for subsequent ones.
+app.on('open-file', (event, filePath) => {
+  event.preventDefault();
+  if (filePath && /\.smproj$/i.test(filePath)) {
+    pendingProjectFile = filePath;
+    dispatchPendingProject();
+  }
+});
 
 // Persisted UI theme — written by the renderer so the splash window (which
 // shows before the app loads) can pick the matching light/dark cube.
@@ -524,7 +582,7 @@ function showMainWindow() {
 // System tray — the window hides here on close instead of quitting.
 function createTray() {
   if (tray) return tray;
-  const iconPath = appPath('assets', process.platform === 'darwin' ? 'strata_mixer_1_1d.icns' : 'strata_mixer_1_1d.ico');
+  const iconPath = appPath('assets', process.platform === 'darwin' ? 'strata_mixer_v1_2_4.icns' : 'strata_mixer_v1_2_4.ico');
   try {
     let image = null;
     try { image = nativeImage.createFromPath(iconPath); } catch {}
@@ -546,7 +604,7 @@ function createTray() {
 function createWindow() {
   Menu.setApplicationMenu(null);
   const bounds = getSafeWindowBounds();
-  const icon = appPath('assets', process.platform === 'darwin' ? 'strata_mixer_1_1d.icns' : 'strata_mixer_1_1d.ico');
+  const icon = appPath('assets', process.platform === 'darwin' ? 'strata_mixer_v1_2_4.icns' : 'strata_mixer_v1_2_4.ico');
   mainWindow = new BrowserWindow({
     width: bounds.width,
     height: bounds.height,
@@ -579,7 +637,8 @@ function createWindow() {
   });
 
   // Closing the window (incl. the custom titlebar ✕) hides to the tray
-  // instead of quitting. A real quit goes through the tray menu / app.quit().
+  // instead of quitting. A real quit goes through the tray menu / app.quit(),
+  // which fires before-quit — the save-prompt lives there.
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -614,6 +673,10 @@ function pushUpdateState(patch) {
 function setupAutoUpdater() {
   // electron-updater needs a packaged app (app-update.yml is embedded at build).
   if (!app.isPackaged) return;
+  // On macOS the DMG is unsigned (no Apple Developer cert), so electron-updater
+  // can't actually install anything. We fall back to a GitHub-Releases-API
+  // poll that just notifies the user and opens the download page on demand.
+  if (process.platform === 'darwin') return;
   try {
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true; // forced install on next restart
@@ -628,7 +691,38 @@ function setupAutoUpdater() {
 
 function checkForUpdatesSafe() {
   if (!app.isPackaged) return;
+  if (process.platform === 'darwin') { checkMacUpdate(); return; }
   try { autoUpdater.checkForUpdates().catch(() => {}); } catch {}
+}
+
+// macOS-only update check: hit the GitHub Releases API, find the latest tag,
+// and if it's newer than CURRENT_APP_VERSION surface a notify-only update card
+// in the bell. The "install" button just opens the DMG download URL.
+const MAC_RELEASES_API = 'https://api.github.com/repos/genagenagena15-prog/strata-mixer-releases/releases/latest';
+async function checkMacUpdate() {
+  if (!app.isPackaged) return;
+  if (process.platform !== 'darwin') return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${MAC_RELEASES_API}?t=${Date.now()}`, {
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const tag = String(data.tag_name || '').replace(/^v/, '').trim();
+    if (!tag) return;
+    if (!isRemoteNewerVersion(tag, CURRENT_APP_VERSION)) {
+      pushUpdateState({ status: 'idle', error: null });
+      return;
+    }
+    const dmgAsset = (data.assets || []).find(a => /\.dmg$/i.test(a.name));
+    const downloadUrl = dmgAsset?.browser_download_url || data.html_url;
+    pushUpdateState({ status: 'mac-available', version: tag, downloadUrl, error: null });
+  } catch { /* silent — try again later */ }
+  finally { clearTimeout(timer); }
 }
 
 async function fetchNotifications() {
@@ -671,15 +765,85 @@ function startUpdateAndNotificationCycle() {
 ipcMain.handle('app:version', () => CURRENT_DISPLAY_VERSION);
 ipcMain.handle('update:getState', () => updateState);
 ipcMain.handle('update:check', () => { checkForUpdatesSafe(); return updateState; });
-ipcMain.handle('update:install', () => {
+ipcMain.handle('update:install', async () => {
+  // Mac: just open the DMG download in the browser (no auto-install possible
+  // without a Developer cert; the user installs it manually).
+  if (process.platform === 'darwin' && updateState.status === 'mac-available' && updateState.downloadUrl) {
+    try { shell.openExternal(updateState.downloadUrl); } catch {}
+    return true;
+  }
+  // Ask to save unsaved work before restarting for the install.
+  const proceed = await maybePromptSaveProject(
+    'Установить обновление?',
+    'Программа будет перезапущена для установки обновления. У вас есть несохранённые изменения — сохранить проект?'
+  );
+  if (!proceed) return false;
   try { autoUpdater.quitAndInstall(true, true); } catch {}
   return true;
 });
 ipcMain.handle('notifications:get', () => notificationsCache);
 ipcMain.handle('notifications:refresh', async () => { await fetchNotifications(); return notificationsCache; });
 
-app.on('second-instance', () => showMainWindow());
-app.on('before-quit', () => { isQuitting = true; });
+app.on('second-instance', (_event, argv) => {
+  showMainWindow();
+  const proj = extractProjectPath(argv);
+  if (proj) {
+    pendingProjectFile = proj;
+    dispatchPendingProject();
+  }
+});
+app.on('before-quit', (event) => {
+  // If the renderer has unsaved work, intercept the quit and ask the user.
+  // _quitCleared is set after the user has answered (or there was nothing
+  // to save) so the second app.quit() goes through to actual cleanup.
+  if (rendererDirty && !_quitCleared) {
+    event.preventDefault();
+    (async () => {
+      const proceed = await maybePromptSaveProject('Сохранить проект перед выходом?');
+      if (proceed) {
+        _quitCleared = true;
+        isQuitting = true;
+        app.quit();
+      } else {
+        // Cancelled — stay open, stop the quit chain.
+        isQuitting = false;
+      }
+    })();
+    return;
+  }
+  isQuitting = true;
+  // Best-effort sweep of orphaned temps. Fast and synchronous because the
+  // process is exiting; lost files would otherwise stay until the OS cleans
+  // %TEMP% (which on Windows is rarely).
+  for (const f of liveTmpFiles) { try { fs.unlinkSync(f); } catch {} }
+  liveTmpFiles.clear();
+});
+
+// Bound the proxy cache so it doesn't grow forever. Runs in the background
+// at startup — deletes oldest files (by mtime) when the dir is bigger than
+// PROXY_CACHE_MAX bytes. Active proxies keep themselves alive via their
+// mtime being newer than the source file, so freshly-used ones survive.
+const PROXY_CACHE_MAX = 2 * 1024 * 1024 * 1024; // 2 GB ceiling
+function pruneProxyCache() {
+  const dir = path.join(app.getPath('temp'), 'strata-proxy');
+  fs.promises.readdir(dir).then(async (names) => {
+    const entries = [];
+    for (const n of names) {
+      const full = path.join(dir, n);
+      try {
+        const st = await fs.promises.stat(full);
+        entries.push({ full, size: st.size, mtimeMs: st.mtimeMs });
+      } catch {}
+    }
+    let total = entries.reduce((s, e) => s + e.size, 0);
+    if (total <= PROXY_CACHE_MAX) return;
+    entries.sort((a, b) => a.mtimeMs - b.mtimeMs); // oldest first
+    for (const e of entries) {
+      if (total <= PROXY_CACHE_MAX) break;
+      try { await fs.promises.unlink(e.full); total -= e.size; } catch {}
+    }
+  }).catch(() => {});
+}
 
 app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;
@@ -689,6 +853,11 @@ app.whenReady().then(async () => {
   createWindow();
   createTray();
   startUpdateAndNotificationCycle();
+  pruneProxyCache();
+
+  // If we were launched with a .smproj path in argv (or via macOS open-file
+  // queued before whenReady), push it into the renderer as soon as it loads.
+  dispatchPendingProject();
 
   app.on('activate', () => showMainWindow());
 });
@@ -754,9 +923,168 @@ ipcMain.handle('saveas:pick', async (_event, defaultName, format) => {
   return result.filePath || '';
 });
 
+// ── Project file (.smproj) save/open ────────────────────────────────────────
+// Plain JSON: { version, savedAt, state: { layers, totalDuration, ... } }.
+// Media paths are stored absolute — easiest, but breaks if the user moves the
+// source files. On open we check fs.existsSync for every layer's file and tag
+// missing ones with `_missing: true` so the UI can flag them.
+ipcMain.handle('project:save', async (_event, projectData) => {
+  try {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Сохранить проект',
+      defaultPath: (projectData && projectData.suggestedName) || 'project.smproj',
+      filters: [{ name: 'Strata Mixer Project', extensions: ['smproj'] }],
+    });
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+    // Drop the `suggestedName` hint before writing — it's a transient field
+    // used only to seed the save dialog.
+    const { suggestedName, ...payload } = projectData || {};
+    fs.writeFileSync(result.filePath, JSON.stringify(payload, null, 2), 'utf8');
+    return { ok: true, path: result.filePath };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
+// Renderer pushes its dirty flag here whenever it changes.
+ipcMain.on('project:set-dirty', (_event, dirty) => {
+  rendererDirty = !!dirty;
+});
+
+// Ask the renderer to perform a Save (it owns the project state and the
+// IPC saveProject() flow). Resolves with whatever the renderer reports.
+function requestRendererSave() {
+  return new Promise((resolve) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return resolve({ ok: false, error: 'no window' });
+    const handler = (_event, res) => {
+      ipcMain.removeListener('project:save-response', handler);
+      resolve(res || { ok: false, error: 'no response' });
+    };
+    ipcMain.on('project:save-response', handler);
+    try { mainWindow.webContents.send('project:save-request', {}); }
+    catch (e) {
+      ipcMain.removeListener('project:save-response', handler);
+      resolve({ ok: false, error: String(e.message || e) });
+    }
+  });
+}
+
+// Ask the renderer to show its custom in-app save-prompt modal and resolve
+// with 'save' | 'dont-save' | 'cancel'. Falls back to the native dialog if
+// the renderer isn't reachable for any reason.
+function requestRendererSavePrompt(message, detail) {
+  return new Promise((resolve) => {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    if (!win) return resolve('cancel');
+    const handler = (_event, choice) => {
+      ipcMain.removeListener('project:save-prompt-response', handler);
+      clearTimeout(timeoutId);
+      resolve(choice || 'cancel');
+    };
+    ipcMain.on('project:save-prompt-response', handler);
+    // Safety net: if the renderer somehow never responds (crashed mid-modal),
+    // fall back to "cancel" after 60 s so the app doesn't hang.
+    const timeoutId = setTimeout(() => {
+      ipcMain.removeListener('project:save-prompt-response', handler);
+      resolve('cancel');
+    }, 60000);
+    try { win.webContents.send('project:save-prompt-request', { message, detail }); }
+    catch {
+      ipcMain.removeListener('project:save-prompt-response', handler);
+      clearTimeout(timeoutId);
+      resolve('cancel');
+    }
+  });
+}
+
+// Returns true if the caller should proceed with the destructive action
+// (quit / update install). False if the user cancelled or the save failed.
+async function maybePromptSaveProject(message, detail) {
+  if (!rendererDirty) return true;
+  if (savePromptInFlight) return false;
+  savePromptInFlight = true;
+  try {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    if (!win) return true;
+    if (!win.isVisible()) { try { win.show(); } catch {} }
+    try { win.focus(); } catch {}
+    const choice = await requestRendererSavePrompt(
+      message,
+      detail || 'У вас есть несохранённые изменения. Хотите сохранить проект?'
+    );
+    if (choice === 'cancel') return false;
+    if (choice === 'dont-save') return true;
+    // choice === 'save'
+    const saveRes = await requestRendererSave();
+    if (saveRes && saveRes.canceled) return false;
+    if (saveRes && saveRes.ok) return true;
+    // Save error: fall back to native error dialog so the user definitely sees it.
+    await dialog.showMessageBox(win, {
+      type: 'error',
+      buttons: ['ОК'],
+      title: 'Strata Mixer',
+      message: 'Не удалось сохранить проект',
+      detail: (saveRes && saveRes.error) || 'Неизвестная ошибка',
+    });
+    return false;
+  } finally {
+    savePromptInFlight = false;
+  }
+}
+
+ipcMain.handle('project:open', async () => {
+  try {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Открыть проект',
+      properties: ['openFile'],
+      filters: [{ name: 'Strata Mixer Project', extensions: ['smproj'] }],
+    });
+    if (result.canceled || !result.filePaths?.[0]) return { ok: false, canceled: true };
+    const file = result.filePaths[0];
+    const raw = fs.readFileSync(file, 'utf8');
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || !data.state) {
+      return { ok: false, error: 'Файл проекта повреждён или имеет несовместимый формат.' };
+    }
+    // Tag layers whose source files have moved/disappeared so the UI can mark
+    // them in the timeline. The project still opens — the user can swap the
+    // file manually per layer.
+    if (Array.isArray(data.state.layers)) {
+      data.state.layers = data.state.layers.map(l => {
+        if (l && l.file && !fs.existsSync(l.file)) return { ...l, _missing: true };
+        return l;
+      });
+    }
+    return { ok: true, path: file, data };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
 // Preview proxy generator: re-encodes a video (commonly HEVC/AV1 that
 // Chromium can't decode) to H.264 + AAC at original resolution so the editor
 // preview works. The original file path is still used for the final export.
+// Throttle parallel proxy transcodes so importing N videos at once doesn't
+// fire N ffmpeg processes simultaneously (saturates disk/GPU and OS scheduler).
+const PROXY_CONCURRENCY = 2;
+let _proxyInflight = 0;
+const _proxyQueue = [];
+function _acquireProxySlot() {
+  return new Promise(resolve => {
+    if (_proxyInflight < PROXY_CONCURRENCY) {
+      _proxyInflight++;
+      resolve();
+    } else {
+      _proxyQueue.push(resolve);
+    }
+  });
+}
+function _releaseProxySlot() {
+  _proxyInflight--;
+  const next = _proxyQueue.shift();
+  if (next) { _proxyInflight++; next(); }
+}
+
 ipcMain.handle('editor:makeProxy', async (event, payload) => {
   const { file, force } = payload || {};
   if (!file) return { ok: false, error: 'no file' };
@@ -801,6 +1129,7 @@ ipcMain.handle('editor:makeProxy', async (event, payload) => {
     proxyPath,
   ];
 
+  await _acquireProxySlot();
   return new Promise((resolve) => {
     const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
     let stderr = ''; let totalDur = 0;
@@ -816,8 +1145,9 @@ ipcMain.handle('editor:makeProxy', async (event, payload) => {
         try { event.sender.send('editor:proxy-progress', { file, percent: Math.min(99, (t / totalDur) * 100) }); } catch {}
       }
     });
-    proc.on('error', e => resolve({ ok: false, error: String(e.message || e) }));
+    proc.on('error', e => { _releaseProxySlot(); resolve({ ok: false, error: String(e.message || e) }); });
     proc.on('close', code => {
+      _releaseProxySlot();
       if (code === 0) resolve({ ok: true, proxyPath, cached: false });
       else resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-300)}` });
     });
@@ -994,6 +1324,17 @@ ipcMain.handle('video:edit', async (_event, payload) => {
 
   return new Promise((resolve) => {
     const tmpFiles = [...tmpRevFiles];
+    // Async drawtext-text writes collected here; flushed in parallel before
+    // spawn so the build doesn't sit on N sequential sync writes.
+    const pendingTextWrites = [];
+    // Track every temp file globally so app quit purges any that escaped
+    // the per-call cleanup (e.g. when a sync error aborted the filter-graph
+    // builder before spawn).
+    tmpFiles.forEach(f => liveTmpFiles.add(f));
+    const cleanupTmps = () => {
+      tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch {} liveTmpFiles.delete(f); });
+    };
+    try {
     const filterParts = [];
     const inputArgs = ['-i', file];
     let videoStream = '[0:v]';
@@ -1009,64 +1350,146 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     // Declared at executor scope so the audio-mixing block below can read it
     // even when isAudioOnly skipped the video graph entirely.
     const videoOverlayInputs = [];
+    // Same scope reasoning for mainVideo source-position info — the audio
+    // block also needs mvSrc/mvSp to trim [0:a] correctly when a head-trim
+    // was applied to the main clip.
+    const mvSrc = (mvLayer && Number(mvLayer.srcStart)) || 0;
+    const mvSp = Math.max(0.1, ((mvLayer && mvLayer.speed) || 100) / 100);
 
     if (!isAudioOnly) {
       const mv = mainVideoForFilter;
-      if (mv && mv.aspect && mv.size) {
+      // The clip on the timeline runs from videoStart..videoEnd, but the
+      // SOURCE pixels played in that window start from mvLayer.srcStart in
+      // the input file. Honour both — otherwise trimming the head of a clip
+      // gets lost in the export (preview shows trimmed, export shows raw).
+      const mvClipDur = Math.max(0.01, videoEnd - videoStart);
+      const mvSrcEnd = (mvSrc + mvClipDur * mvSp).toFixed(3);
+      // Colour correction for the main video — must match the preview's
+      // CSS filter: brightness() is a MULTIPLIER (100% = unchanged, 150% =
+      // 1.5x), so we model it via colorchannelmixer (per-channel scaling)
+      // instead of eq.brightness which is additive in [-1,1].
+      const mvCcB = (mvLayer && Number(mvLayer.ccB)) || 0;
+      const mvCcC = (mvLayer && mvLayer.ccC != null) ? Number(mvLayer.ccC) : 100;
+      const mvCcS = (mvLayer && mvLayer.ccS != null) ? Number(mvLayer.ccS) : 100;
+      const mvCcH = (mvLayer && Number(mvLayer.ccH)) || 0;
+      const mvBMult = 1 + mvCcB / 100;
+      const mvCmPart = mvBMult !== 1
+        ? `,colorchannelmixer=rr=${mvBMult.toFixed(3)}:gg=${mvBMult.toFixed(3)}:bb=${mvBMult.toFixed(3)}`
+        : '';
+      const mvEqPart = (mvCcC !== 100 || mvCcS !== 100)
+        ? `,eq=contrast=${(mvCcC/100).toFixed(3)}:saturation=${(mvCcS/100).toFixed(3)}`
+        : '';
+      const mvHuePart = mvCcH !== 0 ? `,hue=h=${mvCcH.toFixed(2)}` : '';
+      const mvCcPart = mvCmPart + mvEqPart + mvHuePart;
+
+      if (mvLayer && mv.aspect && mv.size) {
         const mvW = Math.max(2, Math.round((mv.size / 100) * evenW));
         const mvH = Math.max(2, Math.round(mvW / mv.aspect));
         const mvX = Math.round(((mv.x == null ? 50 : mv.x) / 100) * evenW - mvW / 2);
         const mvY = Math.round(((mv.y == null ? 50 : mv.y) / 100) * evenH - mvH / 2);
         filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[smbg]`);
-        filterParts.push(`[0:v]trim=start=${videoStart}:end=${videoEnd},setpts=PTS-STARTPTS+${videoStart}/TB,scale=${mvW}:${mvH},setsar=1[smmv]`);
+        filterParts.push(`[0:v]trim=start=${mvSrc.toFixed(3)}:end=${mvSrcEnd},setpts=(PTS-STARTPTS)/${mvSp}+${videoStart}/TB,scale=${mvW}:${mvH},setsar=1${mvCcPart}[smmv]`);
         filterParts.push(`[smbg][smmv]overlay=${mvX}:${mvY}:eof_action=pass:enable='between(t,${videoStart},${videoEnd})'[vscaled]`);
-      } else {
-        let baseFilter = `${videoStream}trim=start=${videoStart}:end=${videoEnd},setpts=PTS-STARTPTS,scale=${evenW}:${evenH}:force_original_aspect_ratio=decrease,setsar=1,pad=${evenW}:${evenH}:(ow-iw)/2:(oh-ih)/2:${bgHex}`;
+      } else if (mvLayer) {
+        let baseFilter = `${videoStream}trim=start=${mvSrc.toFixed(3)}:end=${mvSrcEnd},setpts=(PTS-STARTPTS)/${mvSp}${mvCcPart},scale=${evenW}:${evenH}:force_original_aspect_ratio=decrease,setsar=1,pad=${evenW}:${evenH}:(ow-iw)/2:(oh-ih)/2:${bgHex}`;
         if (videoStart > 0 || padAfter > 0) {
           baseFilter += `,tpad=start_duration=${videoStart}:stop_duration=${padAfter}:color=${bgHex}`;
         }
         baseFilter += '[vscaled]';
         filterParts.push(baseFilter);
+      } else {
+        // No "main video" — the bottom-most visible layer in the renderer was
+        // an image (or there are no video overlays). Start with a synthetic
+        // colour canvas so every layer goes through the overlay chain strictly
+        // in z-order. Input [0]'s video stream (if any) is ignored here; the
+        // same file is listed in `layers` and renders via its videoOverlay
+        // branch at the correct z-position.
+        filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[vscaled]`);
       }
       videoStream = '[vscaled]';
 
       let blurCount = 0, imgCount = 0, vidovCount = 0, txtCount = 0, zoomCount = 0, maskCount = 0, transCount = 0;
       (layers || []).forEach((layer) => {
         if (layer.type === 'transition') {
-          // Camera shake + white flash. Implemented as:
-          //   1) scale-up + crop with time-varying offset = shake
-          //   2) overlay only inside [startTime, endTime]
-          //   3) overlay a white frame with fade-in/out alpha for the flash
           const i = transCount++;
           const ts = Number(layer.startTime) || 0;
           const te = Number(layer.endTime) || ts + 0.3;
           const span = Math.max(0.05, te - ts);
-          const ampPx = Number(layer.amp) || 30;
-          const flashMax = Math.max(0, Math.min(1, layer.flash ?? 0.85));
-          // Scale factor to keep the cropped frame inside the original size.
-          // Headroom margin grows with shake amplitude.
-          const margin = Math.max(0.04, ampPx / Math.min(evenW, evenH));
-          const sx = (1 + margin * 2);
-          const bigW = Math.round(evenW * sx);
-          const bigH = Math.round(evenH * sx);
-          // Decay over time + shifted sine packets for a noisy look. The expr
-          // gets wrapped in single quotes below, so commas inside max() and
-          // function args are passed through literally — no \\, escape.
-          const xExpr = `(${bigW}-${evenW})/2 + (sin(t*113)*0.6 + sin(t*187)*0.4) * ${ampPx} * max(0, 1 - (t - ${ts}) / ${span} * 0.85)`;
-          const yExpr = `(${bigH}-${evenH})/2 + (cos(t*97)*0.6 + cos(t*151)*0.4) * ${ampPx} * max(0, 1 - (t - ${ts}) / ${span} * 0.85)`;
-          const enableShake = `enable='between(t,${ts.toFixed(3)},${te.toFixed(3)})'`;
-          // Split → produce a shaken copy → overlay onto the original only in enable range.
-          filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
-          filterParts.push(`[trS${i}]scale=${bigW}:${bigH},crop=${evenW}:${evenH}:'${xExpr}':'${yExpr}'[trShaken${i}]`);
-          filterParts.push(`[trM${i}][trShaken${i}]overlay=0:0:${enableShake}[trAfterShake${i}]`);
-          videoStream = `[trAfterShake${i}]`;
-          // White flash overlay: opaque white frame with a quick alpha ramp.
-          // fade in 15% of span, fade out the rest.
-          const fadeIn = Math.max(0.02, span * 0.15);
-          const fadeOut = Math.max(0.02, span - fadeIn);
-          filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${span.toFixed(3)},format=rgba,fade=t=in:st=0:d=${fadeIn.toFixed(3)}:alpha=1,fade=t=out:st=${fadeIn.toFixed(3)}:d=${fadeOut.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${ts.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trFlash${i}]`);
-          filterParts.push(`${videoStream}[trFlash${i}]overlay=0:0:enable='between(t,${ts.toFixed(3)},${te.toFixed(3)})'[trDone${i}]`);
-          videoStream = `[trDone${i}]`;
+          const kind = layer.kind || 'shake';
+          const enableExpr = `enable='between(t,${ts.toFixed(3)},${te.toFixed(3)})'`;
+
+          if (kind === 'shake') {
+            // Camera shake (exp-decay) + tblend motion blur + short bloom flash.
+            const ampPx = Number(layer.amp) || 30;
+            const flashMax = Math.max(0, Math.min(1, layer.flash ?? 0.85));
+            const margin = Math.max(0.06, ampPx / Math.min(evenW, evenH) + 0.02);
+            const sxScale = (1 + margin * 2);
+            const bigW = Math.round(evenW * sxScale);
+            const bigH = Math.round(evenH * sxScale);
+            // Exponential decay = energetic punch + fast falloff
+            const decay = `exp(-3.2*max(0,t-${ts})/${span})`;
+            const xExpr = `(${bigW}-${evenW})/2 + (sin((t-${ts})*113)*0.6 + sin((t-${ts})*187)*0.4) * ${ampPx} * ${decay}`;
+            const yExpr = `(${bigH}-${evenH})/2 + (cos((t-${ts})*97)*0.6 + cos((t-${ts})*151)*0.4) * ${ampPx} * ${decay}`;
+            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+            // tblend averages current with previous frame → free motion blur during fast shakes
+            filterParts.push(`[trS${i}]scale=${bigW}:${bigH},crop=${evenW}:${evenH}:'${xExpr}':'${yExpr}',tblend=all_mode=average[trShaken${i}]`);
+            filterParts.push(`[trM${i}][trShaken${i}]overlay=0:0:${enableExpr}[trAfterShake${i}]`);
+            videoStream = `[trAfterShake${i}]`;
+            // Punchy short flash (45% of span) with sharp rise and tail
+            const flashDur = Math.max(0.05, span * 0.45);
+            const fadeIn = Math.max(0.02, flashDur * 0.18);
+            const fadeOut = Math.max(0.02, flashDur - fadeIn);
+            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${flashDur.toFixed(3)},format=rgba,fade=t=in:st=0:d=${fadeIn.toFixed(3)}:alpha=1,fade=t=out:st=${fadeIn.toFixed(3)}:d=${fadeOut.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${ts.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trFlash${i}]`);
+            filterParts.push(`${videoStream}[trFlash${i}]overlay=0:0:enable='between(t,${ts.toFixed(3)},${(ts+flashDur).toFixed(3)})'[trDone${i}]`);
+            videoStream = `[trDone${i}]`;
+          } else if (kind === 'whippan') {
+            // Horizontal whip with directional smear + chromatic aberration
+            // + tblend motion blur from the fast frame-to-frame displacement.
+            const shiftPct = Math.max(0, Math.min(150, Number(layer.shift) || 60));
+            const blurSigma = Math.max(0, Number(layer.blur) || 22);
+            // Scale wider than canvas so the crop can scroll past the centre.
+            const bigW = Math.round(evenW * (1 + shiftPct / 100 * 1.4));
+            const xCenter = (bigW - evenW) / 2;
+            // sin(0)=0, sin(pi/2)=1, sin(pi)=0 → peak in the middle
+            const xExpr = `${xCenter.toFixed(2)} + ${(shiftPct / 100 * evenW).toFixed(2)} * sin((t-${ts})/${span}*${Math.PI.toFixed(5)})`;
+            // boxblur=lumaRadius x lumaPower : chromaRadius x chromaPower
+            // Big horizontal radius, 0 vertical = directional smear.
+            const blurH = Math.max(1, Math.round(blurSigma));
+            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+            // rgbashift = R/B channel offset (chromatic aberration) before smear,
+            // then tblend averages with previous frame for true motion blur during the sweep.
+            filterParts.push(`[trS${i}]scale=${bigW}:${evenH},crop=${evenW}:${evenH}:'${xExpr}':0,rgbashift=rh=8:bh=-8:gh=0,boxblur=${blurH}:1:0:0,tblend=all_mode=average[trWhip${i}]`);
+            filterParts.push(`[trM${i}][trWhip${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
+            videoStream = `[trDone${i}]`;
+          } else if (kind === 'zoom') {
+            // Zoom punch — pre-scaled copy crossfaded over base, heavy blur
+            // + chromatic aberration + brief white impact flash at the peak.
+            const scaleMax = Math.max(1.05, Number(layer.scale) || 2);
+            const blurSigma = Math.max(4, Number(layer.blur) || 14);
+            const zw = Math.round(evenW * scaleMax);
+            const zh = Math.round(evenH * scaleMax);
+            const halfSpan = span / 2;
+            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+            filterParts.push(`[trS${i}]scale=${zw}:${zh},crop=${evenW}:${evenH},gblur=sigma=${blurSigma.toFixed(2)},rgbashift=rh=10:bh=-10:gh=0,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1,fade=t=out:st=${(ts+halfSpan).toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1[trZoom${i}]`);
+            filterParts.push(`[trM${i}][trZoom${i}]overlay=0:0:${enableExpr}[trAfterZoom${i}]`);
+            videoStream = `[trAfterZoom${i}]`;
+            // Impact flash: short white pulse centred on the peak
+            const flashSpan = Math.max(0.05, span * 0.22);
+            const flashStart = ts + (span - flashSpan) / 2;
+            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${flashSpan.toFixed(3)},format=rgba,fade=t=in:st=0:d=${(flashSpan*0.4).toFixed(3)}:alpha=1,fade=t=out:st=${(flashSpan*0.4).toFixed(3)}:d=${(flashSpan*0.6).toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${flashStart.toFixed(3)}/TB,colorchannelmixer=aa=0.32[trZoomFlash${i}]`);
+            filterParts.push(`${videoStream}[trZoomFlash${i}]overlay=0:0:enable='between(t,${flashStart.toFixed(3)},${(flashStart+flashSpan).toFixed(3)})'[trDone${i}]`);
+            videoStream = `[trDone${i}]`;
+          } else if (kind === 'blur') {
+            // Blur burst with faux-bloom: heavy gaussian + curves lift on
+            // midtones/highlights + saturation pump for that "dreamy glow" feel.
+            const blurSigma = Math.max(8, Number(layer.blur) || 30);
+            const halfSpan = span / 2;
+            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+            // gblur (heavy), then curves lift midtone 0.5→0.65 (highlights pop without crushing shadows), then +40% saturation
+            filterParts.push(`[trS${i}]gblur=sigma=${blurSigma.toFixed(2)},curves=all='0/0 0.5/0.65 1/1',eq=saturation=1.4,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1,fade=t=out:st=${(ts+halfSpan).toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1[trBlur${i}]`);
+            filterParts.push(`[trM${i}][trBlur${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
+            videoStream = `[trDone${i}]`;
+          }
         } else if (layer.type === 'mask') {
           // Clipping mask: keep current videoStream pixels only inside the
           // chosen shape; outside becomes the project background colour.
@@ -1151,12 +1574,19 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           const ovSp = Math.max(0.1, (layer.speed || 100) / 100);
           const ovDur = Math.max(0.1, (layer.endTime ?? totalDur) - (layer.startTime || 0));
           const ovSrc = layer.srcStart || 0;
-          const ccB = (layer.ccB || 0) / 100;
+          const ccB = (layer.ccB || 0); // raw -50..+50
           const ccC = (layer.ccC == null ? 100 : layer.ccC) / 100;
           const ccS = (layer.ccS == null ? 100 : layer.ccS) / 100;
-          const ccPart = (ccB !== 0 || ccC !== 1 || ccS !== 1)
-            ? `,eq=brightness=${ccB.toFixed(3)}:contrast=${ccC.toFixed(3)}:saturation=${ccS.toFixed(3)}`
+          const ccH = Number(layer.ccH || 0);
+          const bMult = 1 + ccB / 100;
+          const cmPart = bMult !== 1
+            ? `,colorchannelmixer=rr=${bMult.toFixed(3)}:gg=${bMult.toFixed(3)}:bb=${bMult.toFixed(3)}`
             : '';
+          const eqPart = (ccC !== 1 || ccS !== 1)
+            ? `,eq=contrast=${ccC.toFixed(3)}:saturation=${ccS.toFixed(3)}`
+            : '';
+          const huePart = ccH !== 0 ? `,hue=h=${ccH.toFixed(2)}` : '';
+          const ccPart = cmPart + eqPart + huePart;
           // Trim, retime, then crop the EXACT source region the user picked
           // with the mask (srcCrop) and scale it to the cut-out box. Clamp the
           // crop window to the real input dimensions so ffmpeg doesn't bail
@@ -1213,13 +1643,22 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           const ovSp = Math.max(0.1, (layer.speed || 100) / 100);
           const ovDur = Math.max(0.1, (layer.endTime ?? totalDur) - (layer.startTime || 0));
           const ovSrc = layer.srcStart || 0;
-          // Per-video colour correction (Эффекты видео)
-          const ccB = (layer.ccB || 0) / 100;
+          // Per-video colour correction (Эффекты видео + Свойства) — see
+          // the maskedVideo branch above for why brightness goes via
+          // colorchannelmixer instead of eq.brightness.
+          const ccB = (layer.ccB || 0);
           const ccC = (layer.ccC == null ? 100 : layer.ccC) / 100;
           const ccS = (layer.ccS == null ? 100 : layer.ccS) / 100;
-          const ccPart = (ccB !== 0 || ccC !== 1 || ccS !== 1)
-            ? `,eq=brightness=${ccB.toFixed(3)}:contrast=${ccC.toFixed(3)}:saturation=${ccS.toFixed(3)}`
+          const ccH = Number(layer.ccH || 0);
+          const bMult = 1 + ccB / 100;
+          const cmPart = bMult !== 1
+            ? `,colorchannelmixer=rr=${bMult.toFixed(3)}:gg=${bMult.toFixed(3)}:bb=${bMult.toFixed(3)}`
             : '';
+          const eqPart = (ccC !== 1 || ccS !== 1)
+            ? `,eq=contrast=${ccC.toFixed(3)}:saturation=${ccS.toFixed(3)}`
+            : '';
+          const huePart = ccH !== 0 ? `,hue=h=${ccH.toFixed(2)}` : '';
+          const ccPart = cmPart + eqPart + huePart;
           filterParts.push(`[${idx}:v]trim=start=${ovSrc}:end=${(ovSrc + ovDur * ovSp).toFixed(3)},setpts=(PTS-STARTPTS)/${ovSp}+${layer.startTime || 0}/TB,scale=${scaleW}:${scaleH}${ccPart},format=rgba[vov${i}]`);
           filterParts.push(`${videoStream}[vov${i}]overlay=${x}:${y}:${enable}[vvidov${i}]`);
           videoStream = `[vvidov${i}]`;
@@ -1235,7 +1674,9 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           const enable = `enable='between(t,${layer.startTime || 0},${layer.endTime || 9999})'`;
           // Write text to a UTF-8 temp file so Cyrillic / Unicode renders correctly
           const tmpTxt = path.join(os.tmpdir(), `smtxt_${Date.now()}_${i}.txt`);
-          try { fs.writeFileSync(tmpTxt, layer.text || '', 'utf8'); tmpFiles.push(tmpTxt); } catch(e) {}
+          tmpFiles.push(tmpTxt);
+          liveTmpFiles.add(tmpTxt);
+          pendingTextWrites.push(fs.promises.writeFile(tmpTxt, layer.text || '', 'utf8').catch(() => {}));
           let fontPart = '';
           if (layer.fontFile && fs.existsSync(layer.fontFile)) {
             fontPart = `:fontfile='${ffPath(layer.fontFile)}'`;
@@ -1280,7 +1721,16 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     // project). It carries the real source/timeline split so trimming works.
     const baseAud = payload.baseAudio;
 
-    if (mvVol !== 100 || audioLayers.length > 0 || videoOverlayInputs.length > 0 || baseAud) {
+    // Need to also enter the audio block when the main clip's head was
+    // trimmed (srcStart > 0) or its start was pushed away from 0 — otherwise
+    // ffmpeg copies [0:a] verbatim and audio plays from the source start
+    // while video correctly plays from srcStart, so they desync.
+    const needMvAudioTrim = mvLayer && (
+      (Number(mvLayer.srcStart) || 0) > 0.01 ||
+      (Number(videoStart) || 0) > 0.01 ||
+      (Number(mvLayer.speed) && Number(mvLayer.speed) !== 100)
+    );
+    if (mvVol !== 100 || audioLayers.length > 0 || videoOverlayInputs.length > 0 || baseAud || needMvAudioTrim) {
       const baseHasAudio = audioProbeMap.get(payload.file) !== false;
       // Base audio — for audio-only projects use baseAudio's real coordinates;
       // for video projects, use the main video's video-range (back-compat).
@@ -1293,8 +1743,18 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const baDelayMs = Math.round((Number(baseAud.startTime) || 0) * 1000);
         const baVol = ((Number(baseAud.volume) || 100) / 100).toFixed(3);
         filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}|${baDelayMs},volume=${baVol}[auMain]`);
-      } else if (baseHasAudio) {
-        filterParts.push(`[0:a]atrim=${videoStart.toFixed(3)}:${videoEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${Math.round(videoStart*1000)}|${Math.round(videoStart*1000)},volume=${(mvVol / 100).toFixed(3)}[auMain]`);
+      } else if (mvLayer && baseHasAudio) {
+        // [0:a] is the main video's audio — only safe to use as the base mix
+        // when there IS a mainVideo (input [0] is conceptually the timeline
+        // base). Trim from mvLayer.srcStart for the clip duration so head-trims
+        // applied in the editor are honoured here too (same fix as video).
+        const mvAtSrc = (Number(mvLayer.srcStart) || 0).toFixed(3);
+        const mvAtSrcEnd = ((Number(mvLayer.srcStart) || 0) + Math.max(0.01, videoEnd - videoStart) * mvSp).toFixed(3);
+        let atParts = [], atRem = mvSp;
+        while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
+        while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
+        atParts.push(`atempo=${atRem.toFixed(4)}`);
+        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${Math.round(videoStart*1000)}|${Math.round(videoStart*1000)},volume=${(mvVol / 100).toFixed(3)}[auMain]`);
       } else {
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
       }
@@ -1392,6 +1852,11 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     }
     args.push('-t', String(totalDur), '-y', outPath);
 
+    // Make sure every drawtext temp file is on disk BEFORE ffmpeg starts.
+    // Otherwise the textfile= references would fail with "no such file".
+    Promise.all(pendingTextWrites).then(() => spawnFfmpeg()).catch(() => spawnFfmpeg());
+
+    function spawnFfmpeg() {
     const proc = spawn(ffmpeg, args, { windowsHide: true });
     let errLog = '';
     proc.stderr?.on('data', (d) => {
@@ -1403,22 +1868,33 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       }
     });
     proc.on('close', (code) => {
-      tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch {} });
+      cleanupTmps();
       if (mainWindow) mainWindow.webContents.send('edit-progress', { percent: 100, done: true });
       resolve({ ok: code === 0, error: code !== 0 ? errLog.slice(-1600) : '' });
     });
     proc.on('error', (err) => {
-      tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch {} });
+      cleanupTmps();
       resolve({ ok: false, error: String(err) });
     });
+    }
+    } catch (buildErr) {
+      // Building the filter graph threw — clean up temps before bailing.
+      cleanupTmps();
+      resolve({ ok: false, error: 'Сбой построения фильтра: ' + String(buildErr && buildErr.message || buildErr) });
+    }
   });
 });
 
+// Font list cached after the first read — C:/Windows/Fonts changes rarely
+// and the dir is large (1000+ files). Cache survives until app quits.
+let _fontsCache = null;
 ipcMain.handle('fonts:list', async () => {
   if (process.platform !== 'win32') return [];
+  if (_fontsCache) return _fontsCache;
   const fontsDir = 'C:/Windows/Fonts';
   try {
-    return fs.readdirSync(fontsDir)
+    const files = await fs.promises.readdir(fontsDir);
+    _fontsCache = files
       .filter(f => /\.(ttf|otf)$/i.test(f))
       .map(f => {
         const n = path.basename(f, path.extname(f))
@@ -1428,6 +1904,7 @@ ipcMain.handle('fonts:list', async () => {
         return { name: n, file: (fontsDir + '/' + f) };
       })
       .sort((a, b) => a.name.localeCompare(b.name));
+    return _fontsCache;
   } catch { return []; }
 });
 
@@ -1449,7 +1926,7 @@ ipcMain.handle('file:reveal', async (_event, filePath) => {
 ipcMain.handle('system:detectRender', async () => {
   const ffmpeg = findFfmpeg();
   const system = getSystemInfo();
-  const acceleration = detectAcceleration(ffmpeg);
+  const acceleration = await detectAcceleration(ffmpeg);
   return {
     ffmpeg,
     system,
@@ -1467,7 +1944,9 @@ ipcMain.handle('shell:openExternal', async (_event, url) => {
 
 ipcMain.handle('process:stop', async () => {
   stopRequested = true;
-  if (currentProc) { try { currentProc.kill('SIGTERM'); } catch {} }
+  // Kill every running ffmpeg — parallel job workers each have their own
+  // proc and stopping should halt all of them, not just the most recent.
+  for (const p of activeProcs) { try { p.kill('SIGTERM'); } catch {} }
   return true;
 });
 
@@ -1509,24 +1988,34 @@ function getSystemInfo() {
   };
 }
 
+// Cache encoders & acceleration once per app session — ffmpeg's encoder
+// list never changes at runtime, so the 1–8 sec spawn was pure waste.
+let _encodersCache = null;
+let _accelCache = null;
 function readEncoders(ffmpeg) {
-  try {
-    const out = execFileSync(ffmpeg, ['-hide_banner', '-encoders'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 8000 });
-    return String(out || '');
-  } catch (e) {
-    try { return String(e.stdout || '') + '\n' + String(e.stderr || ''); } catch { return ''; }
-  }
+  if (_encodersCache != null) return Promise.resolve(_encodersCache);
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpeg, ['-hide_banner', '-encoders'], { windowsHide: true });
+    let out = '';
+    proc.stdout.on('data', d => out += d.toString());
+    proc.stderr.on('data', d => out += d.toString());
+    const timer = setTimeout(() => { try { proc.kill('SIGTERM'); } catch {} }, 8000);
+    proc.on('close', () => { clearTimeout(timer); _encodersCache = out; resolve(out); });
+    proc.on('error', () => { clearTimeout(timer); _encodersCache = ''; resolve(''); });
+  });
 }
 
-function detectAcceleration(ffmpeg) {
-  const enc = readEncoders(ffmpeg);
+async function detectAcceleration(ffmpeg) {
+  if (_accelCache) return _accelCache;
+  const enc = await readEncoders(ffmpeg);
   const has = (name) => new RegExp(`\\b${name}\\b`, 'i').test(enc);
-  return {
+  _accelCache = {
     nvidia: has('h264_nvenc'),
     intel: has('h264_qsv'),
     amd: has('h264_amf'),
     cpu: true
   };
+  return _accelCache;
 }
 
 function chooseEncoder(settings, acceleration) {
@@ -1605,13 +2094,30 @@ function parseVideoSize(output) {
   return { width: Number(m[1]), height: Number(m[2]) };
 }
 
+// Cache probe results by file path + mtime — invalidates if the source file
+// changes underneath us. Drops the entry after 5 minutes of inactivity so a
+// long-running app doesn't hoard memory.
+const probeCache = new Map();
+const PROBE_TTL_MS = 5 * 60 * 1000;
 function probeMediaInfo(ffmpeg, file) {
+  let mtime = 0;
+  try { mtime = fs.statSync(file).mtimeMs | 0; } catch {}
+  const cacheKey = file + '|' + mtime;
+  const hit = probeCache.get(cacheKey);
+  if (hit && (Date.now() - hit.ts) < PROBE_TTL_MS) {
+    return Promise.resolve(hit.info);
+  }
   return new Promise((resolve) => {
     const p = spawn(ffmpeg, ['-hide_banner', '-i', file], { windowsHide: true });
     let out = '';
     p.stderr.on('data', d => out += d.toString());
     p.stdout.on('data', d => out += d.toString());
-    p.on('close', () => { const sz = parseVideoSize(out); resolve({ duration: parseDuration(out), hasAudio: /Audio:/i.test(out), width: sz.width, height: sz.height, raw: out }); });
+    p.on('close', () => {
+      const sz = parseVideoSize(out);
+      const info = { duration: parseDuration(out), hasAudio: /Audio:/i.test(out), width: sz.width, height: sz.height, raw: out };
+      probeCache.set(cacheKey, { ts: Date.now(), info });
+      resolve(info);
+    });
     p.on('error', (err) => resolve({ duration: null, hasAudio: false, width: null, height: null, raw: String(err) }));
   });
 }
@@ -1797,7 +2303,7 @@ function runFfmpeg(ffmpeg, args, onProgressLine, options = {}) {
   return new Promise((resolve) => {
     const proc = spawn(ffmpeg, args, { windowsHide: true });
     if (options.background) { try { os.setPriority(proc.pid, 10); } catch {} }
-    currentProc = proc;
+    activeProcs.add(proc);
     let output = '';
     const handle = d => {
       const s = d.toString(); output += s;
@@ -1805,8 +2311,8 @@ function runFfmpeg(ffmpeg, args, onProgressLine, options = {}) {
     };
     proc.stdout.on('data', handle);
     proc.stderr.on('data', d => { output += d.toString(); });
-    proc.on('close', code => { currentProc = null; resolve({ code, output }); });
-    proc.on('error', err => { currentProc = null; resolve({ code: 1, output: String(err) }); });
+    proc.on('close', code => { activeProcs.delete(proc); resolve({ code, output }); });
+    proc.on('error', err => { activeProcs.delete(proc); resolve({ code: 1, output: String(err) }); });
   });
 }
 
@@ -1828,7 +2334,7 @@ ipcMain.handle('process:start', async (_event, payload) => {
   stopRequested = false;
 
   const system = getSystemInfo();
-  const acceleration = detectAcceleration(ffmpeg);
+  const acceleration = await detectAcceleration(ffmpeg);
   const selectedRender = chooseEncoder(settings, acceleration);
   const parallelLimit = autoParallelJobs(settings, files.length || 1);
   const renderSummary = `Рендер: ${encoderLabel(selectedRender)} | параллельно: ${parallelLimit} | CPU: ${system.cpuCores} ядер | RAM: ${system.ramGb} GB`;
@@ -2012,7 +2518,7 @@ ipcMain.handle('process:start', async (_event, payload) => {
     try {
       if (Notification.isSupported()) {
         const n = createdFiles.length;
-        const iconPath = appPath('assets', 'strata_mixer_1_1d.ico');
+        const iconPath = appPath('assets', 'strata_mixer_v1_2_4.ico');
         new Notification({
           title: 'Strata Mixer',
           body: `Готово · ${n} файл${n === 1 ? '' : n < 5 ? 'а' : 'ов'} создано`,
