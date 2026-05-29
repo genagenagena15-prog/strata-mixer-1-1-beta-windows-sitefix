@@ -32,6 +32,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const progress = require('./release-progress.cjs');
 
 const root = path.resolve(__dirname, '..');
 const pkgPath = path.join(root, 'package.json');
@@ -183,6 +184,17 @@ const newVersion = bump(oldVersion, kind);
 console.log(`\n📦 ${oldVersion}  →  ${newVersion}`);
 if (notes) console.log(`📝 Notes (${notes.length} chars)\n`); else console.log(`📝 No notes\n`);
 
+// ── Spawn the live progress dashboard (browser auto-opens) ─────────────────
+if (!dryRun) {
+  progress.start(newVersion, {
+    sourceOwner: 'genagenagena15-prog',
+    sourceRepo: 'strata-mixer-1-1-beta-windows-sitefix',
+    releasesOwner: 'genagenagena15-prog',
+    releasesRepo: 'strata-mixer-releases',
+    tag: `v${newVersion}`,
+  });
+}
+
 pkg.version = newVersion;
 pkg.publicVersion = `v${newVersion}`;
 writeJson(pkgPath, pkg);
@@ -210,6 +222,7 @@ if (!dryRun && !process.env.GH_TOKEN) {
 // build Windows locally in the next step, the Mac build is already running
 // in the cloud.
 if (!dryRun) {
+  progress.set('win', { status: 'building', detail: 'Коммит + пуш в source repo', percent: 5 });
   console.log('\n📌 Pushing version bump to source repo + tag (triggers Mac CI)…');
   if (runSoft('git', ['add', '-A']) !== 0) {
     console.error('   ✗ git add failed — aborting');
@@ -246,6 +259,7 @@ if (!dryRun) {
     console.error('     Run later: git push origin ' + tagName);
   } else {
     console.log(`   ✓ ${tagName} pushed → Mac CI started in background`);
+    progress.set('win', { status: 'building', detail: 'Тэг запушен, Mac CI стартует', percent: 15 });
   }
 }
 
@@ -254,12 +268,16 @@ console.log(dryRun
   ? '🛠  Building Windows locally (no publish — --dry)…\n'
   : '🚀 Building & publishing Windows installer to GitHub…\n');
 
+if (!dryRun) progress.set('win', { status: 'building', detail: 'vite build', percent: 25 });
 run('npm', ['run', 'build']);
+if (!dryRun) progress.set('win', { status: 'building', detail: 'prepare-ffmpeg', percent: 35 });
 run('npm', ['run', 'prepare-ffmpeg']);
+if (!dryRun) progress.set('win', { status: 'publishing', detail: 'electron-builder + upload', percent: 55 });
 run('npx', [
   'electron-builder', '--win',
   ...(dryRun ? [] : ['--publish', 'always']),
 ]);
+if (!dryRun) progress.set('win', { status: 'publishing', detail: 'Описание релиза + notifications.json', percent: 85 });
 
 // ── Post-publish: update release body + notifications.json ────────────────
 const owner = pkg.build?.publish?.[0]?.owner;
@@ -282,14 +300,47 @@ const repo = pkg.build?.publish?.[0]?.repo;
       console.error('   ✗ failed to update notifications.json:', e.message);
     }
   }
+  if (!dryRun) progress.set('win', { status: 'done', detail: `StrataMixer-${newVersion}.exe залит на GitHub`, percent: 100 });
 
-  console.log(`\n✅ v${newVersion} ${dryRun ? 'built locally' : 'Windows published'}`);
+  // ── Update marketing site on Cloudflare Pages ─────────────────────────
+  // Edits version.json + download links in the site source, then deploys
+  // via wrangler. Only runs when not a dry-run and when the Cloudflare
+  // credentials are present (otherwise we log a hint and skip).
+  if (!dryRun) {
+    const hasCfCreds = process.env.CLOUDFLARE_API_TOKEN
+      && process.env.CLOUDFLARE_ACCOUNT_ID
+      && process.env.CLOUDFLARE_PAGES_PROJECT;
+    if (!hasCfCreds) {
+      console.log('\n⚠ Cloudflare env not set — skipping site update.');
+      console.log('  Set CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_PAGES_PROJECT to enable.');
+      progress.set('site', { status: 'failed', detail: 'Cloudflare env не настроены', percent: 100 });
+    } else {
+      progress.set('site', { status: 'updating', detail: 'Правлю version.json + HTML', percent: 25 });
+      console.log('\n🌐 Updating marketing site on Cloudflare Pages…');
+      progress.set('site', { status: 'deploying', detail: 'wrangler pages deploy…', percent: 70 });
+      const siteRes = spawnSync('node', [
+        path.join(root, 'scripts', 'update-site.cjs'),
+        newVersion,
+        ...(notes ? ['--notes', notes] : []),
+      ], { stdio: 'inherit', shell: true, cwd: root, env: process.env });
+      if (siteRes.status !== 0) {
+        console.error('   ✗ site update failed — release on GitHub is still live');
+        progress.set('site', { status: 'failed', detail: 'wrangler упал', percent: 100 });
+      } else {
+        progress.set('site', { status: 'done', detail: 'stratamixer.net обновлён', percent: 100 });
+      }
+    }
+  }
+  if (!dryRun) progress.shutdownIfDone();
+
+  console.log(`\n✅ v${newVersion} ${dryRun ? 'built locally' : 'released'}`);
   if (dryRun) {
     console.log(`   release-installer\\StrataMixer-${newVersion}.exe`);
   } else if (owner && repo) {
     console.log(`   Win release:  https://github.com/${owner}/${repo}/releases/tag/v${newVersion}`);
     console.log(`   Mac CI:       https://github.com/genagenagena15-prog/strata-mixer-1-1-beta-windows-sitefix/actions`);
-    console.log(`                 (≈10 min; .dmg files attach to the same release when done)`);
+    console.log(`                 (≈10 min; .dmg attaches to same release when done)`);
+    console.log(`   Site:         https://stratamixer.net (Cloudflare auto-promoted)`);
   }
   console.log('');
 })().catch(e => { console.error(e); process.exit(1); });
