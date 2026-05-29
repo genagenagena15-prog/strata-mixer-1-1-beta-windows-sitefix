@@ -51,8 +51,8 @@ if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
 if (!fs.existsSync(SITE_DIR)) exitErr(`Site dir not found: ${SITE_DIR}`);
 
 const winUrl = `${RELEASES_BASE}/StrataMixer-${version}.exe`;
+// Single universal .dmg — works natively on both Apple Silicon and Intel.
 const macUrl = `${RELEASES_BASE}/StrataMixer-${version}.dmg`;
-const macArmUrl = `${RELEASES_BASE}/StrataMixer-${version}-arm64.dmg`;
 
 console.log(`\n📦 Site update for v${version}`);
 console.log(`   SITE_DIR = ${SITE_DIR}`);

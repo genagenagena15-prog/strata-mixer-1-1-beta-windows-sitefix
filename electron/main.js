@@ -112,10 +112,17 @@ function findFfmpeg() {
     const ffmpegStatic = require('ffmpeg-static');
     if (ffmpegStatic && fs.existsSync(ffmpegStatic)) return ffmpegStatic;
   } catch {}
+  // On macOS we ship both arm64 and x64 binaries side-by-side so a single
+  // universal .dmg works on Intel + Apple Silicon. Pick the one for the
+  // current process arch at runtime. On Windows / Linux we ship a single
+  // binary named `ffmpeg.exe` / `ffmpeg` (one .exe / one Linux build).
+  const macBin = `ffmpeg-darwin-${process.arch}`;
   const candidates = [
+    process.platform === 'darwin' ? appPath('bin', macBin) : null,
     appPath('bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
     resourcePath('ffmpeg.exe'),
     resourcePath('ffmpeg'),
+    process.platform === 'darwin' ? resourcePath(macBin) : null,
     path.join(process.resourcesPath || '', 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
     path.join(process.resourcesPath || '', 'app', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
   ];

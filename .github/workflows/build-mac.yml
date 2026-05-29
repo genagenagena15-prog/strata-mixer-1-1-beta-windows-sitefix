@@ -43,8 +43,8 @@ jobs:
       - name: Prepare bundled ffmpeg (macOS binary from ffmpeg-static)
         run: npm run prepare-ffmpeg
 
-      - name: Build & publish .dmg (arm64 + x64)
-        run: npx electron-builder --mac --arm64 --x64 --publish always
+      - name: Build & publish universal .dmg (arm64 + x64 in one bundle)
+        run: npx electron-builder --mac --universal --publish always
         env:
           # PAT with write access to the releases repo
           # (genagenagena15-prog/strata-mixer-releases). Add it under
