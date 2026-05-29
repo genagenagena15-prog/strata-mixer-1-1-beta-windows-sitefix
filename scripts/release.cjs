@@ -192,6 +192,11 @@ if (!dryRun) {
     releasesOwner: 'genagenagena15-prog',
     releasesRepo: 'strata-mixer-releases',
     tag: `v${newVersion}`,
+  }, {
+    // When invoked as part of the full release flow, the dashboard auto-heals
+    // common Mac CI failures (e.g. package-lock out of sync) — applies the
+    // fix, force-retags, and lets the workflow re-run. Max 2 attempts.
+    autoRecover: true,
   });
 }
 
