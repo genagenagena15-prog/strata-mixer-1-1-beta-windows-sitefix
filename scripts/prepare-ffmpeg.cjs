@@ -14,13 +14,22 @@ fs.mkdirSync(outDir, { recursive: true });
 
 const platform = process.platform;
 
-// ffmpeg-static publishes its binaries as raw files in github releases —
-// here we mirror the URL pattern it uses internally so we can pull the
-// non-host arch on a Mac CI runner. Version tag matches the bin-version
-// of ffmpeg-static@5.x (currently b6.0 = ffmpeg 6.0).
-const FFMPEG_TAG = 'b6.0';
+// Pull the release tag + executable name from ffmpeg-static's own
+// package.json so the URL stays in sync if the dependency is upgraded.
+// See node_modules/ffmpeg-static/install.js lines 173-174 for the exact
+// pattern: `${downloadsUrl}/${release}/${executableBaseName}-${platform}-${arch}.gz`
+let FFMPEG_TAG = 'b6.1.1';
+let FFMPEG_EXE_NAME = 'ffmpeg';
+try {
+  const ffPkg = require('ffmpeg-static/package.json');
+  const meta = ffPkg && ffPkg['ffmpeg-static'];
+  if (meta) {
+    if (meta['binary-release-tag']) FFMPEG_TAG = meta['binary-release-tag'];
+    if (meta['executable-base-name']) FFMPEG_EXE_NAME = meta['executable-base-name'];
+  }
+} catch {}
 const FFMPEG_URL = (arch) =>
-  `https://github.com/eugeneware/ffmpeg-static/releases/download/${FFMPEG_TAG}/darwin-${arch}.gz`;
+  `https://github.com/eugeneware/ffmpeg-static/releases/download/${FFMPEG_TAG}/${FFMPEG_EXE_NAME}-darwin-${arch}.gz`;
 
 function download(url, dst) {
   return new Promise((resolve, reject) => {
