@@ -107,26 +107,50 @@ function appPath(...parts) {
   return path.join(__dirname, '..', ...parts);
 }
 
+// Any path that points INSIDE app.asar must be rewritten to app.asar.unpacked
+// before being handed to child_process.spawn — Electron's asar fs hooks make
+// fs.existsSync() return true for files inside the archive, but the OS cannot
+// execute a binary that doesn't physically exist on disk. This was the cause
+// of the ENOENT users hit after upgrading to the electron-builder packaging.
+function unpackAsar(p) {
+  if (!p || typeof p !== 'string') return p;
+  if (p.includes('app.asar.unpacked')) return p;
+  return p.replace(/([\\/])app\.asar([\\/])/, '$1app.asar.unpacked$2');
+}
+
 function findFfmpeg() {
-  try {
-    const ffmpegStatic = require('ffmpeg-static');
-    if (ffmpegStatic && fs.existsSync(ffmpegStatic)) return ffmpegStatic;
-  } catch {}
   // On macOS we ship both arm64 and x64 binaries side-by-side so a single
   // universal .dmg works on Intel + Apple Silicon. Pick the one for the
   // current process arch at runtime. On Windows / Linux we ship a single
   // binary named `ffmpeg.exe` / `ffmpeg` (one .exe / one Linux build).
   const macBin = `ffmpeg-darwin-${process.arch}`;
+  let ffmpegStatic = '';
+  try { ffmpegStatic = require('ffmpeg-static') || ''; } catch {}
+
   const candidates = [
     process.platform === 'darwin' ? appPath('bin', macBin) : null,
     appPath('bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
     resourcePath('ffmpeg.exe'),
     resourcePath('ffmpeg'),
     process.platform === 'darwin' ? resourcePath(macBin) : null,
-    path.join(process.resourcesPath || '', 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
-    path.join(process.resourcesPath || '', 'app', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe')
+    path.join(process.resourcesPath || '', 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
+    ffmpegStatic
   ];
-  for (const c of candidates) if (c && fs.existsSync(c)) return c;
+
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const c = unpackAsar(raw);
+    // existsSync on an asar.unpacked path checks the real filesystem, which is
+    // exactly what spawn() will hit — so this stays honest.
+    if (fs.existsSync(c)) {
+      if (!findFfmpeg._loggedPath || findFfmpeg._loggedPath !== c) {
+        console.log('[strata] ffmpeg resolved to:', c);
+        findFfmpeg._loggedPath = c;
+      }
+      return c;
+    }
+  }
+  console.warn('[strata] ffmpeg NOT found on disk — falling back to PATH lookup (will likely fail with ENOENT)');
   return 'ffmpeg';
 }
 
