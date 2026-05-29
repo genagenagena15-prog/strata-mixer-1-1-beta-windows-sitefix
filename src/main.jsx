@@ -305,6 +305,11 @@ function App() {
 // ── Notification center (bell) ───────────────────────────────────────
 const NOTIF_SEEN_KEY = 'strata_notif_seen_v1';
 const NOTIF_MUTE_KEY = 'strata_notif_muted_v1';
+// Public releases page — used as the "rollback" escape hatch in update
+// toasts and the bell panel update card. Opens externally so the user can
+// download an older .exe/.dmg directly.
+const RELEASES_URL = 'https://github.com/genagenagena15-prog/strata-mixer-releases/releases';
+const openReleases = () => { try { window.strata?.openExternal?.(RELEASES_URL); } catch {} };
 
 function loadSeenIds() {
   try { return new Set(JSON.parse(localStorage.getItem(NOTIF_SEEN_KEY) || '[]')); }
@@ -477,6 +482,7 @@ function NotificationBell() {
               <div className="nuc-title">Обновление готово{update.version ? ` · v${update.version}` : ''}</div>
               <div className="nuc-text">Обновись сейчас или просто закрой программу — новая версия установится автоматически при следующем запуске.</div>
               <button className="nuc-btn" onClick={doInstall}>Обновить сейчас</button>
+              <a className="nuc-rollback" onClick={(e) => { e.preventDefault(); openReleases(); }} href="#">Проблемы? Скачать старую версию</a>
             </div>
           )}
           {update.status === 'mac-available' && (
@@ -484,6 +490,7 @@ function NotificationBell() {
               <div className="nuc-title">Доступна новая версия{update.version ? ` · v${update.version}` : ''}</div>
               <div className="nuc-text">На Mac обновление ставится вручную: нажми «Скачать», установи DMG в Applications.</div>
               <button className="nuc-btn" onClick={doInstall}>Скачать</button>
+              <a className="nuc-rollback" onClick={(e) => { e.preventDefault(); openReleases(); }} href="#">Проблемы? Скачать старую версию</a>
             </div>
           )}
           {update.status === 'downloading' && (
@@ -520,6 +527,9 @@ function NotificationBell() {
               {t.body && <div className="nt-body">{t.body}</div>}
               {t.kind === 'update-ready' && <button className="nt-btn" onClick={(e) => { e.stopPropagation(); doInstall(); }}>Обновить</button>}
               {t.kind === 'update-mac' && <button className="nt-btn" onClick={(e) => { e.stopPropagation(); doInstall(); }}>Скачать</button>}
+              {(t.kind === 'update-ready' || t.kind === 'update-mac') && (
+                <a className="nt-rollback" onClick={(e) => { e.stopPropagation(); e.preventDefault(); openReleases(); }} href="#">Проблемы? Скачать старую версию</a>
+              )}
             </div>
             <button className="nt-close" onClick={(e) => { e.stopPropagation(); dismissToast(t.key); }} aria-label="Скрыть">×</button>
           </div>

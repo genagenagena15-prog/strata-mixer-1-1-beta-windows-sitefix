@@ -1331,6 +1331,14 @@
 .nuc-btn{margin-top:9px;width:100%;padding:8px;border:0;border-radius:9px;font-weight:900;font-size:12px;color:#04140c;background:linear-gradient(135deg,#3ddc91,#28c8b0);cursor:pointer;transition:filter .15s,transform .1s}
 .nuc-btn:hover{filter:brightness(1.08)}
 .nuc-btn:active{transform:scale(.98)}
+/* Rollback escape-hatch link: small, subtle, sits under the main action.
+   Opens the GitHub Releases page so user can grab a previous version. */
+.nuc-rollback{display:block;margin-top:8px;text-align:center;font-size:11px;color:#85929c;text-decoration:none;cursor:pointer;transition:color .12s}
+.nuc-rollback:hover{color:#cbd6e0;text-decoration:underline}
+.nt-rollback{display:inline-block;margin-top:6px;margin-left:8px;font-size:10.5px;color:#85929c;text-decoration:none;cursor:pointer;transition:color .12s}
+.nt-rollback:hover{color:#cbd6e0;text-decoration:underline}
+[data-theme="light"] .nuc-rollback,[data-theme="light"] .nt-rollback{color:#6a7280}
+[data-theme="light"] .nuc-rollback:hover,[data-theme="light"] .nt-rollback:hover{color:#262934}
 
 .notif-toasts{position:fixed;top:48px;left:12px;z-index:9200;display:flex;flex-direction:column;gap:9px;width:330px;pointer-events:none}
 .notif-toast{pointer-events:auto;display:flex;gap:10px;padding:11px 12px;border-radius:12px;background:#121b2c;border:1px solid rgba(122,139,174,.22);box-shadow:0 16px 40px rgba(0,0,0,.5);cursor:pointer;animation:toastIn .26s cubic-bezier(.2,.9,.25,1)}
