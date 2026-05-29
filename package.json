@@ -33,7 +33,8 @@
       {
         "provider": "github",
         "owner": "genagenagena15-prog",
-        "repo": "strata-mixer-releases"
+        "repo": "strata-mixer-releases",
+        "releaseType": "release"
       }
     ],
     "directories": {
@@ -88,7 +89,8 @@
     "icojs": "^1.0.0",
     "png2icons": "^2.0.1",
     "vite": "^8.0.13",
-    "wait-on": "^9.0.10"
+    "wait-on": "^9.0.10",
+    "wrangler": "^4.95.0"
   },
   "publicVersion": "v1.2.5"
 }
