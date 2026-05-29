@@ -259,36 +259,76 @@ function npmRun(args, opts = {}) {
 async function attemptRecovery(run, failedStepName) {
   recoveryAttempts++;
   const tag = pollConfig.tag;
+  const fs = require('fs');
 
-  // Pattern 1: package-lock.json out of sync with package.json
-  //   Symptom: install step fails with "npm error code EUSAGE … `npm ci` can
-  //   only install packages when your package.json and package-lock.json …"
-  //   Fix: run `npm install` locally, commit + push the updated lockfile.
-  if (/install|dependencies|deps/i.test(failedStepName)) {
-    console.log('\n🔧 Auto-fix: syncing package-lock.json…');
-    const inst = npmRun(['install']);
-    if (inst.status !== 0) {
-      return { ok: false, reason: 'npm install failed' };
+  // Fetch the failed-job logs once — most patterns need to grep them.
+  let logs = '';
+  try {
+    const { sourceOwner, sourceRepo } = pollConfig;
+    const jobs = (await ghFetch(`https://api.github.com/repos/${sourceOwner}/${sourceRepo}/actions/runs/${run.id}/jobs`)).jobs || [];
+    const jobId = jobs[0]?.id;
+    if (jobId) {
+      const res = await fetch(`https://api.github.com/repos/${sourceOwner}/${sourceRepo}/actions/jobs/${jobId}/logs`, {
+        headers: { 'Authorization': 'Bearer ' + process.env.GH_TOKEN, 'Accept': 'application/vnd.github+json' },
+        redirect: 'follow',
+      });
+      if (res.ok) logs = await res.text();
     }
-    // Commit the lockfile (and only the lockfile) if it changed.
-    const diff = gitRun(['diff', '--quiet', 'package-lock.json']);
-    if (diff.status !== 0) {
+  } catch {}
+
+  // Pattern A: package-lock.json out of sync with package.json.
+  // Symptom: install step fails with "npm error code EUSAGE".
+  if (/install|dependencies|deps/i.test(failedStepName) || /npm error code EUSAGE/.test(logs)) {
+    console.log('\n🔧 Auto-fix: syncing package-lock.json…');
+    if (npmRun(['install']).status !== 0) return { ok: false, reason: 'npm install failed' };
+    if (gitRun(['diff', '--quiet', 'package-lock.json']).status !== 0) {
       gitRun(['add', 'package-lock.json']);
-      const commit = gitRun(['commit', '-m', 'fix: auto-sync package-lock.json (release-doctor)']);
-      if (commit.status !== 0) {
+      if (gitRun(['commit', '-m', 'fix: auto-sync package-lock.json (release-doctor)']).status !== 0) {
         return { ok: false, reason: 'git commit failed' };
       }
-      const push = gitRun(['push', 'origin', 'main']);
-      if (push.status !== 0) {
+      if (gitRun(['push', 'origin', 'main']).status !== 0) {
         return { ok: false, reason: 'git push failed' };
       }
     }
-    return retagAndPush(tag, `auto-fix: package-lock sync`);
+    return retagAndPush(tag, 'auto-fix: package-lock sync');
   }
 
-  // Pattern 2: generic / transient — just retry. GitHub Actions network
-  // hiccups, ffmpeg download flake, etc. We don't change any code, just
-  // re-tag so the workflow runs again.
+  // Pattern B: @electron/universal complains about a file outside ASAR that
+  // is identical between arm64+x64 builds — needs to be added to the
+  // mac.x64ArchFiles glob. Extract the file path from the error and
+  // extend the pattern.
+  const x64Match = logs.match(/Detected file "([^"]+)" that's the same in both x64 and arm64 builds/);
+  if (x64Match) {
+    const offendingPath = x64Match[1];
+    // Use the filename (last path segment) — broadest match without false positives.
+    const fileName = offendingPath.split('/').pop();
+    console.log(`\n🔧 Auto-fix: x64ArchFiles — adding "${fileName}" to glob`);
+    const pkgPath = path.join(ROOT, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const cur = pkg.build?.mac?.x64ArchFiles || '';
+    // Strip outer "**/{...}" braces if present, add new entry, re-wrap.
+    let inner = cur.replace(/^\*\*\/\{/, '').replace(/\}$/, '').replace(/^\*\*\//, '');
+    const entries = inner ? inner.split(',') : [];
+    const newEntry = `**/${fileName}`;
+    if (!entries.includes(newEntry) && !entries.includes(fileName)) {
+      entries.push(fileName);
+    }
+    pkg.build = pkg.build || {};
+    pkg.build.mac = pkg.build.mac || {};
+    pkg.build.mac.x64ArchFiles = `**/{${entries.join(',')}}`;
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+    gitRun(['add', 'package.json']);
+    if (gitRun(['commit', '-m', `fix: auto-extend x64ArchFiles for "${fileName}" (release-doctor)`]).status !== 0) {
+      return { ok: false, reason: 'git commit failed' };
+    }
+    if (gitRun(['push', 'origin', 'main']).status !== 0) {
+      return { ok: false, reason: 'git push failed' };
+    }
+    return retagAndPush(tag, `auto-fix: x64ArchFiles += ${fileName}`);
+  }
+
+  // Pattern C: generic / transient — just retry. GitHub Actions network
+  // hiccups, ffmpeg download flake, etc. No code change.
   console.log('\n🔄 Auto-retry (no code change) for transient CI flake');
   return retagAndPush(tag, `auto-retry attempt ${recoveryAttempts}`);
 }
