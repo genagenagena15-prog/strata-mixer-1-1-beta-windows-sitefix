@@ -1,6 +1,6 @@
 {
   "name": "strata-mixer",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "description": "Strata Mixer v1.2 — программа для уникализации и редактирования видео",
   "main": "electron/main.js",
   "private": true,
@@ -75,7 +75,9 @@
     ]
   },
   "dependencies": {
+    "archiver": "^7.0.1",
     "electron-updater": "^6.8.3",
+    "extract-zip": "^2.0.1",
     "ffmpeg-static": "^5.3.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
@@ -93,5 +95,5 @@
     "wait-on": "^9.0.10",
     "wrangler": "^4.95.0"
   },
-  "publicVersion": "v1.2.6"
+  "publicVersion": "v1.2.7"
 }

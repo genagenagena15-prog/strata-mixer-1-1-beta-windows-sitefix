@@ -3,6 +3,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const archiver = require('archiver');
+const extractZip = require('extract-zip');
 
 let mainWindow = null;
 let splashWindow = null;
@@ -45,19 +47,14 @@ function extractProjectPath(argv) {
 function dispatchPendingProject() {
   if (!pendingProjectFile || !mainWindow || mainWindow.isDestroyed()) return;
   const wc = mainWindow.webContents;
-  const send = () => {
+  const send = async () => {
     if (!pendingProjectFile) return;
     const filePath = pendingProjectFile;
     pendingProjectFile = null;
     try {
-      const raw = fs.readFileSync(filePath, 'utf8');
-      const data = JSON.parse(raw);
-      if (Array.isArray(data?.state?.layers)) {
-        data.state.layers = data.state.layers.map(l =>
-          l && l.file && !fs.existsSync(l.file) ? { ...l, _missing: true } : l
-        );
-      }
-      wc.send('project:open-from-file', { ok: true, path: filePath, data });
+      // Shared loader: ZIP bundle (extract + rewrite) or legacy plain JSON.
+      const res = await loadProjectFile(filePath);
+      wc.send('project:open-from-file', res);
     } catch (e) {
       wc.send('project:open-from-file', { ok: false, error: String(e.message || e) });
     }
@@ -959,6 +956,149 @@ ipcMain.handle('saveas:pick', async (_event, defaultName, format) => {
 // Media paths are stored absolute — easiest, but breaks if the user moves the
 // source files. On open we check fs.existsSync for every layer's file and tag
 // missing ones with `_missing: true` so the UI can flag them.
+// ── Self-contained project bundling (.smproj = ZIP) ────────────────────────
+// A saved project is a ZIP archive: `project.json` (the state with media paths
+// rewritten to repo-relative `media/<n>_<name>`) plus a `media/` folder holding
+// a copy of every referenced video/audio/image. This lets a user forward ONE
+// file and have it open identically on another machine. Legacy plain-JSON
+// projects still open (detected by the absence of the ZIP magic bytes).
+
+const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]); // "PK\x03\x04"
+
+function isZipFile(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(4);
+    fs.readSync(fd, buf, 0, 4, 0);
+    fs.closeSync(fd);
+    return buf.equals(ZIP_MAGIC);
+  } catch { return false; }
+}
+
+function sanitizeMediaName(p) {
+  const base = path.basename(String(p || 'file'));
+  return base.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(-80) || 'file';
+}
+
+// Walk the project state and return every absolute media path it references
+// (main video + each layer's .file). Deduped, existing files only.
+function collectProjectMedia(state) {
+  const files = new Set();
+  const add = (f) => { if (f && typeof f === 'string') files.add(f); };
+  if (state) {
+    add(state.file);
+    if (Array.isArray(state.layers)) state.layers.forEach((l) => add(l && l.file));
+  }
+  return [...files].filter((f) => { try { return fs.existsSync(f); } catch { return false; } });
+}
+
+// Build the ZIP. Returns a promise that resolves when the archive is fully
+// flushed to disk. Streams files in (no whole-file buffering) so multi-GB
+// projects don't blow up memory.
+function bundleProjectToZip(payload, filePath) {
+  return new Promise((resolve, reject) => {
+    const state = payload && payload.state ? payload.state : {};
+    const media = collectProjectMedia(state);
+
+    // original absolute path → archived relative name (deduped, collision-safe).
+    const pathMap = new Map();
+    media.forEach((abs, i) => {
+      pathMap.set(abs, `media/${i}_${sanitizeMediaName(abs)}`);
+    });
+
+    // Deep-ish clone of state with media paths rewritten to the archived names.
+    // Missing files keep their original path (they'll flag as _missing on open).
+    const remap = (f) => (f && pathMap.has(f) ? pathMap.get(f) : f);
+    const newState = {
+      ...state,
+      file: remap(state.file),
+      layers: Array.isArray(state.layers)
+        ? state.layers.map((l) => (l && l.file ? { ...l, file: remap(l.file) } : l))
+        : state.layers,
+    };
+    const wrapper = {
+      version: 2,
+      app: 'strata-mixer',
+      bundled: true,
+      savedAt: new Date().toISOString(),
+      state: newState,
+    };
+
+    const output = fs.createWriteStream(filePath);
+    const archive = archiver('zip', { store: true }); // store: media is already compressed
+    let settled = false;
+    const done = (err) => { if (settled) return; settled = true; err ? reject(err) : resolve({ ok: true, path: filePath, mediaCount: media.length }); };
+
+    output.on('close', () => done());
+    output.on('error', done);
+    archive.on('error', done);
+    archive.on('warning', (w) => { if (w.code !== 'ENOENT') done(w); });
+
+    archive.pipe(output);
+    archive.append(JSON.stringify(wrapper, null, 2), { name: 'project.json' });
+    for (const abs of media) {
+      archive.file(abs, { name: pathMap.get(abs) });
+    }
+    archive.finalize().catch(done);
+  });
+}
+
+// Unique, stable-ish cache dir for an opened bundle so re-opening the same file
+// reuses extracted media instead of piling up copies.
+function bundleCacheDir(filePath) {
+  let stamp = '0';
+  try { stamp = String(fs.statSync(filePath).mtimeMs | 0); } catch {}
+  const key = sanitizeMediaName(filePath) + '-' + stamp;
+  return path.join(app.getPath('userData'), 'opened-projects', key);
+}
+
+// Shared loader for BOTH the open-dialog handler and the double-click /
+// open-from-file flow. Detects ZIP vs legacy JSON, extracts media to cache,
+// rewrites archived paths back to absolute, and flags any missing files.
+async function loadProjectFile(filePath) {
+  if (isZipFile(filePath)) {
+    const cacheDir = bundleCacheDir(filePath);
+    try { fs.rmSync(cacheDir, { recursive: true, force: true }); } catch {}
+    fs.mkdirSync(cacheDir, { recursive: true });
+    await extractZip(filePath, { dir: cacheDir });
+    const jsonPath = path.join(cacheDir, 'project.json');
+    const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    if (!data || typeof data !== 'object' || !data.state) {
+      return { ok: false, error: 'Файл проекта повреждён или имеет несовместимый формат.' };
+    }
+    // Rewrite media/... → absolute path inside the cache dir.
+    const abs = (f) => {
+      if (f && typeof f === 'string' && f.startsWith('media/')) {
+        const p = path.join(cacheDir, f);
+        return fs.existsSync(p) ? p : f;
+      }
+      return f;
+    };
+    const s = data.state;
+    s.file = abs(s.file);
+    if (Array.isArray(s.layers)) {
+      s.layers = s.layers.map((l) => {
+        if (!l || !l.file) return l;
+        const resolved = abs(l.file);
+        return fs.existsSync(resolved) ? { ...l, file: resolved } : { ...l, file: resolved, _missing: true };
+      });
+    }
+    return { ok: true, path: filePath, data };
+  }
+  // Legacy plain-JSON project.
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const data = JSON.parse(raw);
+  if (!data || typeof data !== 'object' || !data.state) {
+    return { ok: false, error: 'Файл проекта повреждён или имеет несовместимый формат.' };
+  }
+  if (Array.isArray(data.state.layers)) {
+    data.state.layers = data.state.layers.map((l) =>
+      l && l.file && !fs.existsSync(l.file) ? { ...l, _missing: true } : l
+    );
+  }
+  return { ok: true, path: filePath, data };
+}
+
 ipcMain.handle('project:save', async (_event, projectData) => {
   try {
     const result = await dialog.showSaveDialog(mainWindow, {
@@ -970,7 +1110,9 @@ ipcMain.handle('project:save', async (_event, projectData) => {
     // Drop the `suggestedName` hint before writing — it's a transient field
     // used only to seed the save dialog.
     const { suggestedName, ...payload } = projectData || {};
-    fs.writeFileSync(result.filePath, JSON.stringify(payload, null, 2), 'utf8');
+    // Always bundle: write a self-contained ZIP with all media inside, so the
+    // .smproj can be forwarded and opened 1:1 on another machine.
+    await bundleProjectToZip(payload, result.filePath);
     return { ok: true, path: result.filePath };
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
@@ -1072,21 +1214,9 @@ ipcMain.handle('project:open', async () => {
     });
     if (result.canceled || !result.filePaths?.[0]) return { ok: false, canceled: true };
     const file = result.filePaths[0];
-    const raw = fs.readFileSync(file, 'utf8');
-    const data = JSON.parse(raw);
-    if (!data || typeof data !== 'object' || !data.state) {
-      return { ok: false, error: 'Файл проекта повреждён или имеет несовместимый формат.' };
-    }
-    // Tag layers whose source files have moved/disappeared so the UI can mark
-    // them in the timeline. The project still opens — the user can swap the
-    // file manually per layer.
-    if (Array.isArray(data.state.layers)) {
-      data.state.layers = data.state.layers.map(l => {
-        if (l && l.file && !fs.existsSync(l.file)) return { ...l, _missing: true };
-        return l;
-      });
-    }
-    return { ok: true, path: file, data };
+    // Shared loader handles both ZIP bundles (extract media to cache + rewrite
+    // paths) and legacy plain-JSON projects.
+    return await loadProjectFile(file);
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
   }
@@ -1413,21 +1543,26 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       const mvHuePart = mvCcH !== 0 ? `,hue=h=${mvCcH.toFixed(2)}` : '';
       const mvCcPart = mvCmPart + mvEqPart + mvHuePart;
 
-      if (mvLayer && mv.aspect && mv.size) {
-        const mvW = Math.max(2, Math.round((mv.size / 100) * evenW));
-        const mvH = Math.max(2, Math.round(mvW / mv.aspect));
+      if (mvLayer) {
+        // Mirror the preview's getLayerPx(mainVideo) EXACTLY so the export
+        // matches what the user sees: the video fills the canvas WIDTH at
+        // `size`%, its height follows the source aspect, it's centred at
+        // (x,y), and any overflow is cropped by the canvas ("cover"). The old
+        // code only did this when size+aspect were explicitly set, otherwise
+        // it fell back to a "contain" scale+pad that added black bars — which
+        // is the bug being fixed here. Defaults match the preview: size=100,
+        // aspect from the source probe (videoWidth/videoHeight), x=y=50.
+        const mvAspect = (Number(mv.aspect) > 0)
+          ? Number(mv.aspect)
+          : ((srcProbe.width > 0 && srcProbe.height > 0) ? srcProbe.width / srcProbe.height : evenW / evenH);
+        const mvSize = (mv.size != null && Number(mv.size) > 0) ? Number(mv.size) : 100;
+        const mvW = Math.max(2, Math.round((mvSize / 100) * evenW));
+        const mvH = Math.max(2, Math.round(mvW / mvAspect));
         const mvX = Math.round(((mv.x == null ? 50 : mv.x) / 100) * evenW - mvW / 2);
         const mvY = Math.round(((mv.y == null ? 50 : mv.y) / 100) * evenH - mvH / 2);
         filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[smbg]`);
         filterParts.push(`[0:v]trim=start=${mvSrc.toFixed(3)}:end=${mvSrcEnd},setpts=(PTS-STARTPTS)/${mvSp}+${videoStart}/TB,scale=${mvW}:${mvH},setsar=1${mvCcPart}[smmv]`);
         filterParts.push(`[smbg][smmv]overlay=${mvX}:${mvY}:eof_action=pass:enable='between(t,${videoStart},${videoEnd})'[vscaled]`);
-      } else if (mvLayer) {
-        let baseFilter = `${videoStream}trim=start=${mvSrc.toFixed(3)}:end=${mvSrcEnd},setpts=(PTS-STARTPTS)/${mvSp}${mvCcPart},scale=${evenW}:${evenH}:force_original_aspect_ratio=decrease,setsar=1,pad=${evenW}:${evenH}:(ow-iw)/2:(oh-ih)/2:${bgHex}`;
-        if (videoStart > 0 || padAfter > 0) {
-          baseFilter += `,tpad=start_duration=${videoStart}:stop_duration=${padAfter}:color=${bgHex}`;
-        }
-        baseFilter += '[vscaled]';
-        filterParts.push(baseFilter);
       } else {
         // No "main video" — the bottom-most visible layer in the renderer was
         // an image (or there are no video overlays). Start with a synthetic
@@ -1438,6 +1573,24 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[vscaled]`);
       }
       videoStream = '[vscaled]';
+
+      // If there are mask layers, pre-split [vscaled] so each mask can fill
+      // its outside-shape area with the pristine mainVideo (instead of a flat
+      // bgColor). Without this, during the mask's enable window the canvas
+      // outside the shape was always bgColor — even where the mainVideo
+      // (or any earlier non-overlay content) should have kept playing.
+      const totalMaskCount = (layers || []).filter(l => l.type === 'mask').length;
+      const baseMaskLabels = [];
+      if (totalMaskCount > 0) {
+        const labels = ['[vscaledSeq]'];
+        for (let mi = 0; mi < totalMaskCount; mi++) {
+          const lbl = `[vbaseMask${mi}]`;
+          labels.push(lbl);
+          baseMaskLabels.push(lbl);
+        }
+        filterParts.push(`${videoStream}split=${totalMaskCount + 1}${labels.join('')}`);
+        videoStream = '[vscaledSeq]';
+      }
 
       let blurCount = 0, imgCount = 0, vidovCount = 0, txtCount = 0, zoomCount = 0, maskCount = 0, transCount = 0;
       (layers || []).forEach((layer) => {
@@ -1522,8 +1675,17 @@ ipcMain.handle('video:edit', async (_event, payload) => {
             videoStream = `[trDone${i}]`;
           }
         } else if (layer.type === 'mask') {
-          // Clipping mask: keep current videoStream pixels only inside the
-          // chosen shape; outside becomes the project background colour.
+          // Clipping mask: inside its time window, the canvas shows bgColor
+          // everywhere OUTSIDE the chosen shape and the previous composition
+          // INSIDE the shape. Outside the time window, the previous composition
+          // passes through unchanged.
+          //
+          // The old version used [mbg] (bgColor canvas) as the overlay BASE,
+          // which made the entire timeline turn bgColor whenever the mask's
+          // enable was false (overlay returns its base when enable=false). That
+          // was a huge bug — adding a 5-sec mask blacked out the other 95% of
+          // the video. Now we split the previous stream and use it as the base
+          // so outside the enable window everything renders normally.
           const i = maskCount++;
           const mw = Math.max(2, Math.round((layer.width / 100) * evenW));
           const mh = Math.max(2, Math.round((layer.height / 100) * evenH));
@@ -1543,12 +1705,28 @@ ipcMain.handle('video:edit', async (_event, payload) => {
             alphaExpr = `if(lte(pow(X-clip(X,${ix0},${ix1}),2)+pow(Y-clip(Y,${iy0},${iy1}),2),${R * R}),255,0)`;
           }
           const enable = `enable='between(t,${layer.startTime},${layer.endTime})'`;
-          // bg fill + grayscale shape (white inside / black outside). alphamerge
-          // uses the luma of input2 as the new alpha of input1.
-          filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[mbg${i}]`);
+          // Split the previous stream: one copy is the unchanged pass-through
+          // (used as base outside the enable window), the other gets clipped.
+          filterParts.push(`${videoStream}split=2[morig${i}][mtoclip${i}]`);
+          // Base for the "masked look" inside the enable window: prefer the
+          // pristine mainVideo (split off earlier) so during the mask window
+          // we see "mainVideo outside shape + previous-composite inside shape"
+          // — i.e. the topmost overlay appears to be cookie-cutter clipped.
+          // Falls back to bgColor only when there's no mainVideo at all.
+          const baseLbl = baseMaskLabels[i] || null;
+          // Grayscale alpha mask: 255 inside shape, 0 outside.
           filterParts.push(`color=c=black:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)},format=gray,geq=lum='${alphaExpr}'[mma${i}]`);
-          filterParts.push(`${videoStream}[mma${i}]alphamerge[mclip${i}]`);
-          filterParts.push(`[mbg${i}][mclip${i}]overlay=0:0:${enable}[vmask${i}]`);
+          // Apply alpha → previous content visible only inside shape (transparent outside).
+          filterParts.push(`[mtoclip${i}][mma${i}]alphamerge[mclip${i}]`);
+          // Compose the "masked" look: base (mainVideo or bgColor) outside shape + clipped previous content inside shape.
+          if (baseLbl) {
+            filterParts.push(`${baseLbl}[mclip${i}]overlay=0:0[mmasked${i}]`);
+          } else {
+            filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[mbg${i}]`);
+            filterParts.push(`[mbg${i}][mclip${i}]overlay=0:0[mmasked${i}]`);
+          }
+          // Final: outside enable window → pass-through (morig); inside window → masked look.
+          filterParts.push(`[morig${i}][mmasked${i}]overlay=0:0:${enable}[vmask${i}]`);
           videoStream = `[vmask${i}]`;
         } else if (layer.type === 'blur') {
           const i = blurCount++;
@@ -1773,7 +1951,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const baSrcEnd = baSrcStart + baLen;
         const baDelayMs = Math.round((Number(baseAud.startTime) || 0) * 1000);
         const baVol = ((Number(baseAud.volume) || 100) / 100).toFixed(3);
-        filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}|${baDelayMs},volume=${baVol}[auMain]`);
+        filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}:all=1,volume=${baVol}[auMain]`);
       } else if (mvLayer && baseHasAudio) {
         // [0:a] is the main video's audio — only safe to use as the base mix
         // when there IS a mainVideo (input [0] is conceptually the timeline
@@ -1785,7 +1963,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
         while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
         atParts.push(`atempo=${atRem.toFixed(4)}`);
-        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${Math.round(videoStart*1000)}|${Math.round(videoStart*1000)},volume=${(mvVol / 100).toFixed(3)}[auMain]`);
+        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${Math.round(videoStart*1000)}:all=1,volume=${(mvVol / 100).toFixed(3)}[auMain]`);
       } else {
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
       }
@@ -1802,7 +1980,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const ovHasAudio = audioProbeMap.get(layer.file) !== false;
         if (!ovHasAudio) {
           // Silent overlay — keep the timeline structure intact for amix.
-          filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${oLen.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${oDelay}|${oDelay}[auVov${i}]`);
+          filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${oLen.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${oDelay}:all=1[auVov${i}]`);
           mixInputs.push(`[auVov${i}]`);
           return;
         }
@@ -1810,7 +1988,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
         while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
         atParts.push(`atempo=${atRem.toFixed(4)}`);
-        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}|${oDelay},volume=${oVol.toFixed(3)}[auVov${i}]`);
+        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}:all=1,volume=${oVol.toFixed(3)}[auVov${i}]`);
         mixInputs.push(`[auVov${i}]`);
       });
       audioLayers.forEach((layer, i) => {
@@ -1822,15 +2000,21 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const vol = (layer.volume ?? 100) / 100;
         const delayMs = Math.round(aStart * 1000);
         const aSrc = Number(layer.srcStart || 0);
-        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs},volume=${vol.toFixed(3)}[auLayer${i}]`);
+        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${vol.toFixed(3)}[auLayer${i}]`);
         mixInputs.push(`[auLayer${i}]`);
       });
+      // Always pass the final audio through aresample to absorb tiny PTS
+      // drift from atrim/atempo/adelay chains. Without this, split clips on
+      // the timeline accumulate fractional-sample errors → amix sees one
+      // input as "ended early" → 2-sec dropout fade-out kicks in and the
+      // rest of the audio disappears (the exact symptom of the cut+mask
+      // + cut bug). dropout_transition=0 also disables that fade entirely.
       if (mixInputs.length === 1) {
-        audioMap = '[auMain]';
+        filterParts.push(`[auMain]aresample=async=1:first_pts=0[auFinal]`);
       } else {
-        filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:normalize=0[auFinal]`);
-        audioMap = '[auFinal]';
+        filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=async=1:first_pts=0[auFinal]`);
       }
+      audioMap = '[auFinal]';
     }
 
     // ── Quality / size — capped relative to the source (max ≤×3, normal ≈
@@ -1863,11 +2047,19 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       else if (quality === 'max' && srcVideoKbps > 0) { vKbps = srcVideoKbps * 2.4; maxMul = 1.25; }
       else if (quality === 'fast' && srcVideoKbps > 0) { vKbps = srcVideoKbps * 0.55; maxMul = 1.45; }
       else if (quality === 'normal' && srcVideoKbps > 0) { vKbps = srcVideoKbps * 0.95; maxMul = 1.3; }
+      // -fps_mode cfr forces constant frame rate on output — without this,
+      // stacking many overlays with their own setpts shifts produces
+      // non-monotonic DTS, which writes a corrupt duration into the moov
+      // atom. Players then read garbage as a 64-bit timestamp → "-500
+      // hours" / "0 duration" / the file shows the wrong length entirely.
+      // cfr regenerates DTS from a fixed clock, so the container is sane.
       if (format === 'webm') {
         args.push('-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '2');
         if (vKbps > 0) { const v = Math.max(300, Math.round(vKbps)); args.push('-b:v', `${v}k`, '-maxrate', `${Math.round(v * maxMul)}k`); }
         else args.push('-crf', String(quality === 'custom' ? cCrf(33) : quality === 'max' ? 28 : quality === 'fast' ? 40 : 33), '-b:v', '0');
         if (quality === 'custom' && cFps > 0) args.push('-r', String(cFps));
+        else args.push('-r', '30');
+        args.push('-fps_mode', 'cfr');
         args.push('-c:a', 'libopus', '-b:a', `${audioKbps}k`);
       } else {
         args.push('-c:v', 'libx264', '-preset', encPreset);
@@ -1878,6 +2070,8 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           args.push('-crf', String(quality === 'custom' ? cCrf(23) : quality === 'max' ? 19 : quality === 'fast' ? 27 : 23));
         }
         if (quality === 'custom' && cFps > 0) args.push('-r', String(cFps));
+        else args.push('-r', '30');
+        args.push('-fps_mode', 'cfr');
         args.push('-c:a', 'aac', '-b:a', `${audioKbps}k`, '-movflags', '+faststart');
       }
     }

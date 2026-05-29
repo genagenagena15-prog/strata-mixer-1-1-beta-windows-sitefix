@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.2.6';
+const APP_VERSION = 'v1.2.7';
 const DONATE_WALLET = 'TGoUEoM6AjG6KjnXJi9hFYRn54c6HsTybE';
 
 const A = {
@@ -1293,6 +1293,12 @@ function Editor({ state, setState }) {
   const tlScrollRef = useRef(null);
   const canvasRef = useRef(null);
   const previewCanvasRef = useRef(null);
+  // Fullscreen preview: a second canvas painted by the same render loop, shown
+  // in a fixed overlay that goes into real OS fullscreen for distraction-free
+  // playback review.
+  const fsCanvasRef = useRef(null);
+  const fsOverlayRef = useRef(null);
+  const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const videoOverlayRefs = useRef({});
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
@@ -2204,14 +2210,38 @@ function Editor({ state, setState }) {
     const tick = (ts) => {
       if (!running) return;
       rafRef.current = requestAnimationFrame(tick);
-      const canvas = previewCanvasRef.current;
-      if (!canvas || ts - last < 33) return;
+      if (ts - last < 33) return;
       last = ts;
-      const ctx = canvas.getContext('2d');
-      renderFrameRef.current?.(ctx);
+      const draw = renderFrameRef.current;
+      if (!draw) return;
+      const canvas = previewCanvasRef.current;
+      if (canvas) draw(canvas.getContext('2d'));
+      // Paint the fullscreen mirror with the same frame when it's open.
+      const fs = fsCanvasRef.current;
+      if (fs) draw(fs.getContext('2d'));
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => { running = false; cancelAnimationFrame(rafRef.current); };
+  }, []);
+
+  // Drive real OS fullscreen from the previewFullscreen state. Entering asks
+  // the overlay element to go fullscreen; exiting (button or browser ESC) drops
+  // back. The fullscreenchange listener keeps React state in sync when the user
+  // presses ESC (which the browser handles itself).
+  useEffect(() => {
+    const el = fsOverlayRef.current;
+    if (previewFullscreen) {
+      if (el && !document.fullscreenElement) el.requestFullscreen?.().catch(() => {});
+    } else if (document.fullscreenElement) {
+      document.exitFullscreen?.().catch(() => {});
+    }
+  }, [previewFullscreen]);
+  useEffect(() => {
+    const onFsChange = () => { if (!document.fullscreenElement) setPreviewFullscreen(false); };
+    const onKey = (e) => { if (e.key === 'Escape') setPreviewFullscreen(false); };
+    document.addEventListener('fullscreenchange', onFsChange);
+    window.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('fullscreenchange', onFsChange); window.removeEventListener('keydown', onKey); };
   }, []);
 
   // Subscribe to proxy-encode progress events. The backend emits the
@@ -2400,6 +2430,25 @@ function Editor({ state, setState }) {
       if (v.currentTime >= videoEnd || v.currentTime < videoStart) { v.currentTime = videoStart; setCurrentTime(videoStart); }
       v.play().catch(() => {}); setPlaying(true);
     }
+  }
+
+  // Shared scrub-drag handler so the normal playback bar AND the fullscreen
+  // overlay's bar behave identically. getBoundingClientRect is read off the
+  // event target, so it works wherever the scrub element is rendered.
+  function scrubPointerDown(e) {
+    e.preventDefault();
+    pausePlayback();
+    const r = e.currentTarget.getBoundingClientRect();
+    const seek = (ev) => {
+      let t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
+      t = snapTime(t, ev.shiftKey);
+      seekTo(t);
+    };
+    seek(e);
+    const move = (ev) => seek(ev);
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
   }
 
   function makePreviewDrag(id) {
@@ -2952,8 +3001,12 @@ function Editor({ state, setState }) {
           ctx.restore();
         }
       } else if (layer.type === 'mask') {
-        // Clipping mask: keep canvas pixels only INSIDE the shape, rest erased
-        // and refilled with the background colour so the mask reads as a hole.
+        // Clipping mask (cookie-cutter): inside the shape we keep the full
+        // composition; OUTSIDE the shape we fall back to the main video base
+        // (the lower layer), NOT a flat bgColor hole. This matches the ffmpeg
+        // export, which composites the clipped stream over the pristine
+        // mainVideo split. So a circle mask over an overlay reads as "the
+        // overlay is cut to the circle, the base video keeps playing around it".
         const b = getLayerPx(layer);
         const r = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
         // 1) Snapshot the current composition (everything below the mask).
@@ -2963,11 +3016,23 @@ function Editor({ state, setState }) {
         const tctx = tmp.getContext('2d');
         tctx.clearRect(0, 0, W, H);
         try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-        // 2) Wipe the main canvas back to bg colour.
+        // 2) Rebuild the OUTSIDE-shape backdrop = bgColor + the main video base
+        //    only (the lower layer), so masked overlays read as cookie-cut over
+        //    the underlying video instead of over a black hole.
         ctx.save();
         ctx.fillStyle = bgColor || '#000000';
         ctx.fillRect(0, 0, W, H);
-        // 3) Re-draw the snapshot clipped by the shape.
+        const mv = layers.find(l => l.type === 'mainVideo');
+        if (mv && currentTime >= videoStart && currentTime <= videoEnd) {
+          const vid = mv.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current;
+          if (vid && vid.readyState >= 2) {
+            const mb = getLayerPx(mv);
+            try { ctx.drawImage(vid, mb.x, mb.y, mb.w, mb.h); } catch(e) {}
+          }
+        }
+        ctx.restore();
+        // 3) Re-draw the full composition clipped by the shape on top.
+        ctx.save();
         ctx.beginPath();
         if (layer.shape === 'circle') {
           ctx.ellipse(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, 0, 0, Math.PI * 2);
@@ -3551,21 +3616,7 @@ function Editor({ state, setState }) {
           {/* Playback bar */}
           <div className="ed-playback">
             <button className="ed-pb-btn ed-pb-play" onClick={togglePlay}>{playing ? '⏸' : '▶'}</button>
-            <div className="ed-scrub" onPointerDown={e => {
-              e.preventDefault();
-              pausePlayback();
-              const r = e.currentTarget.getBoundingClientRect();
-              const seek = (ev) => {
-                let t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
-                t = snapTime(t, ev.shiftKey);
-                seekTo(t);
-              };
-              seek(e);
-              const move = (ev) => seek(ev);
-              const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
-              window.addEventListener('pointermove', move);
-              window.addEventListener('pointerup', up);
-            }}>
+            <div className="ed-scrub" onPointerDown={scrubPointerDown}>
               <div className="ed-scrub-fill" style={{ width:pct(currentTime) }} />
               <div className="ed-scrub-head" style={{ left:pct(currentTime) }} />
             </div>
@@ -3574,7 +3625,33 @@ function Editor({ state, setState }) {
             <input className="ed-dur-inp" data-onb="duration" type="text" inputMode="decimal" value={durStr} title="Длительность, сек"
               onChange={e=>setDurStr(e.target.value)} onBlur={commitDuration} onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
             <span className="ed-time-unit">с</span>
+            <button className="ed-pb-btn ed-pb-fs" onClick={()=>setPreviewFullscreen(true)} title="Полный экран (предпросмотр)">⛶</button>
           </div>
+
+          {/* Fullscreen preview overlay — a second canvas painted by the same
+              render loop, shown over everything and pushed into real OS
+              fullscreen. ESC or the ✕ button exits. */}
+          {previewFullscreen && (
+            <div ref={fsOverlayRef} className="ed-fs-overlay"
+              style={{ position:'fixed', inset:0, zIndex:9999, background:'#000', display:'flex', flexDirection:'column' }}>
+              <div style={{ flex:'1 1 auto', display:'flex', alignItems:'center', justifyContent:'center', minHeight:0, overflow:'hidden' }}>
+                <canvas ref={fsCanvasRef}
+                  style={{ maxWidth:'100%', maxHeight:'100%', aspectRatio:`${outWidth}/${outHeight}`, display:'block' }} />
+              </div>
+              <div className="ed-playback ed-playback-fs"
+                style={{ flex:'0 0 auto', display:'flex', alignItems:'center', gap:'10px', padding:'10px 16px', background:'rgba(20,20,22,.92)' }}>
+                <button className="ed-pb-btn ed-pb-play" onClick={togglePlay}>{playing ? '⏸' : '▶'}</button>
+                <div className="ed-scrub" style={{ flex:'1 1 auto' }} onPointerDown={scrubPointerDown}>
+                  <div className="ed-scrub-fill" style={{ width:pct(currentTime) }} />
+                  <div className="ed-scrub-head" style={{ left:pct(currentTime) }} />
+                </div>
+                <span className="ed-time">{fmt(currentTime)}</span>
+                <span className="ed-time-sep">/</span>
+                <span className="ed-time">{fmt(dur)}</span>
+                <button className="ed-pb-btn ed-pb-fs" onClick={()=>setPreviewFullscreen(false)} title="Выйти (Esc)">✕</button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Properties panel */}
