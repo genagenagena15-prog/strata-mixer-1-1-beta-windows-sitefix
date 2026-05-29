@@ -61,7 +61,8 @@
     "mac": {
       "target": "dmg",
       "icon": "assets/strata_mixer_v1_2_4.icns",
-      "category": "public.app-category.video"
+      "category": "public.app-category.video",
+      "x64ArchFiles": "**/ffmpeg-darwin-*"
     },
     "fileAssociations": [
       {

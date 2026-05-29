@@ -43,10 +43,11 @@ function start(version, pollOpts, opts = {}) {
   state.version = version;
   state.startedAt = Date.now();
   pollConfig = pollOpts;
-  // Auto-recovery only enabled when called from release.cjs (the full release
-  // flow). Standalone monitor mode leaves failures alone so the user can
-  // inspect logs in peace without anything being auto-pushed.
-  autoRecover = !!opts.autoRecover;
+  // Auto-recovery is enabled by default — the dashboard attempts to fix
+  // known failures (npm lockfile sync, transient CI flakes) without
+  // bothering the user. Pass { autoRecover: false } only for diagnostic
+  // monitor sessions where you explicitly want to inspect failures by hand.
+  autoRecover = opts.autoRecover !== false;
 
   serverHandle = http.createServer((req, res) => {
     if (req.url === '/' || req.url === '/index.html') {
