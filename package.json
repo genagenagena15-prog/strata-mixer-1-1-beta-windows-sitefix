@@ -62,7 +62,7 @@
       "target": "dmg",
       "icon": "assets/strata_mixer_v1_2_4.icns",
       "category": "public.app-category.video",
-      "x64ArchFiles": "**/ffmpeg-darwin-*"
+      "x64ArchFiles": "**/{ffmpeg-darwin-*,ffmpeg-static/**}"
     },
     "fileAssociations": [
       {
