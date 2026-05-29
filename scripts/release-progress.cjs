@@ -18,11 +18,16 @@ const path = require('path');
 
 const PORT = 8765;
 const ROOT = path.resolve(__dirname, '..');
-const MAX_RECOVERY = 2;
+// Generous cap — auto-recovery is allowed to keep trying when each failure
+// is a DIFFERENT error (e.g. fix one issue, hit another, fix that, etc.).
+// The "same error twice in a row" guard below stops infinite loops when a
+// fix actually didn't work, so this number rarely gets reached in practice.
+const MAX_RECOVERY = 5;
 
 let recoveryAttempts = 0;
 let autoRecover = false;
 let recoveryInFlight = false;
+let lastFailureSignature = ''; // step name + first error line — to detect repeated failures
 
 let state = {
   version: '',
@@ -168,10 +173,14 @@ async function pollMacCI() {
           if (failed) failedStepName = failed.name;
         } catch {}
 
-        // Try auto-recovery first if enabled (only when invoked from
-        // release.cjs). Recovery handles known transient failures + flaky CI.
-        if (autoRecover && !recoveryInFlight && recoveryAttempts < MAX_RECOVERY) {
+        // Try auto-recovery first if enabled. Stops if:
+        //   (a) MAX_RECOVERY attempts have happened, OR
+        //   (b) Same error signature 2 times in a row — fix didn't work.
+        const signature = failedStepName + '|' + (run.id ? '' : '');
+        const sameAsLast = lastFailureSignature && lastFailureSignature === signature;
+        if (autoRecover && !recoveryInFlight && recoveryAttempts < MAX_RECOVERY && !sameAsLast) {
           recoveryInFlight = true;
+          lastFailureSignature = signature;
           const fix = await attemptRecovery(run, failedStepName);
           recoveryInFlight = false;
           if (fix.ok) {
@@ -188,6 +197,16 @@ async function pollMacCI() {
           set('mac', {
             status: 'failed',
             detail: `Авто-фикс не помог: ${fix.reason}. Упал шаг: "${failedStepName}"`,
+            percent: 100,
+            url: runUrl,
+          });
+          shutdownIfDone();
+          return;
+        }
+        if (sameAsLast) {
+          set('mac', {
+            status: 'failed',
+            detail: `Та же ошибка 2 раза подряд (шаг: "${failedStepName}") — авто-фикс не помог. Нужна ручная починка.`,
             percent: 100,
             url: runUrl,
           });
