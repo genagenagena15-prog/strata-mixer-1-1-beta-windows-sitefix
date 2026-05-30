@@ -8,6 +8,11 @@ contextBridge.exposeInMainWorld('strata', {
   pickFolder: () => ipcRenderer.invoke('folder:pick'),
   pickSaveAs: (defaultName, format) => ipcRenderer.invoke('saveas:pick', defaultName, format),
   saveProject: (data) => ipcRenderer.invoke('project:save', data),
+  onSaveProgress: (callback) => {
+    const handler = (_event, info) => callback(info);
+    ipcRenderer.on('project:save-progress', handler);
+    return () => ipcRenderer.removeListener('project:save-progress', handler);
+  },
   openProject: () => ipcRenderer.invoke('project:open'),
   onProjectOpen: (callback) => {
     const handler = (_event, data) => callback(data);
@@ -88,6 +93,7 @@ contextBridge.exposeInMainWorld('strata', {
     getState: () => ipcRenderer.invoke('update:getState'),
     check: () => ipcRenderer.invoke('update:check'),
     install: () => ipcRenderer.invoke('update:install'),
+    rollback: () => ipcRenderer.invoke('update:rollback'),
     onState: (callback) => {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on('update:state', handler);
@@ -101,6 +107,31 @@ contextBridge.exposeInMainWorld('strata', {
       const handler = (_event, data) => callback(data);
       ipcRenderer.on('notifications:data', handler);
       return () => ipcRenderer.removeListener('notifications:data', handler);
+    }
+  },
+  // ── Auto-subtitles (Groq Whisper) ─────────────────────────────────────
+  // Renderer fires `generate(state)` with the same payload shape video:edit
+  // uses (file/layers/videoStart/.../totalDuration), and listens to
+  // onProgress for { phase: 'extract'|'upload'|'pack'|'done'|'error', percent }
+  // events while it runs. Final result lands as { ok, segments, fullText }.
+  subtitles: {
+    generate: (payload) => ipcRenderer.invoke('subtitles:generate', payload),
+    onProgress: (callback) => {
+      const handler = (_event, info) => callback(info);
+      ipcRenderer.on('subtitles:progress', handler);
+      return () => ipcRenderer.removeListener('subtitles:progress', handler);
+    }
+  },
+  // ── Standalone speech-to-text ─────────────────────────────────────────
+  // Transcribe ANY picked video/audio file (independent of the editor
+  // project) to plain text via the same Groq Whisper pipeline. Returns
+  // { ok, fullText, segments }; onProgress streams { phase, percent } ticks.
+  transcribe: {
+    file: (payload) => ipcRenderer.invoke('transcribe:file', payload),
+    onProgress: (callback) => {
+      const handler = (_event, info) => callback(info);
+      ipcRenderer.on('transcribe:progress', handler);
+      return () => ipcRenderer.removeListener('transcribe:progress', handler);
     }
   }
 });

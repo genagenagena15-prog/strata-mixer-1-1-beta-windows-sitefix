@@ -16,3 +16,8 @@ installer-output/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# test scratch (this session)
+_subtest/
+NUL
+NUL.css

@@ -91,6 +91,10 @@ const htmlFiles = [
   path.join(SITE_DIR, 'download', 'index.html'),
 ];
 
+// Release date stamped into the "Что нового" panel header (DD.MM.YYYY).
+const _now = new Date();
+const releaseDate = `${String(_now.getDate()).padStart(2, '0')}.${String(_now.getMonth() + 1).padStart(2, '0')}.${_now.getFullYear()}`;
+
 let touched = 0;
 for (const f of htmlFiles) {
   if (!fs.existsSync(f)) continue;
@@ -100,11 +104,16 @@ for (const f of htmlFiles) {
   src = src.replace(/StrataMixer-\d+\.\d+\.\d+(-arm64)?\.exe/g, `StrataMixer-${version}.exe`);
   src = src.replace(/StrataMixer-\d+\.\d+\.\d+-arm64\.dmg/g, `StrataMixer-${version}-arm64.dmg`);
   src = src.replace(/StrataMixer-\d+\.\d+\.\d+\.dmg/g, `StrataMixer-${version}.dmg`);
-  // Display version. Matches BOTH "v1.2.3" (three-part) AND "v1.2"
-  // (two-part) since the site uses the short form in headers/FAQ. Replace
-  // with the new full version.
-  src = src.replace(/\bv\d+\.\d+\.\d+\b/g, `v${version}`);
-  src = src.replace(/\bv\d+\.\d+\b/g, `v${version}`);
+  // Display version. Matches a "v" followed by TWO OR MORE dot-separated
+  // numbers, of ANY length — "v1.2", "v1.2.3", and even a previously-mangled
+  // "v1.2.7.7.6" — and replaces the WHOLE token with the clean version.
+  // (The old code ran a 3-part regex then a 2-part regex; the 2-part one
+  // re-matched "v1.2" inside the just-written "v1.2.7" and appended the
+  // trailing ".7", so every release compounded the version into garbage like
+  // v1.2.7.7.6. A single greedy match fixes that AND repairs old mangling.)
+  src = src.replace(/\bv\d+(?:\.\d+)+\b/g, `v${version}`);
+  // Refresh the faint release date in the "Что нового" panel header.
+  src = src.replace(/(<span class="rn-date">)[^<]*(<\/span>)/g, `$1${releaseDate}$2`);
   if (src !== before) {
     fs.writeFileSync(f, src, 'utf8');
     touched++;
@@ -120,18 +129,34 @@ if (notes) {
   const downloadHtml = path.join(SITE_DIR, 'download', 'index.html');
   if (fs.existsSync(downloadHtml)) {
     let src = fs.readFileSync(downloadHtml, 'utf8');
-    // Convert notes to HTML — newlines become <br>, escape < > &
-    const escaped = notes
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/\r?\n\r?\n/g, '</p><p>').replace(/\r?\n/g, '<br>');
-    const notesBlock = `<p>${escaped}</p>`;
-    const re = /(<div class="release-notes[^"]*"[^>]*>)([\s\S]*?)(<\/div>)/;
-    if (re.test(src)) {
-      src = src.replace(re, `$1${notesBlock}$3`);
+    // Build <li> items from the notes. ONLY lines starting with a bullet
+    // marker ("• ", "- ", "* ") are turned into bullets — the marker is
+    // stripped so the <ul>'s own disc doesn't duplicate it. Plain intro lines
+    // (e.g. "В этом обновлении:") are dropped because the <h3> "Что нового"
+    // heading already serves that role. **bold** → <strong>, `code` → <code>.
+    const liItems = notes
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => /^[•\-*]\s+/.test(l))
+      .map((l) => {
+        let t = l.replace(/^[•\-*]\s+/, '');
+        t = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+        return `      <li>${t}</li>`;
+      })
+      .join('\n');
+    // Target the <ul> that directly follows the release-version div (the
+    // latest release block) and swap ONLY its contents. The old regex grabbed
+    // the first </div> inside the nested .release-notes container, which would
+    // have corrupted the markup — that's why notes never landed before.
+    const reList = /(<div class="release-version">[^<]*<\/div>\s*<ul>)[\s\S]*?(<\/ul>)/;
+    if (reList.test(src)) {
+      src = src.replace(reList, `$1\n${liItems}\n    $2`);
       fs.writeFileSync(downloadHtml, src, 'utf8');
       console.log('✏️  download/index.html — patch notes inserted');
     } else {
-      console.log('   (no .release-notes container found, skipped notes injection)');
+      console.log('   (release-version <ul> block not found, skipped notes injection)');
     }
   }
 }

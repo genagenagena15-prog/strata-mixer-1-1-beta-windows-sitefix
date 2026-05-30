@@ -6,6 +6,18 @@ const { spawn } = require('child_process');
 const archiver = require('archiver');
 const extractZip = require('extract-zip');
 
+// Volume taper for exports: matches the renderer's volumeCurve. Piecewise —
+// fine quiet control below 50 % (5 % ≈ −46 dB, 1 % ≈ −74 dB), linear from
+// 50 – 100 %, cubic boost above 100 %. The master loudnorm downstream keeps
+// the overall export at -16 LUFS so quieting one layer doesn't drop the
+// whole mix's perceived level.
+function volumeCurve(percent) {
+  const v = Math.max(0, Number(percent) || 0) / 100;
+  if (v <= 0.5) return 2 * v * v;
+  if (v <= 1) return v;
+  return v * v * v;
+}
+
 let mainWindow = null;
 let splashWindow = null;
 let splashShownAt = 0;
@@ -809,6 +821,80 @@ ipcMain.handle('update:install', async () => {
   try { autoUpdater.quitAndInstall(true, true); } catch {}
   return true;
 });
+// Roll back to the previous published version: find the release immediately
+// older than the one running, download its installer and run it (Windows) or
+// open the DMG (macOS). This is the "Скачать предыдущую версию" action.
+const RELEASES_LIST_API = 'https://api.github.com/repos/genagenagena15-prog/strata-mixer-releases/releases?per_page=40';
+ipcMain.handle('update:rollback', async () => {
+  try {
+    const res = await fetch(`${RELEASES_LIST_API}&t=${Date.now()}`, {
+      cache: 'no-store',
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const list = await res.json();
+    // Releases strictly older than the running version, newest-first.
+    const older = (Array.isArray(list) ? list : [])
+      .map((r) => ({ r, ver: String(r.tag_name || '').replace(/^v/, '').trim() }))
+      .filter((x) => /^\d+\.\d+\.\d+/.test(x.ver) && isRemoteNewerVersion(CURRENT_APP_VERSION, x.ver))
+      .sort((a, b) => (isRemoteNewerVersion(a.ver, b.ver) ? -1 : 1));
+    if (!older.length) {
+      await dialog.showMessageBox(mainWindow, { type: 'info', buttons: ['ОК'], title: 'Откат версии', message: 'Предыдущая версия не найдена', detail: 'На сервере нет релиза старше текущего.' });
+      return { ok: false, error: 'no previous release' };
+    }
+    const prev = older[0];
+    const isMac = process.platform === 'darwin';
+    const wantExt = isMac ? /\.dmg$/i : /\.exe$/i;
+    const asset = (prev.r.assets || []).find((a) => wantExt.test(a.name) && !/blockmap/i.test(a.name));
+    if (!asset) {
+      await dialog.showMessageBox(mainWindow, { type: 'error', buttons: ['ОК'], title: 'Откат версии', message: `Установщик для v${prev.ver} не найден`, detail: `Нет ${isMac ? '.dmg' : '.exe'} в релизе v${prev.ver}.` });
+      return { ok: false, error: 'no installer asset' };
+    }
+    const url = asset.browser_download_url;
+
+    // Confirm — this closes the app and runs an older installer.
+    const choice = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: [`Откатиться на v${prev.ver}`, 'Отмена'],
+      defaultId: 0, cancelId: 1, noLink: true,
+      title: 'Откат на предыдущую версию',
+      message: `Откатиться на v${prev.ver}?`,
+      detail: isMac
+        ? `Скачаем v${prev.ver} и откроем DMG — установишь вручную (перетащи в Applications).`
+        : `Программа закроется, скачается v${prev.ver} и запустится установщик. Несохранённую работу сначала сохрани.`,
+    });
+    if (choice.response !== 0) return { ok: false, canceled: true };
+
+    if (isMac) {
+      // No auto-install on Mac — download the DMG then open it.
+      const dmgPath = await downloadUpdateInstaller(url);
+      try { await shell.openPath(dmgPath); } catch { try { shell.openExternal(url); } catch {} }
+      return { ok: true, version: prev.ver };
+    }
+
+    // Windows: show the download window, fetch the installer, run it, quit.
+    createUpdateWindow({ displayVersion: `v${prev.ver}` });
+    setUpdateWindowStatus({ title: `Откат на v${prev.ver}`, detail: 'Скачиваем предыдущую версию. После загрузки запустится установщик.', status: 'Подключаемся...', percent: 0 });
+    const installerPath = await downloadUpdateInstaller(url, (percent, downloaded, total) => {
+      const sizeText = total ? `${formatDownloadSize(downloaded)} / ${formatDownloadSize(total)}` : formatDownloadSize(downloaded);
+      setUpdateWindowStatus({ title: `Откат на v${prev.ver}`, detail: 'Скачиваем предыдущую версию. После загрузки запустится установщик.', status: sizeText, percent });
+    });
+    setUpdateWindowStatus({ title: 'Загрузка завершена', detail: 'Запускаем установщик. Strata Mixer закроется.', status: 'Готово', percent: 100 });
+    await new Promise((r) => setTimeout(r, 800));
+    const child = spawn(installerPath, [], { detached: true, stdio: 'ignore', windowsHide: false });
+    child.unref();
+    updateWindowCanClose = true;
+    isQuitting = true;
+    app.quit();
+    return { ok: true, version: prev.ver };
+  } catch (e) {
+    try {
+      await dialog.showMessageBox(mainWindow, { type: 'error', buttons: ['ОК'], title: 'Откат версии', message: 'Не удалось скачать предыдущую версию', detail: String(e?.message || e) });
+    } catch {}
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
 ipcMain.handle('notifications:get', () => notificationsCache);
 ipcMain.handle('notifications:refresh', async () => { await fetchNotifications(); return notificationsCache; });
 
@@ -995,7 +1081,7 @@ function collectProjectMedia(state) {
 // Build the ZIP. Returns a promise that resolves when the archive is fully
 // flushed to disk. Streams files in (no whole-file buffering) so multi-GB
 // projects don't blow up memory.
-function bundleProjectToZip(payload, filePath) {
+function bundleProjectToZip(payload, filePath, onProgress) {
   return new Promise((resolve, reject) => {
     const state = payload && payload.state ? payload.state : {};
     const media = collectProjectMedia(state);
@@ -1005,6 +1091,17 @@ function bundleProjectToZip(payload, filePath) {
     media.forEach((abs, i) => {
       pathMap.set(abs, `media/${i}_${sanitizeMediaName(abs)}`);
     });
+
+    // Pre-compute total bytes for a stable progress bar (sum of media file
+    // sizes; the JSON entry is negligible). Failures fall back to 0 (then
+    // the bar just runs on archiver's own byte count).
+    let totalBytes = 0;
+    for (const abs of media) {
+      try { totalBytes += fs.statSync(abs).size; } catch {}
+    }
+    const emit = (extra) => {
+      try { onProgress && onProgress(extra); } catch {}
+    };
 
     // Deep-ish clone of state with media paths rewritten to the archived names.
     // Missing files keep their original path (they'll flag as _missing on open).
@@ -1027,12 +1124,32 @@ function bundleProjectToZip(payload, filePath) {
     const output = fs.createWriteStream(filePath);
     const archive = archiver('zip', { store: true }); // store: media is already compressed
     let settled = false;
-    const done = (err) => { if (settled) return; settled = true; err ? reject(err) : resolve({ ok: true, path: filePath, mediaCount: media.length }); };
+    const done = (err) => {
+      if (settled) return; settled = true;
+      if (err) { reject(err); return; }
+      emit({ phase: 'done', percent: 100, processed: totalBytes, total: totalBytes, fileName: '' });
+      resolve({ ok: true, path: filePath, mediaCount: media.length });
+    };
 
     output.on('close', () => done());
     output.on('error', done);
     archive.on('error', done);
     archive.on('warning', (w) => { if (w.code !== 'ENOENT') done(w); });
+    // Per-entry add (file name shown in the UI).
+    archive.on('entry', (entry) => {
+      const name = entry?.name || '';
+      if (!/^media\//.test(name)) return; // skip the project.json entry
+      emit({ phase: 'add', fileName: name.replace(/^media\/\d+_/, '') });
+    });
+    // Byte-level progress (drives the percent number).
+    archive.on('progress', (p) => {
+      const processed = p?.fs?.processedBytes || 0;
+      const total = totalBytes || p?.fs?.totalBytes || 0;
+      const percent = total > 0 ? Math.min(99, Math.round((processed / total) * 100)) : 0;
+      emit({ phase: 'progress', percent, processed, total });
+    });
+
+    emit({ phase: 'start', percent: 0, processed: 0, total: totalBytes, mediaCount: media.length });
 
     archive.pipe(output);
     archive.append(JSON.stringify(wrapper, null, 2), { name: 'project.json' });
@@ -1112,7 +1229,10 @@ ipcMain.handle('project:save', async (_event, projectData) => {
     const { suggestedName, ...payload } = projectData || {};
     // Always bundle: write a self-contained ZIP with all media inside, so the
     // .smproj can be forwarded and opened 1:1 on another machine.
-    await bundleProjectToZip(payload, result.filePath);
+    // Stream progress events to the renderer for the save modal.
+    await bundleProjectToZip(payload, result.filePath, (info) => {
+      try { mainWindow?.webContents?.send('project:save-progress', info); } catch {}
+    });
     return { ok: true, path: result.filePath };
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
@@ -1492,8 +1612,12 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     // the per-call cleanup (e.g. when a sync error aborted the filter-graph
     // builder before spawn).
     tmpFiles.forEach(f => liveTmpFiles.add(f));
+    // Per-render isolated font dirs (one font file each) — see subtitle loop.
+    // Cleaned up recursively alongside the temp files.
+    const tmpFontDirs = [];
     const cleanupTmps = () => {
       tmpFiles.forEach(f => { try { fs.unlinkSync(f); } catch {} liveTmpFiles.delete(f); });
+      tmpFontDirs.forEach(d => { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} });
     };
     try {
     const filterParts = [];
@@ -1560,9 +1684,16 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const mvH = Math.max(2, Math.round(mvW / mvAspect));
         const mvX = Math.round(((mv.x == null ? 50 : mv.x) / 100) * evenW - mvW / 2);
         const mvY = Math.round(((mv.y == null ? 50 : mv.y) / 100) * evenH - mvH / 2);
-        filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[smbg]`);
-        filterParts.push(`[0:v]trim=start=${mvSrc.toFixed(3)}:end=${mvSrcEnd},setpts=(PTS-STARTPTS)/${mvSp}+${videoStart}/TB,scale=${mvW}:${mvH},setsar=1${mvCcPart}[smmv]`);
-        filterParts.push(`[smbg][smmv]overlay=${mvX}:${mvY}:eof_action=pass:enable='between(t,${videoStart},${videoEnd})'[vscaled]`);
+        if (mvLayer.hidden) {
+          // Hidden main video: don't draw its picture. The base canvas is just
+          // bgColor. [0:a] stays untouched so the audio block can still mix it
+          // (audio follows `muted`, not `hidden`). [0:v] simply goes unused.
+          filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[vscaled]`);
+        } else {
+          filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[smbg]`);
+          filterParts.push(`[0:v]trim=start=${mvSrc.toFixed(3)}:end=${mvSrcEnd},setpts=(PTS-STARTPTS)/${mvSp}+${videoStart}/TB,scale=${mvW}:${mvH},setsar=1${mvCcPart}[smmv]`);
+          filterParts.push(`[smbg][smmv]overlay=${mvX}:${mvY}:eof_action=pass:enable='between(t,${videoStart},${videoEnd})'[vscaled]`);
+        }
       } else {
         // No "main video" — the bottom-most visible layer in the renderer was
         // an image (or there are no video overlays). Start with a synthetic
@@ -1579,7 +1710,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       // bgColor). Without this, during the mask's enable window the canvas
       // outside the shape was always bgColor — even where the mainVideo
       // (or any earlier non-overlay content) should have kept playing.
-      const totalMaskCount = (layers || []).filter(l => l.type === 'mask').length;
+      // Hidden masks are skipped visually below, so they must NOT be counted
+      // here — otherwise `split=N` produces an unconsumed [vbaseMask] pad and
+      // ffmpeg fails with "Output pad not connected".
+      const totalMaskCount = (layers || []).filter(l => l.type === 'mask' && !l.hidden).length;
       const baseMaskLabels = [];
       if (totalMaskCount > 0) {
         const labels = ['[vscaledSeq]'];
@@ -1673,8 +1807,36 @@ ipcMain.handle('video:edit', async (_event, payload) => {
             filterParts.push(`[trS${i}]gblur=sigma=${blurSigma.toFixed(2)},curves=all='0/0 0.5/0.65 1/1',eq=saturation=1.4,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1,fade=t=out:st=${(ts+halfSpan).toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1[trBlur${i}]`);
             filterParts.push(`[trM${i}][trBlur${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
             videoStream = `[trDone${i}]`;
+          } else if (kind === 'seamzoom') {
+            // Seamless zoom: per-frame scale ramps 1× → max → 1× via a sine.
+            // Implemented with `zoompan` (the one filter whose `z` accepts a
+            // time-based expression for video input). `tblend` averages adjacent
+            // frames → free radial motion blur from the fast zoom. `rgbashift`
+            // gives chromatic aberration. A short white flash centred on the
+            // peak hides the actual cut between the two clips.
+            const scaleMax = Math.max(1.5, Number(layer.scale) || 4.5);
+            const rgb = Math.max(0, Math.round(Number(layer.rgb) || 9));
+            const flashMax = Math.max(0, Math.min(1, layer.flash ?? 0.28));
+            const K = (scaleMax - 1).toFixed(3);
+            const env = `sin((time-${ts})/${span}*${Math.PI.toFixed(5)})`;
+            // max(1,...) clamps to no-zoom outside the window (zoompan's z must
+            // be ≥ 1; outside the enable, the overlay hides this stream anyway).
+            const zExpr = `max(1,1+${K}*${env})`;
+            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+            filterParts.push(`[trS${i}]zoompan=z='${zExpr}':d=1:s=${evenW}x${evenH}:fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',rgbashift=rh=${rgb}:bh=${-rgb}:gh=0,tblend=all_mode=average[trSZ${i}]`);
+            filterParts.push(`[trM${i}][trSZ${i}]overlay=0:0:${enableExpr}[trAfterSZ${i}]`);
+            videoStream = `[trAfterSZ${i}]`;
+            // Brief white flash centred on the peak (~25% of span).
+            const flashSpan = Math.max(0.05, span * 0.25);
+            const flashStart = ts + (span - flashSpan) / 2;
+            const fIn = flashSpan * 0.4, fOut = flashSpan - fIn;
+            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${flashSpan.toFixed(3)},format=rgba,fade=t=in:st=0:d=${fIn.toFixed(3)}:alpha=1,fade=t=out:st=${fIn.toFixed(3)}:d=${fOut.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${flashStart.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trSZFlash${i}]`);
+            filterParts.push(`${videoStream}[trSZFlash${i}]overlay=0:0:enable='between(t,${flashStart.toFixed(3)},${(flashStart + flashSpan).toFixed(3)})'[trDone${i}]`);
+            videoStream = `[trDone${i}]`;
           }
         } else if (layer.type === 'mask') {
+          // Hidden layer → no audio for masks, so skip its visual entirely.
+          if (layer.hidden) return;
           // Clipping mask: inside its time window, the canvas shows bgColor
           // everywhere OUTSIDE the chosen shape and the previous composition
           // INSIDE the shape. Outside the time window, the previous composition
@@ -1729,6 +1891,8 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           filterParts.push(`[morig${i}][mmasked${i}]overlay=0:0:${enable}[vmask${i}]`);
           videoStream = `[vmask${i}]`;
         } else if (layer.type === 'blur') {
+          // Hidden layer → blur has no audio, skip its visual entirely.
+          if (layer.hidden) return;
           const i = blurCount++;
           // Centre-based coordinates matching getLayerPx in the preview
           const bw = Math.max(2, Math.round((layer.width / 100) * evenW));
@@ -1743,6 +1907,9 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           filterParts.push(`[vb${i}main][vb${i}blurred]overlay=${x}:${y}:${enable}[vblur${i}]`);
           videoStream = `[vblur${i}]`;
         } else if (layer.type === 'image') {
+          // Hidden layer → image has no audio, skip it entirely (don't even
+          // register an ffmpeg input — nothing references it).
+          if (layer.hidden) return;
           const i = imgCount++;
           inputArgs.push('-i', layer.file);
           const idx = inputIdx++;
@@ -1762,6 +1929,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           inputArgs.push('-i', layer.file);
           const idx = inputIdx++;
           videoOverlayInputs.push({ idx, layer });
+          // Hidden layer: KEEP the input + videoOverlayInputs entry (so its
+          // audio can still be mixed via [idx:a]), but DON'T draw its picture.
+          // videoStream passes through unchanged — no [vmcut] is produced.
+          if (layer.hidden) return;
           const mw = Math.max(2, Math.round((layer.width / 100) * evenW));
           const mh = Math.max(2, Math.round((layer.height / 100) * evenH));
           const cxPx = Math.round((layer.x / 100) * evenW);
@@ -1844,6 +2015,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           inputArgs.push('-i', layer.file);
           const idx = inputIdx++;
           videoOverlayInputs.push({ idx, layer });
+          // Hidden layer: KEEP the input + videoOverlayInputs entry (so its
+          // audio can still be mixed via [idx:a]), but DON'T draw its picture.
+          // videoStream passes through unchanged — no [vvidov] is produced.
+          if (layer.hidden) return;
           const x = `(W*${layer.x / 100}-w/2)`;
           const y = `(H*${layer.y / 100}-h/2)`;
           const scaleW = Math.max(2, Math.round((layer.size / 100) * evenW));
@@ -1872,6 +2047,8 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           filterParts.push(`${videoStream}[vov${i}]overlay=${x}:${y}:${enable}[vvidov${i}]`);
           videoStream = `[vvidov${i}]`;
         } else if (layer.type === 'text') {
+          // Hidden layer → text has no audio, skip its visual entirely.
+          if (layer.hidden) return;
           if (!layer.text) return;
           const i = txtCount++;
           const hexColor = '0x' + (layer.color || '#ffffff').replace('#', '');
@@ -1888,7 +2065,21 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           pendingTextWrites.push(fs.promises.writeFile(tmpTxt, layer.text || '', 'utf8').catch(() => {}));
           let fontPart = '';
           if (layer.fontFile && fs.existsSync(layer.fontFile)) {
-            fontPart = `:fontfile='${ffPath(layer.fontFile)}'`;
+            // GUARANTEE preview==export font: drawtext/freetype silently fails to
+            // open fonts whose path has non-ASCII chars or spaces (e.g.
+            // C:\Users\Гена\Desktop\Project 1\…) and falls back to a default face
+            // — that's the "render uses a different font" bug. Mirror the subtitle
+            // pipeline: copy the EXACT file the preview loaded into a clean ASCII
+            // temp path, then point drawtext at that copy.
+            let fontForDraw = layer.fontFile;
+            try {
+              const dest = path.join(os.tmpdir(), `smtxtfont_${Date.now()}_${i}${path.extname(layer.fontFile) || '.ttf'}`);
+              fs.copyFileSync(layer.fontFile, dest);
+              tmpFiles.push(dest);
+              liveTmpFiles.add(dest);
+              fontForDraw = dest;
+            } catch {}
+            fontPart = `:fontfile='${ffPath(fontForDraw)}'`;
           } else {
             fontPart = drawtextFontOption();
           }
@@ -1920,11 +2111,68 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         filterParts.push(`${videoStream}${parts.join(',')}[vfaded]`);
         videoStream = '[vfaded]';
       }
+
+      // ── Subtitles burn-in (ASS karaoke) ──────────────────────────────
+      // Each subtitle layer becomes one ASS file with per-word colored
+      // events that mirror the live CapCut-style highlight in the preview.
+      // Burned in via the `ass=` filter — the right tool for word karaoke.
+      const subtitleLayers = (layers || []).filter(l => l && l.type === 'subtitles' && !l.hidden && Array.isArray(l.segments) && l.segments.length);
+      for (let si = 0; si < subtitleLayers.length; si++) {
+        const subL = subtitleLayers[si];
+        try {
+          // Guarantee preview==export font: patch the picked font file's family
+          // name to a UNIQUE token, drop the patched copy in an isolated dir, and
+          // tell libass to use that token. fontconfig then has exactly one
+          // matchable font — no sibling weight, no system-installed copy, and no
+          // fuzzy match can hijack it (the old bug: "Arista Pro Thin" rendered as
+          // Bold; "Open Sans" picked the Bold file; an installed system copy won).
+          let subFontDir = '';
+          let fontToken = null;
+          const _ff = subL?.style?.fontFile;
+          if (_ff) {
+            try {
+              if (fs.existsSync(_ff)) {
+                const isoDir = path.join(os.tmpdir(), `smfont_${Date.now()}_${si}`);
+                fs.mkdirSync(isoDir, { recursive: true });
+                const token = `StrataSub${si}x${Date.now().toString(36)}`;
+                const dest = path.join(isoDir, 'font' + path.extname(_ff));
+                if (patchFontFamilyToToken(_ff, dest, token)) {
+                  fontToken = token;          // Style will reference this token
+                } else {
+                  fs.copyFileSync(_ff, dest); // patch failed → at least isolate
+                }
+                subFontDir = isoDir;
+                tmpFontDirs.push(isoDir);
+              } else {
+                subFontDir = path.dirname(_ff);
+              }
+            } catch {
+              subFontDir = path.dirname(_ff);  // fall back to the whole folder
+            }
+          }
+          const assText = buildAssForSubtitles(subL, evenW, evenH, fontToken);
+          const assPath = path.join(os.tmpdir(), `smass_${Date.now()}_${si}.ass`);
+          fs.writeFileSync(assPath, assText, 'utf8');
+          tmpFiles.push(assPath);
+          liveTmpFiles.add(assPath);
+          // ffmpeg's `ass=` filter takes a path with the same escaping rules as
+          // `subtitles=`. ffPath() handles Windows backslashes + drive colons.
+          const assArg = subFontDir
+            ? `ass='${ffPath(assPath)}':fontsdir='${ffPath(subFontDir)}'`
+            : `ass='${ffPath(assPath)}'`;
+          filterParts.push(`${videoStream}${assArg}[vsubs${si}]`);
+          videoStream = `[vsubs${si}]`;
+        } catch (e) {
+          console.warn('[strata] subtitle render skipped:', e?.message || e);
+        }
+      }
     }
 
     // Audio: volume on main video + optional audio file layers
+    // NOTE: audio follows `muted`, visual follows `hidden`. A `muted` audio
+    // layer is dropped from the mix even though a `hidden` one would still play.
     const mvVol = (mainVideoForFilter?.volume ?? 100);
-    const audioLayers = (layers || []).filter(l => l.type === 'audio');
+    const audioLayers = (layers || []).filter(l => l.type === 'audio' && !l.muted);
     let audioMap = '0:a?';
     // baseAudio is set by the renderer when input 0 IS an audio file (audio-only
     // project). It carries the real source/timeline split so trimming works.
@@ -1941,18 +2189,24 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     );
     if (mvVol !== 100 || audioLayers.length > 0 || videoOverlayInputs.length > 0 || baseAud || needMvAudioTrim) {
       const baseHasAudio = audioProbeMap.get(payload.file) !== false;
+      // audio follows `muted`, visual follows `hidden`: a `muted` main video /
+      // base audio still renders its visual (input [0] video) but contributes
+      // NO audio — we route input 0's audio to silence so the mix structure
+      // (and overlay/audio-layer timing) stays intact.
+      const baseMuted = !!(baseAud && payload.baseAudioMuted);
+      const mvMuted = !!(mainVideoForFilter && mainVideoForFilter.muted);
       // Base audio — for audio-only projects use baseAudio's real coordinates;
       // for video projects, use the main video's video-range (back-compat).
       // If the base file has no audio stream, synthesise silence so the filter
       // graph remains valid.
-      if (baseAud) {
+      if (baseAud && !baseMuted) {
         const baSrcStart = Math.max(0, Number(baseAud.srcStart) || 0);
         const baLen = Math.max(0.01, Number(baseAud.length) || 1);
         const baSrcEnd = baSrcStart + baLen;
         const baDelayMs = Math.round((Number(baseAud.startTime) || 0) * 1000);
-        const baVol = ((Number(baseAud.volume) || 100) / 100).toFixed(3);
+        const baVol = volumeCurve(Number(baseAud.volume) || 100).toFixed(4);
         filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}:all=1,volume=${baVol}[auMain]`);
-      } else if (mvLayer && baseHasAudio) {
+      } else if (mvLayer && baseHasAudio && !mvMuted) {
         // [0:a] is the main video's audio — only safe to use as the base mix
         // when there IS a mainVideo (input [0] is conceptually the timeline
         // base). Trim from mvLayer.srcStart for the clip duration so head-trims
@@ -1963,18 +2217,22 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
         while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
         atParts.push(`atempo=${atRem.toFixed(4)}`);
-        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${Math.round(videoStart*1000)}:all=1,volume=${(mvVol / 100).toFixed(3)}[auMain]`);
+        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${Math.round(videoStart*1000)}:all=1,volume=${volumeCurve(mvVol).toFixed(4)}[auMain]`);
       } else {
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
       }
       const mixInputs = ['[auMain]'];
       // Every overlay video carries its own audio, cut to its clip (split-aware).
+      // audio follows `muted`, visual follows `hidden`: a `muted` overlay/masked
+      // video is still rendered visually (it's in videoOverlayInputs) but its
+      // audio is excluded from the mix here.
       videoOverlayInputs.forEach(({ idx, layer }, i) => {
+        if (layer.muted) return;
         const oStart = layer.startTime || 0;
         const oEnd = Math.min(layer.endTime ?? totalDur, totalDur);
         const oLen = Math.max(0.1, oEnd - oStart);
         const oSrc = Number(layer.srcStart || 0);
-        const oVol = (layer.volume ?? 100) / 100;
+        const oVol = volumeCurve(layer.volume ?? 100);
         const oDelay = Math.round(oStart * 1000);
         const oSp = Math.max(0.1, (layer.speed || 100) / 100);
         const ovHasAudio = audioProbeMap.get(layer.file) !== false;
@@ -1988,7 +2246,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
         while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
         atParts.push(`atempo=${atRem.toFixed(4)}`);
-        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}:all=1,volume=${oVol.toFixed(3)}[auVov${i}]`);
+        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}:all=1,volume=${oVol.toFixed(4)}[auVov${i}]`);
         mixInputs.push(`[auVov${i}]`);
       });
       audioLayers.forEach((layer, i) => {
@@ -1997,10 +2255,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const aStart = layer.startTime || 0;
         const aEnd = Math.min(layer.endTime ?? totalDur, totalDur);
         const aLen = Math.max(0.1, aEnd - aStart);
-        const vol = (layer.volume ?? 100) / 100;
+        const vol = volumeCurve(layer.volume ?? 100);
         const delayMs = Math.round(aStart * 1000);
         const aSrc = Number(layer.srcStart || 0);
-        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${vol.toFixed(3)}[auLayer${i}]`);
+        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${vol.toFixed(4)}[auLayer${i}]`);
         mixInputs.push(`[auLayer${i}]`);
       });
       // Always pass the final audio through aresample to absorb tiny PTS
@@ -2009,10 +2267,16 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       // input as "ended early" → 2-sec dropout fade-out kicks in and the
       // rest of the audio disappears (the exact symptom of the cut+mask
       // + cut bug). dropout_transition=0 also disables that fade entirely.
+      // loudnorm normalizes the final mix to the streaming/broadcast standard
+      // -16 LUFS with peaks capped at -1.5 dBTP. This means "naturally quiet"
+      // sources (voice files at -40 dB, etc.) come out at a consistent loud
+      // level in every export, instead of sounding noticeably quieter than
+      // the rest of the project. Single-pass mode — fast enough for export.
+      const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
       if (mixInputs.length === 1) {
-        filterParts.push(`[auMain]aresample=async=1:first_pts=0[auFinal]`);
+        filterParts.push(`[auMain]${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
       } else {
-        filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=async=1:first_pts=0[auFinal]`);
+        filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
       }
       audioMap = '[auFinal]';
     }
@@ -2110,27 +2374,488 @@ ipcMain.handle('video:edit', async (_event, payload) => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SUBTITLES (Groq Whisper API)
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto-generated word-level subtitles via Groq's hosted whisper-large-v3.
+// Free tier is generous (~14400 transcription seconds/day). Key embedded in
+// process.env.GROQ_API_KEY — for dev set via Windows User env, for production
+// build it gets baked into the binary (the user doesn't see or manage it,
+// CapCut-style UX).
+const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
+const GROQ_MAX_FILE_BYTES = 25 * 1024 * 1024;     // Groq hard limit: 25MB
+const SUBTITLE_MAX_SECONDS = 25 * 60;             // Refuse projects > 25 min
+
+function groqApiKey() {
+  return process.env.GROQ_API_KEY || '';
+}
+
+// Build a mono 16kHz MP3 of the entire project audio mix. This is what we
+// send to Whisper — minimal size, maximum accuracy. Mirrors the audio-graph
+// logic from video:edit but drops video, volume curves and loudnorm (we want
+// the audio as natural as possible for STT; volume balance doesn't matter).
+async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
+  const ffmpeg = findFfmpeg();
+  if (!ffmpeg) throw new Error('FFmpeg не найден');
+  const { file: mainFile, videoStart = 0, videoEnd = 0, totalDuration = 0, layers = [], mainVideo, baseAudio } = payload || {};
+  const totalDur = Math.max(0.1, totalDuration);
+
+  // Probe every audio source so we don't reference a silent stream in the
+  // filter graph (which crashes ffmpeg with "Stream specifier matches no streams").
+  const audioProbeMap = new Map();
+  const probeFiles = new Set();
+  if (mainFile) probeFiles.add(mainFile);
+  for (const l of layers) {
+    if (l && l.file && (l.type === 'videoOverlay' || l.type === 'audio')) probeFiles.add(l.file);
+  }
+  await Promise.all([...probeFiles].map(async (f) => {
+    try { const p = await probeMediaInfo(ffmpeg, f); audioProbeMap.set(f, !!p.hasAudio); }
+    catch { audioProbeMap.set(f, false); }
+  }));
+
+  const inputArgs = [];
+  const filterParts = [];
+  const mixInputs = [];
+  let inputIdx = 0;
+
+  // Input 0 is always the main file (mainVideo or baseAudio source).
+  if (mainFile) {
+    inputArgs.push('-i', mainFile);
+    inputIdx = 1;
+  }
+
+  // Base audio (audio-only project: input 0 IS an audio file).
+  if (baseAudio && audioProbeMap.get(mainFile)) {
+    const baSrcStart = Math.max(0, Number(baseAudio.srcStart) || 0);
+    const baLen = Math.max(0.01, Number(baseAudio.length) || 1);
+    const baSrcEnd = baSrcStart + baLen;
+    const baDelayMs = Math.round((Number(baseAudio.startTime) || 0) * 1000);
+    filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}:all=1[auBase]`);
+    mixInputs.push('[auBase]');
+  } else if (mainVideo && audioProbeMap.get(mainFile)) {
+    // Main video's audio — trimmed + tempo-adjusted + delayed like in video:edit.
+    const mvSrc = Number(mainVideo.srcStart) || 0;
+    const mvSp = Math.max(0.1, (mainVideo.speed || 100) / 100);
+    const clipDur = Math.max(0.01, videoEnd - videoStart);
+    const mvSrcEnd = mvSrc + clipDur * mvSp;
+    const delayMs = Math.round(videoStart * 1000);
+    const atParts = [];
+    let atRem = mvSp;
+    while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
+    while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
+    atParts.push(`atempo=${atRem.toFixed(4)}`);
+    filterParts.push(`[0:a]atrim=${mvSrc.toFixed(3)}:${mvSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${delayMs}:all=1[auMain]`);
+    mixInputs.push('[auMain]');
+  }
+
+  // Video overlay audio.
+  const vovLayers = (layers || []).filter(l => l && l.type === 'videoOverlay' && l.file);
+  vovLayers.forEach((l, i) => {
+    if (!audioProbeMap.get(l.file)) return;  // silent overlay — skip
+    inputArgs.push('-i', l.file);
+    const idx = inputIdx++;
+    const oStart = l.startTime || 0;
+    const oEnd = l.endTime ?? totalDur;
+    const oLen = Math.max(0.1, oEnd - oStart);
+    const oSrc = Number(l.srcStart || 0);
+    const oSp = Math.max(0.1, (l.speed || 100) / 100);
+    const delayMs = Math.round(oStart * 1000);
+    const atParts = [];
+    let atRem = oSp;
+    while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
+    while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
+    atParts.push(`atempo=${atRem.toFixed(4)}`);
+    filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${delayMs}:all=1[auV${i}]`);
+    mixInputs.push(`[auV${i}]`);
+  });
+
+  // Pure audio layers.
+  const audLayers = (layers || []).filter(l => l && l.type === 'audio' && l.file);
+  audLayers.forEach((l, i) => {
+    if (!audioProbeMap.get(l.file)) return;
+    inputArgs.push('-i', l.file);
+    const idx = inputIdx++;
+    const aStart = l.startTime || 0;
+    const aEnd = l.endTime ?? totalDur;
+    const aLen = Math.max(0.1, aEnd - aStart);
+    const aSrc = Number(l.srcStart || 0);
+    const delayMs = Math.round(aStart * 1000);
+    filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1[auA${i}]`);
+    mixInputs.push(`[auA${i}]`);
+  });
+
+  if (mixInputs.length === 0) {
+    throw new Error('В проекте нет аудио для распознавания (все слои без звука)');
+  }
+
+  if (mixInputs.length === 1) {
+    filterParts.push(`${mixInputs[0]}aresample=async=1[afin]`);
+  } else {
+    filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=async=1[afin]`);
+  }
+
+  const args = [
+    ...inputArgs,
+    '-filter_complex', filterParts.join(';'),
+    '-map', '[afin]',
+    '-vn',
+    '-ac', '1',           // mono — Whisper prefers it
+    '-ar', '16000',       // 16kHz — Whisper's native rate (smaller file, same quality)
+    '-c:a', 'libmp3lame',
+    '-b:a', '64k',        // tiny file — keeps us well under Groq's 25MB cap
+    '-t', String(totalDur),
+    '-y', outPath,
+  ];
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpeg, args, { windowsHide: true });
+    let stderr = '';
+    proc.stderr.on('data', d => {
+      const s = d.toString();
+      stderr += s;
+      const m = s.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (m && onProgress) {
+        const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+        onProgress(Math.min(99, (t / totalDur) * 100));
+      }
+    });
+    proc.on('error', reject);
+    proc.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg код ${code}: ${stderr.slice(-300)}`));
+    });
+  });
+}
+
+// POST the mp3 to Groq's Whisper endpoint and return word-level segments.
+// Uses native fetch + FormData (Node 18+ / Electron's bundled Node). The
+// response format `verbose_json` + `timestamp_granularities[]=word` gives
+// per-word start/end timing — required for the CapCut-style highlight.
+async function transcribeWithGroq(audioPath, { language, signal } = {}) {
+  const apiKey = groqApiKey();
+  if (!apiKey) throw new Error('Groq API ключ не настроен. Свяжись с поддержкой.');
+
+  const fileData = await fs.promises.readFile(audioPath);
+  if (fileData.length > GROQ_MAX_FILE_BYTES) {
+    throw new Error('Аудио слишком большое после сжатия (>25МБ). Сократи длительность проекта.');
+  }
+
+  // Browser-compatible Blob + FormData are global in Electron's main process
+  // since Node 18 / fetch landed natively. No extra deps needed.
+  const blob = new Blob([fileData], { type: 'audio/mpeg' });
+  const form = new FormData();
+  form.append('file', blob, path.basename(audioPath));
+  form.append('model', 'whisper-large-v3');
+  form.append('response_format', 'verbose_json');
+  form.append('timestamp_granularities[]', 'word');
+  form.append('timestamp_granularities[]', 'segment');
+  // Only pin the language when the user explicitly picked one. Default ('auto'
+  // / empty) lets Whisper DETECT it — forcing the wrong language (e.g. 'ru' on
+  // Portuguese speech) makes it hallucinate a credit line instead of
+  // transcribing. Auto-detect handles ru/pt/en/es/… correctly.
+  if (language && language !== 'auto') form.append('language', language);
+  // `temperature=0` makes it deterministic — same audio → same transcript.
+  form.append('temperature', '0');
+
+  let res;
+  try {
+    res = await fetch(GROQ_TRANSCRIBE_URL, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: form,
+      signal,
+    });
+  } catch (e) {
+    throw new Error('Не удалось подключиться к Groq (нужен интернет): ' + (e.message || e));
+  }
+
+  if (!res.ok) {
+    let detail = '';
+    try { detail = await res.text(); } catch {}
+    if (res.status === 401) throw new Error('Groq API ключ недействителен (401).');
+    if (res.status === 429) throw new Error('Превышен дневной лимит Groq. Попробуй позже.');
+    throw new Error(`Groq API ошибка ${res.status}: ${detail.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  // Whisper returns { text, words: [{ word, start, end }], segments: [...] }
+  // Group words into phrases of ~5 words (or ~3.5 seconds, whichever first)
+  // for a CapCut-style display. The renderer can later split/merge these.
+  const words = Array.isArray(data.words) ? data.words.map(w => ({
+    start: Number(w.start) || 0,
+    end: Number(w.end) || 0,
+    text: String(w.word || '').trim(),
+  })).filter(w => w.text) : [];
+
+  // Per-segment quality metrics — Whisper's own signals for "this is silence /
+  // a hallucination". Used downstream to drop made-up phrases like the infamous
+  // "Субтитры сделал DimaTorzok" that the model emits on speechless audio.
+  const segments = Array.isArray(data.segments) ? data.segments.map(s => ({
+    start: Number(s.start) || 0,
+    end: Number(s.end) || 0,
+    text: String(s.text || ''),
+    noSpeech: Number(s.no_speech_prob) || 0,
+    avgLogprob: Number(s.avg_logprob) || 0,
+    compression: Number(s.compression_ratio) || 0,
+  })) : [];
+
+  return { text: String(data.text || '').trim(), words, segments, raw: data };
+}
+
+// Known Whisper "silence hallucinations" — credit lines / sign-offs baked into
+// the model's YouTube training data that it emits when the audio has NO speech.
+// These are never legitimate content in a user's short clip, so we drop them.
+const HALLUCINATION_RE = /субтитр\w*\s*(сделал|подготов\w*|создал|правил|редактир\w*|выполн\w*|by)|редактор\s+субтитр|коррект[оа]р|продолжение\s+следует|спасибо\s+за\s+(просмотр|внимание|подписку)|подпис(ывайтесь|ывайся|ка|ь)|ставьте\s+лайк|dimatorzok|игорь\s+негода|amara\.?\s*org|subtitles?\s+by|thanks?\s+for\s+watching|please\s+subscribe/i;
+
+function isHallucinatedSegment(seg) {
+  if (!seg) return false;
+  const t = String(seg.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (t && HALLUCINATION_RE.test(t)) return true;     // known credit/sign-off phrase
+  if (seg.noSpeech >= 0.6) return true;               // Whisper itself flags silence
+  if (seg.compression >= 2.4) return true;            // repetitive loop hallucination
+  if (seg.avgLogprob <= -1.0) return true;            // very low confidence
+  return false;
+}
+
+// Keep only words that fall inside a real-speech segment. Returns [] when the
+// model produced nothing but hallucinations (all segments bad) — the caller then
+// reports "no speech" instead of showing a made-up credit line as a subtitle.
+function filterHallucinatedWords(words, segments) {
+  if (!Array.isArray(words) || !words.length) return [];
+  if (!Array.isArray(segments) || !segments.length) {
+    const joined = words.map(w => w.text).join(' ');
+    return HALLUCINATION_RE.test(joined) ? [] : words;
+  }
+  const goodRanges = segments.filter(s => !isHallucinatedSegment(s)).map(s => [s.start, s.end]);
+  if (!goodRanges.length) return [];
+  return words.filter(w => {
+    const mid = ((Number(w.start) || 0) + (Number(w.end) || 0)) / 2;
+    return goodRanges.some(([a, b]) => mid >= a - 0.15 && mid <= b + 0.15);
+  });
+}
+
+// Pack a flat word stream into phrase-sized subtitle segments.
+// Rule: new segment when (a) the word starts > 0.8s after the prev one ends
+// (pause), OR (b) we'd exceed 7 words / 3.5s in the current segment.
+function packWordsToSegments(words) {
+  if (!Array.isArray(words) || words.length === 0) return [];
+  const segs = [];
+  let cur = null;
+  const MAX_WORDS = 7;
+  const MAX_SEG_DUR = 3.5;
+  const PAUSE_GAP = 0.8;
+  for (const w of words) {
+    if (!cur) {
+      cur = { startTime: w.start, endTime: w.end, words: [w] };
+      continue;
+    }
+    const gap = w.start - cur.endTime;
+    const segDur = w.end - cur.startTime;
+    if (gap > PAUSE_GAP || cur.words.length >= MAX_WORDS || segDur > MAX_SEG_DUR) {
+      segs.push(cur);
+      cur = { startTime: w.start, endTime: w.end, words: [w] };
+    } else {
+      cur.words.push(w);
+      cur.endTime = w.end;
+    }
+  }
+  if (cur) segs.push(cur);
+  // Give each segment a stable id and a denormalized text field for the editor.
+  return segs.map((s, i) => ({
+    id: 'sub_' + Date.now().toString(36) + '_' + i,
+    startTime: s.startTime,
+    endTime: s.endTime,
+    text: s.words.map(w => w.text).join(' '),
+    words: s.words,
+  }));
+}
+
+ipcMain.handle('subtitles:generate', async (event, payload) => {
+  const totalDuration = Number(payload?.totalDuration || 0);
+  if (totalDuration > SUBTITLE_MAX_SECONDS) {
+    const mins = Math.ceil(totalDuration / 60);
+    return { ok: false, error: `Проект слишком длинный (${mins} мин). Лимит — 25 минут. Обрежь или раздели на части.` };
+  }
+
+  const tmpAudio = path.join(os.tmpdir(), `smsub_${Date.now()}.mp3`);
+  liveTmpFiles.add(tmpAudio);
+  const cleanup = () => { try { fs.unlinkSync(tmpAudio); } catch {} liveTmpFiles.delete(tmpAudio); };
+
+  const emit = (info) => {
+    try { event.sender.send('subtitles:progress', info); } catch {}
+  };
+
+  try {
+    emit({ phase: 'extract', percent: 0 });
+    await extractMixedAudioForTranscription(payload, tmpAudio, (p) => {
+      // Audio extraction is ~30% of total perceived time (ffmpeg local, fast).
+      emit({ phase: 'extract', percent: Math.round(p * 0.30) });
+    });
+
+    emit({ phase: 'upload', percent: 30 });
+    const { text, words, segments: rawSegments } = await transcribeWithGroq(tmpAudio, { language: payload?.language || 'auto' });
+
+    emit({ phase: 'pack', percent: 95 });
+    // Drop hallucinated / silence segments BEFORE packing so made-up credit
+    // lines never become subtitles.
+    const cleanWords = filterHallucinatedWords(words, rawSegments);
+    const segments = packWordsToSegments(cleanWords);
+
+    cleanup();
+    if (segments.length === 0) {
+      emit({ phase: 'error', error: 'Речь не распознана. В аудио нет чёткой речи — возможно там только музыка/шум, или в видео нет голоса.' });
+      return { ok: false, error: 'Речь не распознана. В аудио нет чёткой речи — возможно там только музыка/шум, или в видео нет голоса.' };
+    }
+    emit({ phase: 'done', percent: 100 });
+    return { ok: true, segments, fullText: text };
+  } catch (e) {
+    cleanup();
+    emit({ phase: 'error', error: String(e.message || e) });
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
+// Standalone speech-to-text. Unlike subtitles:generate (which mixes the whole
+// project audio graph), this transcribes ONE picked file directly — the user
+// just wants to read the words spoken in a video. Same Groq Whisper backend,
+// same hallucination filtering, returns the full plain-text transcript.
+ipcMain.handle('transcribe:file', async (event, payload) => {
+  const file = payload?.file;
+  const language = payload?.language || 'auto';
+  if (!file || !fs.existsSync(file)) return { ok: false, error: 'Файл не найден' };
+
+  const emit = (info) => { try { event.sender.send('transcribe:progress', info); } catch {} };
+  const ffmpeg = findFfmpeg();
+  if (!ffmpeg) return { ok: false, error: 'FFmpeg не найден' };
+
+  let info = null;
+  try { info = await probeMediaInfo(ffmpeg, file); } catch {}
+  if (!info || !info.hasAudio) return { ok: false, error: 'В файле нет звуковой дорожки — распознавать нечего.' };
+  const dur = Number(info.duration || 0);
+  if (dur > SUBTITLE_MAX_SECONDS) {
+    const mins = Math.ceil(dur / 60);
+    return { ok: false, error: `Видео слишком длинное (${mins} мин). Лимит — 25 минут.` };
+  }
+
+  const tmpAudio = path.join(os.tmpdir(), `smtr_${Date.now()}.mp3`);
+  liveTmpFiles.add(tmpAudio);
+  const cleanup = () => { try { fs.unlinkSync(tmpAudio); } catch {} liveTmpFiles.delete(tmpAudio); };
+
+  try {
+    emit({ phase: 'extract', percent: 0 });
+    await new Promise((resolve, reject) => {
+      // Mono 16kHz mp3 — Whisper's native format, tiny file, well under the cap.
+      const args = ['-i', file, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libmp3lame', '-b:a', '64k', '-y', tmpAudio];
+      const proc = spawn(ffmpeg, args, { windowsHide: true });
+      let stderr = '';
+      proc.stderr.on('data', d => {
+        const s = d.toString(); stderr += s;
+        const m = s.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (m && dur > 0) {
+          const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+          emit({ phase: 'extract', percent: Math.min(30, Math.round((t / dur) * 30)) });
+        }
+      });
+      proc.on('error', reject);
+      proc.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg код ${code}: ${stderr.slice(-200)}`)));
+    });
+
+    emit({ phase: 'upload', percent: 35 });
+    const { text, words, segments: rawSegments } = await transcribeWithGroq(tmpAudio, { language });
+    emit({ phase: 'pack', percent: 95 });
+    const cleanWords = filterHallucinatedWords(words, rawSegments);
+    const segments = packWordsToSegments(cleanWords);
+    cleanup();
+
+    const fullText = (String(text || '').trim()) || segments.map(s => s.text).join(' ').trim();
+    if (!fullText) {
+      emit({ phase: 'error', error: 'Речь не распознана.' });
+      return { ok: false, error: 'Речь не распознана — возможно в видео только музыка или шум.' };
+    }
+    emit({ phase: 'done', percent: 100 });
+    return { ok: true, fullText, segments };
+  } catch (e) {
+    cleanup();
+    emit({ phase: 'error', error: String(e.message || e) });
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
 // Font list cached after the first read — C:/Windows/Fonts changes rarely
 // and the dir is large (1000+ files). Cache survives until app quits.
 let _fontsCache = null;
-ipcMain.handle('fonts:list', async () => {
-  if (process.platform !== 'win32') return [];
-  if (_fontsCache) return _fontsCache;
-  const fontsDir = 'C:/Windows/Fonts';
+// Bundled fonts ship inside the app under assets/fonts/. They appear at the
+// top of the picker (prefixed with ★) and are guaranteed to render the same
+// across Windows/Mac since they're not relying on the OS font directory.
+// All four — Open Sans, Poppins, Source Sans 3, Montserrat — have full
+// Cyrillic + Latin coverage and are SIL OFL / Apache 2.0 licensed (safe to
+// distribute with the app).
+// Parse a weight/style suffix from "Family-Weight" or "family_weight" filenames.
+// Returns "" for Regular (omitted), or e.g. "Bold", "Italic", "Bold Italic".
+// Handles common abbreviations Reg/Bol/Ita that ITC/URW fonts use.
+function parseFontVariant(base) {
+  const m = base.split(/[-_]/).slice(1).join(' ').trim();
+  if (!m) return '';
+  const norm = m.toLowerCase().replace(/\s+/g, '');
+  const direct = { reg: '', regular: '', bol: 'Bold', bold: 'Bold', ita: 'Italic',
+    italic: 'Italic', boldita: 'Bold Italic', regita: 'Italic', italicbold: 'Bold Italic',
+    medium: 'Medium', light: 'Light', thin: 'Thin', black: 'Black',
+    semibold: 'SemiBold', demibold: 'DemiBold', extralight: 'ExtraLight',
+    hairline: 'Hairline', fat: 'Fat', extrabold: 'ExtraBold' };
+  if (norm in direct) return direct[norm];
+  // Multi-token fallback: split CamelCase + spaces, map each, drop unknowns.
+  return m.replace(/([a-z])([A-Z])/g, '$1 $2').split(/\s+/)
+    .map(w => direct[w.toLowerCase()] !== undefined ? direct[w.toLowerCase()] : w.charAt(0).toUpperCase() + w.slice(1))
+    .filter(Boolean).join(' ');
+}
+
+function listBundledFonts() {
+  const dir = appPath('assets', 'fonts');
   try {
-    const files = await fs.promises.readdir(fontsDir);
-    _fontsCache = files
+    if (!fs.existsSync(dir)) return [];
+    // Prefer the REAL family name read from the TTF's `name` table for fontconfig
+    // accuracy, then append the variant parsed from the filename so multiple
+    // weights of one family don't collapse to identical-looking picker entries.
+    return fs.readdirSync(dir)
       .filter(f => /\.(ttf|otf)$/i.test(f))
       .map(f => {
-        const n = path.basename(f, path.extname(f))
-          .replace(/[-_]/g, ' ')
-          .replace(/\b\w/g, c => c.toUpperCase())
-          .trim();
-        return { name: n, file: (fontsDir + '/' + f) };
+        const fullPath = path.join(dir, f);
+        const base = path.basename(f, path.extname(f));
+        let family = readFontFamilyName(fullPath);
+        if (!family) {
+          family = base.split(/[-_]/)[0].replace(/([a-z])([A-Z])/g, '$1 $2').trim();
+          family = family.charAt(0).toUpperCase() + family.slice(1);
+        }
+        const variant = parseFontVariant(base);
+        const display = variant ? `${family} ${variant}` : family;
+        return { name: '★ ' + display, file: fullPath };
       })
       .sort((a, b) => a.name.localeCompare(b.name));
-    return _fontsCache;
   } catch { return []; }
+}
+
+ipcMain.handle('fonts:list', async () => {
+  if (_fontsCache) return _fontsCache;
+  const bundled = listBundledFonts();
+  let system = [];
+  if (process.platform === 'win32') {
+    const fontsDir = 'C:/Windows/Fonts';
+    try {
+      const files = await fs.promises.readdir(fontsDir);
+      system = files
+        .filter(f => /\.(ttf|otf)$/i.test(f))
+        .map(f => {
+          const n = path.basename(f, path.extname(f))
+            .replace(/[-_]/g, ' ')
+            .replace(/\b\w/g, c => c.toUpperCase())
+            .trim();
+          return { name: n, file: (fontsDir + '/' + f) };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch {}
+  }
+  _fontsCache = [...bundled, ...system];
+  return _fontsCache;
 });
 
 ipcMain.handle('folder:pick', async () => {
@@ -2357,6 +3082,519 @@ function escapeDrawtext(s) {
 }
 
 function ffPath(p) { return String(p || '').replace(/\\/g, '/').replace(/:/g, '\\:').replace(/,/g, '\\,').replace(/'/g, "\\'"); }
+
+// Read a font file's REAL internal family name (TrueType/OpenType `name`
+// table). Critical for subtitle export: the renderer's font list derives its
+// display name from the FILENAME (arial.ttf → "Arial", ARIALBD.TTF →
+// "Arialbd", seguiemj.ttf → "Seguiemj"), which often does NOT match the name
+// libass/fontconfig needs. Feeding the wrong name makes libass silently fall
+// back to a default font, so the export looks nothing like the preview. We
+// parse the file once (cached) and hand libass the name it actually indexes.
+const _fontNameCache = new Map();
+function readFontFamilyName(fontFile) {
+  if (!fontFile) return null;
+  if (_fontNameCache.has(fontFile)) return _fontNameCache.get(fontFile);
+  let result = null;
+  try {
+    const buf = fs.readFileSync(fontFile);
+    let base = 0;
+    const sig = buf.toString('latin1', 0, 4);
+    // TrueType Collection — point at the first contained font's offset table.
+    if (sig === 'ttcf') base = buf.readUInt32BE(12);
+    const numTables = buf.readUInt16BE(base + 4);
+    let nameOff = 0;
+    for (let i = 0; i < numTables; i++) {
+      const rec = base + 12 + i * 16;
+      if (buf.toString('latin1', rec, rec + 4) === 'name') {
+        nameOff = buf.readUInt32BE(rec + 8);
+        break;
+      }
+    }
+    if (nameOff) {
+      const count = buf.readUInt16BE(nameOff + 2);
+      const strBase = nameOff + buf.readUInt16BE(nameOff + 4);
+      let best = null, bestScore = -1;
+      for (let i = 0; i < count; i++) {
+        const rec = nameOff + 6 + i * 12;
+        const platformID = buf.readUInt16BE(rec);
+        const nameID = buf.readUInt16BE(rec + 6);
+        const len = buf.readUInt16BE(rec + 8);
+        const o = buf.readUInt16BE(rec + 10);
+        // nameID 1 = Family, 16 = Typographic Family (weight-independent base).
+        if (nameID !== 1 && nameID !== 16) continue;
+        const start = strBase + o;
+        if (start + len > buf.length) continue;
+        let str;
+        if (platformID === 3 || platformID === 0) {
+          // UTF-16BE — swap to LE so Node can decode it.
+          const slice = Buffer.from(buf.subarray(start, start + len));
+          if (slice.length % 2 === 0) { slice.swap16(); str = slice.toString('utf16le'); }
+          else str = slice.toString('latin1');
+        } else {
+          str = buf.toString('latin1', start, start + len);
+        }
+        str = (str || '').replace(/\u0000/g, '').trim();
+        if (!str) continue;
+        // Prefer the typographic family (16) and the Windows platform (3) so we
+        // get the name fontconfig matches on, weight-independent.
+        let score = 0;
+        if (nameID === 16) score += 2;
+        if (platformID === 3) score += 1;
+        if (score > bestScore) { bestScore = score; best = str; }
+      }
+      result = best;
+    }
+  } catch { result = null; }
+  _fontNameCache.set(fontFile, result);
+  return result;
+}
+
+// Rewrite a font's `name` table so its family/full/typographic names become a
+// single UNIQUE ASCII token, and write the patched font to destFile. This is
+// what makes the burned-in subtitle font match the preview 1:1: libass resolves
+// fonts through fontconfig by FAMILY NAME, and our bundled fonts share names
+// across weights (all 8 Arista Pro weights are "Arista Pro"; OpenSans Regular &
+// Bold are both "Open Sans"). Worse, if the user also installed the font
+// system-wide, fontconfig prefers the system copy over our fontsdir. Both make
+// the render pick a DIFFERENT file than the exact one the preview loaded. By
+// renaming to a unique token and pointing the Style at that token, libass can
+// only resolve the one patched file — no sibling weight, system copy, or fuzzy
+// match can interfere. The new table is appended at EOF and the table-directory
+// entry repointed (checksum zeroed — rasterizers ignore it). Returns true on
+// success. Works for both TrueType (.ttf) and CFF/OpenType (.otf).
+function patchFontFamilyToToken(srcFile, destFile, token) {
+  try {
+    const src = fs.readFileSync(srcFile);
+    const buf = Buffer.from(src);
+    let base = 0;
+    if (buf.toString('latin1', 0, 4) === 'ttcf') base = buf.readUInt32BE(12);
+    const numTables = buf.readUInt16BE(base + 4);
+    let nameEntry = -1;
+    for (let i = 0; i < numTables; i++) {
+      const rec = base + 12 + i * 16;
+      if (buf.toString('latin1', rec, rec + 4) === 'name') { nameEntry = rec; break; }
+    }
+    if (nameEntry < 0) return false;
+    const ascii = String(token).replace(/[^A-Za-z0-9]/g, '');
+    const recs = [
+      { id: 1,  s: token },     // family
+      { id: 2,  s: 'Regular' }, // subfamily
+      { id: 4,  s: token },     // full name
+      { id: 6,  s: ascii },     // PostScript name (no spaces)
+      { id: 16, s: token },     // typographic family (what fontconfig prefers)
+      { id: 17, s: 'Regular' }, // typographic subfamily
+    ];
+    const heaps = recs.map(r => Buffer.from(r.s, 'utf16le').swap16()); // UTF-16BE
+    const count = recs.length;
+    const strOff = 6 + count * 12;
+    const header = Buffer.alloc(6);
+    header.writeUInt16BE(0, 0);       // format 0
+    header.writeUInt16BE(count, 2);
+    header.writeUInt16BE(strOff, 4);
+    const recBuf = Buffer.alloc(count * 12);
+    let off = 0;
+    for (let i = 0; i < count; i++) {
+      const r = recs[i], h = heaps[i], p = i * 12;
+      recBuf.writeUInt16BE(3, p);        // platform 3 (Windows)
+      recBuf.writeUInt16BE(1, p + 2);    // encoding 1 (UCS-2)
+      recBuf.writeUInt16BE(0x0409, p + 4); // lang en-US
+      recBuf.writeUInt16BE(r.id, p + 6);
+      recBuf.writeUInt16BE(h.length, p + 8);
+      recBuf.writeUInt16BE(off, p + 10);
+      off += h.length;
+    }
+    const newTable = Buffer.concat([header, recBuf, ...heaps]);
+    let appendPos = buf.length;
+    const pad = (4 - (appendPos % 4)) % 4;
+    const out = Buffer.concat([buf, Buffer.alloc(pad), newTable]);
+    appendPos += pad;
+    out.writeUInt32BE(0, nameEntry + 4);            // checksum (ignored)
+    out.writeUInt32BE(appendPos, nameEntry + 8);    // new offset
+    out.writeUInt32BE(newTable.length, nameEntry + 12); // new length
+    fs.writeFileSync(destFile, out);
+    return true;
+  } catch { return false; }
+}
+
+// libass sizes a style's Fontsize by the font's OS/2 win-metrics
+// ((usWinAscent + usWinDescent) / unitsPerEm), NOT by the em square the way a
+// CSS canvas does (`Npx` → em = N px). So at the same nominal size, libass text
+// is ~10-20% smaller than the canvas preview, and the gap VARIES per font.
+// We read the metrics from the file and return the scale that makes the burned
+// subtitle match the preview's pixel height 1:1. Measured empirically accurate
+// to ~1-2% across Arial/Impact/Verdana/Calibri/Times. Cached per file.
+const _fontScaleCache = new Map();
+function readFontAssScale(fontFile) {
+  if (!fontFile) return 1.16;
+  if (_fontScaleCache.has(fontFile)) return _fontScaleCache.get(fontFile);
+  let scale = 1.16;  // sane average fallback if the tables can't be read
+  try {
+    const buf = fs.readFileSync(fontFile);
+    let base = 0;
+    if (buf.toString('latin1', 0, 4) === 'ttcf') base = buf.readUInt32BE(12);
+    const numTables = buf.readUInt16BE(base + 4);
+    let headOff = 0, os2Off = 0, hheaOff = 0;
+    for (let i = 0; i < numTables; i++) {
+      const rec = base + 12 + i * 16;
+      const tag = buf.toString('latin1', rec, rec + 4);
+      if (tag === 'head') headOff = buf.readUInt32BE(rec + 8);
+      else if (tag === 'OS/2') os2Off = buf.readUInt32BE(rec + 8);
+      else if (tag === 'hhea') hheaOff = buf.readUInt32BE(rec + 8);
+    }
+    if (headOff) {
+      const unitsPerEm = buf.readUInt16BE(headOff + 18) || 2048;
+      let h = 0;
+      if (os2Off) {
+        // usWinAscent (+74, uint16) + usWinDescent (+76, uint16) — the metric
+        // libass actually scales by on Windows-style TrueType fonts.
+        h = buf.readUInt16BE(os2Off + 74) + buf.readUInt16BE(os2Off + 76);
+      }
+      if (!h && hheaOff) {
+        // Fallback to hhea ascent-descent if there's no OS/2 table.
+        h = buf.readInt16BE(hheaOff + 4) - buf.readInt16BE(hheaOff + 6);
+      }
+      if (h > 0) scale = h / unitsPerEm;
+    }
+  } catch { scale = 1.16; }
+  // Guard against absurd values from a malformed table.
+  if (!(scale > 0.8 && scale < 1.6)) scale = 1.16;
+  _fontScaleCache.set(fontFile, scale);
+  return scale;
+}
+
+// Convert a CSS-style "#rrggbb" hex into the ASS colour literal "&H00BBGGRR".
+// ASS uses AABBGGRR byte order (opaque = AA=00) — gets us right for libass.
+function _hexToAss(hex) {
+  const h = String(hex || '#ffffff').replace('#', '').padEnd(6, '0');
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return '&H00FFFFFF';
+  const r = h.slice(0, 2);
+  const g = h.slice(2, 4);
+  const b = h.slice(4, 6);
+  return `&H00${b}${g}${r}`.toUpperCase();
+}
+
+function _assTime(t) {
+  const total = Math.max(0, Number(t) || 0);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total - h * 3600 - m * 60;
+  const cs = Math.floor((s - Math.floor(s)) * 100);
+  return `${h}:${String(m).padStart(2, '0')}:${String(Math.floor(s)).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+// Build an ASS subtitle file for one subtitle layer. We emit ONE dialogue line
+// per word's "active" window — the full segment text is rendered each time,
+// but only one word is in highlightColor. This is the simplest path to CapCut-
+// style karaoke that works with any libass build (vanilla \k tags would invert
+// the colour semantics).
+function buildAssForSubtitles(subL, outWidth, outHeight, fontNameOverride) {
+  const style = subL.style || {};
+  // Prefer the layout's (possibly auto-fitted) fontSize over style.fontSize so
+  // shrink-to-fit-box behaves identically in the burned-in result.
+  const layoutFs = subL._layout && Number(subL._layout.fontSize);
+  const canvasPx = Math.max(12, Math.round(layoutFs || Number(style.fontSize) || 56));
+  // libass renders glyphs at the SAME scale a CSS canvas does (Fontsize ≡ em
+  // size, factor ≈ 1.0 — measured exactly 1.000 on Arista Pro, ~0.9-1.0 on the
+  // rest within cap-metric noise). So NO size correction is needed: Fontsize =
+  // canvasPx, ScaleX = ScaleY = 100. The old win-metric scale (~1.44) was a
+  // mis-correction that EITHER widened glyphs (ate the spaces between words) when
+  // applied to Fontsize, OR stretched them vertically (text looked condensed)
+  // when applied to ScaleY. Both are gone now: glyph width matches the canvas-
+  // measured positions (no overlap/gap) and the aspect ratio is undistorted.
+  const fontSize = canvasPx;
+  const yScale = 100;
+  // fontNameOverride is the unique token of the patched/isolated font file (see
+  // the export loop) — using it guarantees libass loads the EXACT file the
+  // preview did. Falls back to the font's real internal family name (then the
+  // renderer display name) when no patched font was produced.
+  const realName = fontNameOverride || readFontFamilyName(style.fontFile);
+  const fontName = String(realName || style.fontFamily || 'Arial').replace(/,/g, ' ');
+  const base = _hexToAss(style.color || '#ffffff');
+  const high = _hexToAss(style.highlightColor || '#ff9a1f');
+  const outline = _hexToAss(style.outlineColor || '#000000');
+  // Canvas strokeText(lineWidth=fs*0.08) straddles the glyph path → ~fs*0.04
+  // shows OUTSIDE the letter. libass Outline=N draws N fully outside, so use
+  // fs*0.04 to match the preview's visible thickness 1:1. Derived from canvasPx
+  // (the on-screen size), NOT the libass-scaled fontSize.
+  // Outline mode + thickness (mirrors the canvas preview). libass only renders a
+  // clean EXTERNAL border, so we offer external + none (any legacy "internal"
+  // value is treated as external). Thickness = olT px, drawn outside the glyph.
+  const olMode = (style.outlineMode === 'none' || style.outline === false) ? 'none' : 'external';
+  const olT = (style.outlineWidth != null && style.outlineWidth !== '')
+    ? Math.max(0, Math.round(Number(style.outlineWidth)))
+    : Math.max(1, Math.round(canvasPx * 0.04));
+  const outlineW = (olMode === 'external') ? olT : 0;
+
+  // Alignment 5 = middle-centre; combined with per-word \an5\pos(x,y) every word
+  // is anchored on its own centre point. Margins are irrelevant (we position
+  // absolutely) — WrapStyle 2 disables any libass wrapping of its own.
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${outWidth}
+PlayResY: ${outHeight}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,${fontName},${fontSize},${base},${high},${outline},&H80000000,0,0,0,0,100,${yScale},0,0,1,${outlineW},0,5,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  const escape = (s) => String(s || '')
+    .replace(/\\/g, '')
+    .replace(/[{}]/g, '')
+    .replace(/\r?\n/g, ' ');
+
+  const lines = [];
+
+  // PREFERRED PATH: the renderer measured the exact layout (per-word centres in
+  // output px) with the same canvas font the preview used, so we just place each
+  // word at its coordinate. This guarantees position/wrap/line-spacing parity
+  // with the preview — libass does no layout of its own. For each word we emit:
+  //   • a BASE-colour Dialogue spanning the whole segment (Layer 0), and
+  //   • a HIGHLIGHT-colour Dialogue spanning that word's active window (Layer 1,
+  //     drawn on top) — so the active word lights up exactly when the preview's
+  //     does, with no lingering.
+  // Animation preset (shared timing constants with the canvas preview's
+  // SUB_ANIM). 'pop' scale-punches the spoken word; 'scale' scales+fades the
+  // whole phrase in; 'type' reveals words one-by-one; 'rise' rises words in.
+  const anim = (style.anim) || 'pop';
+  const A = {
+    POP_MS: 130, POP_SCALE: 130,
+    SCALE_MS: 200, SCALE_FROM: 60, SCALE_FADE_MS: 120,
+    RISE_MS: 150, RISE_OFFSET: 28, RISE_FADE_MS: 100,
+    BAM_MS1: 100, BAM_MS2: 180, BAM_FROM: 150, BAM_MID: 85,
+    BLUR_MS: 200, BLUR_PX: 8,
+    ZOUT_MS: 200, ZOUT_FROM: 140, ZOUT_FADE_MS: 120,
+    GLOW_MS: 500, GLOW_MUL: 2.5,
+    WAVE_MS: 350,
+    WAVE_COLORS: ['#ff9a1f', '#ff3bb8', '#46d3ff', '#aaff00'],
+    // neon-flicker: thick cyan outline + alpha pattern via chained instant-\t toggles
+    NEON_MS: 200, NEON_BORD_MUL: 2.2, NEON_COLOR: '#00f0ff',
+    // typewriter-cursor: blinking | after last revealed word, 500ms full period (250 on / 250 off)
+    TYPE_CURSOR_MS: 500, TYPE_CURSOR_PAD: 0.18,
+    // shake: ±4° rotation jitter via 5 chained \t blocks of \frz
+    SHAKE_STAGES: [[0,40,4],[40,80,-4],[80,120,3],[120,160,-2],[160,200,0]],
+    // bounce: drop-from-above with squash-and-stretch (drop / hit / settle)
+    BOUNCE_OFFSET: 60, BOUNCE_DROP_MS: 120, BOUNCE_SQUASH_MS: 80, BOUNCE_SETTLE_MS: 100,
+    BOUNCE_FROM_FSCX: 80, BOUNCE_FROM_FSCY: 140,
+    BOUNCE_HIT_FSCX: 120, BOUNCE_HIT_FSCY: 70,
+  };
+  const neonOutlineAss = _hexToAss(A.NEON_COLOR);
+  // Neon ALWAYS draws a thick glow, even when the outline toggle is off — the
+  // canvas preview forces the stroke for neon too. So base the neon border on
+  // the font's natural outline width (canvasPx*0.04), NOT on outlineW (which is
+  // 0 when the user disabled the outline → would collapse neon to a 1px hairline
+  // and mismatch the preview's thick glow).
+  const neonBaseW = Math.max(1, Math.round(canvasPx * 0.04));
+  const neonBord = Math.max(neonBaseW + 1, Math.round(neonBaseW * A.NEON_BORD_MUL));
+  // yScale is 100 now (no metric correction), so fy() is the identity — kept so
+  // the animation tag builders below read uniformly and stay correct if a scale
+  // is ever reintroduced.
+  const fy = (n) => Math.round(Number(n) * yScale / 100);
+  const waveAss = A.WAVE_COLORS.map(_hexToAss);
+  const phraseCx = Math.round(((style.x ?? 50) / 100) * outWidth);
+  const phraseCy = Math.round(((style.y ?? 85) / 100) * outHeight);
+  const glowBordBase = outlineW;
+  const glowBordBig = Math.max(glowBordBase + 1, Math.round(outlineW * A.GLOW_MUL));
+
+  const layout = subL._layout;
+  if (layout && Array.isArray(layout.segments) && layout.segments.length) {
+    // Rescale if the export resolution differs from what the layout was built
+    // for (e.g. user changed canvas size after generating) — keeps it correct.
+    const sx = layout.W ? outWidth / layout.W : 1;
+    const sy = layout.H ? outHeight / layout.H : 1;
+    for (const seg of layout.segments) {
+      const segStartNum = Number(seg.start) || 0;
+      const segStart = _assTime(segStartNum);
+      const segEnd = _assTime(Math.max(segStartNum + 0.05, Number(seg.end) || 0));
+      const segWords = seg.words || [];
+      for (let wi = 0; wi < segWords.length; wi++) {
+        const w = segWords[wi];
+        const cx = Math.round((Number(w.cx) || 0) * sx);
+        const cy = Math.round((Number(w.cy) || 0) * sy);
+        const wPx = Math.round((Number(w.w) || 0) * sx);  // word advance width (for typewriter cursor)
+        const txt = escape(w.text);
+        const wStartNum = Number(w.start) || 0;
+        const wStart = _assTime(wStartNum);
+        const wEnd = _assTime(Math.max(wStartNum + 0.02, Number(w.end) || 0));
+
+        // Build the base (Layer 0) and highlight (Layer 1) override blocks +
+        // the base event start time, per animation. All curves are linear \t /
+        // \move / \fad so they reproduce the canvas preview's math.
+        let baseStart = segStart;
+        let baseOv = `{\\an5\\pos(${cx},${cy})\\c${base}}`;
+        let highOv = `{\\an5\\pos(${cx},${cy})\\c${high}}`;
+        if (anim === 'pop') {
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx${A.POP_SCALE}\\fscy${fy(A.POP_SCALE)}\\t(0,${A.POP_MS},\\fscx100\\fscy${yScale})}`;
+        } else if (anim === 'type') {
+          baseStart = wStart;  // reveal the word at its own time
+        } else if (anim === 'rise') {
+          baseStart = wStart;
+          const mv = `\\move(${cx},${cy + A.RISE_OFFSET},${cx},${cy},0,${A.RISE_MS})\\fad(${A.RISE_FADE_MS},0)`;
+          baseOv = `{\\an5${mv}\\c${base}}`;
+          highOv = `{\\an5${mv}\\c${high}}`;
+        } else if (anim === 'scale') {
+          const sX = Math.round(phraseCx + (A.SCALE_FROM / 100) * (cx - phraseCx));
+          const sY = Math.round(phraseCy + (A.SCALE_FROM / 100) * (cy - phraseCy));
+          baseOv = `{\\an5\\move(${sX},${sY},${cx},${cy},0,${A.SCALE_MS})\\fad(${A.SCALE_FADE_MS},0)\\fscx${A.SCALE_FROM}\\fscy${fy(A.SCALE_FROM)}\\t(0,${A.SCALE_MS},\\fscx100\\fscy${yScale})\\c${base}}`;
+          // The highlight must ride the SAME phrase scale-in. If the word lights
+          // up mid-animation, pick the animation up partway (p0); once the phrase
+          // has settled it's just static.
+          const p0 = Math.max(0, Math.min(1, ((wStartNum - segStartNum) * 1000) / A.SCALE_MS));
+          if (p0 < 1) {
+            const scNow = Math.round(A.SCALE_FROM + (100 - A.SCALE_FROM) * p0);
+            const hX = Math.round(phraseCx + (scNow / 100) * (cx - phraseCx));
+            const hY = Math.round(phraseCy + (scNow / 100) * (cy - phraseCy));
+            const remMs = Math.max(1, Math.round(A.SCALE_MS * (1 - p0)));
+            const fadeRem = Math.max(0, Math.round(A.SCALE_FADE_MS - (wStartNum - segStartNum) * 1000));
+            const fadeTag = fadeRem > 0 ? `\\fad(${fadeRem},0)` : '';
+            highOv = `{\\an5\\move(${hX},${hY},${cx},${cy},0,${remMs})${fadeTag}\\fscx${scNow}\\fscy${fy(scNow)}\\t(0,${remMs},\\fscx100\\fscy${yScale})\\c${high}}`;
+          }
+        } else if (anim === 'zoomout') {
+          // Phrase scales 140% → 100% around its anchor, fading in. Same math
+          // as 'scale' but with SCALE_FROM > 100 (starts BIGGER, shrinks in).
+          const sX = Math.round(phraseCx + (A.ZOUT_FROM / 100) * (cx - phraseCx));
+          const sY = Math.round(phraseCy + (A.ZOUT_FROM / 100) * (cy - phraseCy));
+          baseOv = `{\\an5\\move(${sX},${sY},${cx},${cy},0,${A.ZOUT_MS})\\fad(${A.ZOUT_FADE_MS},0)\\fscx${A.ZOUT_FROM}\\fscy${fy(A.ZOUT_FROM)}\\t(0,${A.ZOUT_MS},\\fscx100\\fscy${yScale})\\c${base}}`;
+          // Highlight rides the same phrase animation — partial when it lights
+          // up mid-anim, static once the phrase has settled (p0 ≥ 1).
+          const p0 = Math.max(0, Math.min(1, ((wStartNum - segStartNum) * 1000) / A.ZOUT_MS));
+          if (p0 < 1) {
+            const scNow = Math.round(A.ZOUT_FROM + (100 - A.ZOUT_FROM) * p0);
+            const hX = Math.round(phraseCx + (scNow / 100) * (cx - phraseCx));
+            const hY = Math.round(phraseCy + (scNow / 100) * (cy - phraseCy));
+            const remMs = Math.max(1, Math.round(A.ZOUT_MS * (1 - p0)));
+            const fadeRem = Math.max(0, Math.round(A.ZOUT_FADE_MS - (wStartNum - segStartNum) * 1000));
+            const fadeTag = fadeRem > 0 ? `\\fad(${fadeRem},0)` : '';
+            highOv = `{\\an5\\move(${hX},${hY},${cx},${cy},0,${remMs})${fadeTag}\\fscx${scNow}\\fscy${fy(scNow)}\\t(0,${remMs},\\fscx100\\fscy${yScale})\\c${high}}`;
+          }
+        } else if (anim === 'bam') {
+          // 3-piece overshoot: 150% → 85% → 100% via chained \t (linear pieces).
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx${A.BAM_FROM}\\fscy${fy(A.BAM_FROM)}\\t(0,${A.BAM_MS1},\\fscx${A.BAM_MID}\\fscy${fy(A.BAM_MID)})\\t(${A.BAM_MS1},${A.BAM_MS2},\\fscx100\\fscy${yScale})}`;
+        } else if (anim === 'blurfocus') {
+          // Word starts blurred and snaps into focus via \blur ramp.
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\blur${A.BLUR_PX}\\t(0,${A.BLUR_MS},\\blur0)}`;
+        } else if (anim === 'glow') {
+          // Outline width pulses base → big → base → big → base (~2 cycles).
+          const halfMs = Math.round(A.GLOW_MS / 2);
+          const cycle = A.GLOW_MS;
+          const pulses = [
+            `\\t(0,${halfMs},\\bord${glowBordBig})`,
+            `\\t(${halfMs},${cycle},\\bord${glowBordBase})`,
+            `\\t(${cycle},${cycle + halfMs},\\bord${glowBordBig})`,
+            `\\t(${cycle + halfMs},${2 * cycle},\\bord${glowBordBase})`,
+          ].join('');
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\bord${glowBordBase}${pulses}}`;
+        } else if (anim === 'colorwave') {
+          // Highlight cycles through the WAVE palette via chained \t \c, starting
+          // the FIRST transition at 0 (matches the canvas preview which lerps
+          // from t=0 — not after one full period).
+          const T = A.WAVE_MS;
+          const transitions = [
+            `\\t(0,${T},\\c${waveAss[1]})`,
+            `\\t(${T},${2 * T},\\c${waveAss[2]})`,
+            `\\t(${2 * T},${3 * T},\\c${waveAss[3]})`,
+            `\\t(${3 * T},${4 * T},\\c${waveAss[0]})`,
+          ].join('');
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${waveAss[0]}${transitions}}`;
+        } else if (anim === 'neon') {
+          // Thick cyan outline + 6-stage alpha flicker via instant-\t toggles
+          // (t,t+1 ramp = effectively a jump cut for libass).
+          const flick = [
+            `\\t(50,51,\\1a&HFF&\\3a&HFF&)`,
+            `\\t(70,71,\\1a&H00&\\3a&H00&)`,
+            `\\t(100,101,\\1a&HFF&\\3a&HFF&)`,
+            `\\t(120,121,\\1a&H00&\\3a&H00&)`,
+            `\\t(160,170,\\1a&H8C&\\3a&H8C&)`,
+            `\\t(170,180,\\1a&H00&\\3a&H00&)`,
+          ].join('');
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\3c${neonOutlineAss}\\bord${neonBord}${flick}}`;
+        } else if (anim === 'typewriter') {
+          // Identical to 'type' for the words — reveal each at its own start time.
+          baseStart = wStart;
+        } else if (anim === 'shake') {
+          // 5-stage rotation jitter via chained \t \frz. Each \t interpolates
+          // linearly from the prior \frz value to the new one.
+          const st = A.SHAKE_STAGES;
+          const shakes = st.map(([t0, t1, deg]) => `\\t(${t0},${t1},\\frz${deg})`).join('');
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}${shakes}}`;
+        } else if (anim === 'bounce') {
+          // Phase 1 (0..D): drop from cy-OFFSET → cy + scale (80,140)→(100,100)
+          // Phase 2 (D..D+S): impact squash → (HIT_FSCX, HIT_FSCY)
+          // Phase 3 (D+S..D+S+T): settle → (100, 100)
+          const D = A.BOUNCE_DROP_MS, S = A.BOUNCE_SQUASH_MS, T = A.BOUNCE_SETTLE_MS;
+          const O = A.BOUNCE_OFFSET;
+          const mv = `\\move(${cx},${cy - O},${cx},${cy},0,${D})`;
+          const scales = [
+            `\\t(0,${D},\\fscx100\\fscy${yScale})`,
+            `\\t(${D},${D + S},\\fscx${A.BOUNCE_HIT_FSCX}\\fscy${fy(A.BOUNCE_HIT_FSCY)})`,
+            `\\t(${D + S},${D + S + T},\\fscx100\\fscy${yScale})`,
+          ].join('');
+          baseStart = wStart;
+          baseOv = `{\\an5${mv}\\fscx${A.BOUNCE_FROM_FSCX}\\fscy${fy(A.BOUNCE_FROM_FSCY)}\\fad(80,0)${scales}\\c${base}}`;
+          highOv = `{\\an5${mv}\\fscx${A.BOUNCE_FROM_FSCX}\\fscy${fy(A.BOUNCE_FROM_FSCY)}\\fad(80,0)${scales}\\c${high}}`;
+        }
+
+        lines.push(`Dialogue: 0,${baseStart},${segEnd},Default,,0,0,0,,${baseOv}${txt}`);
+        lines.push(`Dialogue: 1,${wStart},${wEnd},Default,,0,0,0,,${highOv}${txt}`);
+
+        // Typewriter cursor: blinking | sits after each word from word.end until
+        // the next word begins (or seg.end for last). Blinks 250 on / 250 off.
+        if (anim === 'typewriter') {
+          const nextW = segWords[wi + 1];
+          const cursorStartNum = Number(w.end) || 0;
+          const cursorEndNum = nextW ? (Number(nextW.start) || cursorStartNum) : Number(seg.end) || cursorStartNum;
+          if (cursorEndNum > cursorStartNum + 0.05) {
+            const cursorPadPx = Math.round(canvasPx * A.TYPE_CURSOR_PAD);
+            const cursorX = cx + Math.round(wPx / 2) + cursorPadPx;
+            // 250ms on / 250ms off, chained \t toggles. ~6 cycles covers 3s of
+            // typical word-gap (libass clamps stale tags after event end).
+            const blink = [];
+            for (let k = 1; k <= 12; k++) {
+              const t = k * 250;
+              const off = (k % 2 === 1) ? `\\1a&HFF&\\3a&HFF&` : `\\1a&H00&\\3a&H00&`;
+              blink.push(`\\t(${t},${t + 1},${off})`);
+            }
+            const cursorOv = `{\\an5\\pos(${cursorX},${cy})\\c${high}${blink.join('')}}`;
+            lines.push(`Dialogue: 1,${_assTime(cursorStartNum)},${_assTime(cursorEndNum)},Default,,0,0,0,,${cursorOv}|`);
+          }
+        }
+      }
+    }
+    return header + lines.join('\n') + '\n';
+  }
+
+  // FALLBACK (no precomputed layout, e.g. an older project): single \pos line
+  // per word-window, libass handles wrapping. Less exact but never off-screen.
+  const px = Math.round(((style.x ?? 50) / 100) * outWidth);
+  const py = Math.round(((style.y ?? 85) / 100) * outHeight);
+  for (const seg of (subL.segments || [])) {
+    const segStart = Number(seg.startTime) || 0;
+    const segEnd = Math.max(segStart + 0.05, Number(seg.endTime) || segStart);
+    let words = Array.isArray(seg.words) && seg.words.length ? seg.words : null;
+    if (!words) {
+      const parts = String(seg.text || '').split(/\s+/).filter(Boolean);
+      if (parts.length === 0) continue;
+      const each = (segEnd - segStart) / parts.length;
+      words = parts.map((t, i) => ({ text: t, start: segStart + i * each, end: segStart + (i + 1) * each }));
+    }
+    if (words.length === 0) continue;
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      const start = Math.max(segStart, Number(w.start) || segStart);
+      const end = i < words.length - 1
+        ? Math.max(start + 0.05, Number(words[i + 1].start) || start)
+        : Math.max(start + 0.05, Number(w.end) || segEnd);
+      const body = words.map((ww, j) => `{\\c${j === i ? high : base}}${escape(ww.text)}`).join(' ');
+      lines.push(`Dialogue: 0,${_assTime(start)},${_assTime(end)},Default,,0,0,0,,{\\pos(${px},${py})}${body}`);
+    }
+  }
+  return header + lines.join('\n') + '\n';
+}
 
 function drawtextFontOption() {
   const candidates = process.platform === 'win32'

@@ -152,6 +152,31 @@
 .detail-grid .slider span:first-child{display:grid!important;grid-template-columns:1fr auto!important;align-items:center!important;gap:12px!important;margin-bottom:10px!important;}
 .detail-grid .slider input{display:block!important;width:100%!important;accent-color:var(--purple)!important;}
 .slider input{accent-color:var(--purple)!important;}
+/* Font picker — custom popover. Each row shows "Aa" preview in its own font
+   face + the family name in a neutral face for readability. */
+.font-picker{position:relative;flex:1;min-width:0}
+.font-picker-btn{display:flex;align-items:center;gap:8px;width:100%;height:28px;padding:0 8px 0 10px;border:1px solid rgba(140,140,146,.25);border-radius:7px;background:#161618;color:#dcdce0;cursor:pointer;font-size:12px;text-align:left;transition:border-color .12s}
+.font-picker-btn:hover{border-color:#ff8a00}
+.font-picker-sample{display:inline-block;min-width:24px;font-size:15px;font-weight:600;color:#fff;flex-shrink:0;line-height:1}
+.font-picker-name{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-family:Inter,system-ui,sans-serif}
+.font-picker-chev{font-size:10px;color:#85858c;flex-shrink:0;margin-left:auto}
+.font-picker-list{position:absolute;top:calc(100% + 4px);left:0;right:0;max-height:320px;overflow-y:auto;background:#1a1a1d;border:1px solid rgba(140,140,146,.32);border-radius:9px;box-shadow:0 8px 28px rgba(0,0,0,.55);z-index:50;padding:4px}
+.font-picker-item{display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:6px;cursor:pointer;transition:background .1s}
+.font-picker-item:hover{background:rgba(255,138,0,.12)}
+.font-picker-item.active{background:rgba(255,138,0,.22)}
+.font-picker-item .font-picker-sample{font-size:18px;min-width:32px}
+.font-picker-item .font-picker-name{font-size:12.5px;color:#dcdce0}
+[data-theme="light"] .font-picker-btn{background:rgba(255,255,255,.85)!important;color:#262934!important;border-color:rgba(30,36,56,.16)!important}
+[data-theme="light"] .font-picker-list{background:#fff;border-color:rgba(30,36,56,.18);box-shadow:0 8px 28px rgba(30,36,56,.18)}
+[data-theme="light"] .font-picker-sample{color:#262934}
+[data-theme="light"] .font-picker-item .font-picker-name{color:#262934}
+[data-theme="light"] .font-picker-item:hover{background:rgba(255,138,0,.14)}
+[data-theme="light"] .font-picker-item.active{background:rgba(255,138,0,.22)}
+
+.slider-edit{width:64px;padding:2px 6px;border:1px solid #ff8a00;border-radius:5px;background:#1a1a1d;color:#fff;font-size:12px;font-weight:700;outline:none;text-align:right;-moz-appearance:textfield}
+.slider-edit::-webkit-outer-spin-button,.slider-edit::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.slider span b{cursor:pointer;border-radius:4px;padding:1px 4px;transition:background .12s}
+.slider span b:hover{background:rgba(255,138,0,.18)}
 
 /* Watermark page layout */
 .wm-grid{display:grid!important;grid-template-columns:repeat(2,minmax(320px,1fr))!important;gap:16px!important;align-items:start!important;margin-top:14px!important;}
@@ -684,7 +709,7 @@
 /* multi-track timeline */
 .etl-wrap{display:flex;flex-direction:column;border-radius:14px;background:#0a0a0c;border:1px solid rgba(140,140,146,.15);overflow:hidden}
 .etl-header{display:flex;height:24px;border-bottom:1px solid rgba(140,140,146,.12);position:sticky;top:0;z-index:6;background:#0a0a0c}
-.etl-label-col{width:110px;min-width:110px;flex-shrink:0;display:flex;align-items:center;gap:4px;padding:0 6px;border-right:1px solid rgba(140,140,146,.12)}
+.etl-label-col{width:152px;min-width:152px;flex-shrink:0;display:flex;align-items:center;gap:4px;padding:0 6px;border-right:1px solid rgba(140,140,146,.12)}
 .etl-time-ruler{position:relative;flex:1;height:24px;cursor:pointer;overflow:hidden}
 .etl-time-ruler span{position:absolute;top:4px;font-size:10px;color:#63636a;transform:translateX(-50%);pointer-events:none;white-space:nowrap}
 .etl-time-ruler span:first-of-type{transform:translateX(2px)}
@@ -693,25 +718,84 @@
 .etl-trim-handle{position:absolute;top:0;bottom:0;width:8px;transform:translateX(-50%);cursor:ew-resize;z-index:3}
 .etl-trim-handle::after{content:'';position:absolute;left:3px;top:0;bottom:0;width:2px;background:#ff8a00;border-radius:2px}
 .etl-playhead{position:absolute;top:0;bottom:0;width:2px;background:#ff8a00;pointer-events:none;z-index:4;box-shadow:0 0 8px rgba(255,138,0,.6)}
-.etl-track-row{display:flex;border-bottom:1px solid rgba(140,140,146,.08);min-height:36px;cursor:pointer;transition:background .15s}
+.etl-track-row{display:flex;border-bottom:1px solid rgba(140,140,146,.08);min-height:60px;cursor:pointer;transition:background .15s}
 .etl-track-row:hover{background:rgba(255,255,255,.025)}
 .etl-track-row.etl-selected{background:rgba(255,138,0,.14);box-shadow:inset 3px 0 0 #ff8a00}
-.etl-track-row .etl-label-col{flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;padding:4px 6px}
-.etl-track-label{font-size:11px;color:#b0b0b6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px;line-height:1.3;display:inline-flex;align-items:center;gap:5px}
+/* Name pinned at the top, the icon buttons pinned at the bottom; the Up/Down
+   stack floats centred against the cell's right edge so it has equal gap top
+   and bottom. Right padding reserves room for that floating stack. */
+.etl-track-row .etl-label-col{position:relative;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:2px;padding:6px 38px 6px 6px}
+.etl-track-label{font-size:11px;color:#b0b0b6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:108px;line-height:1.3;display:inline-flex;align-items:center;gap:5px}
 .etl-track-label.etl-missing{color:#ff6b6b;font-weight:600}
 /* Per-layer-type icon shown left of the clip name. PNGs ship as pure black
    silhouettes — invert to white for dark theme, dim for light theme. */
 .etl-track-icon{width:14px;height:14px;flex-shrink:0;object-fit:contain;filter:brightness(0) invert(1) opacity(.78);pointer-events:none}
 [data-theme="light"] .etl-track-icon{filter:brightness(0) opacity(.62)}
-.etl-track-actions{display:flex;gap:2px;flex-shrink:0}
-.etl-act-btn{width:18px;height:18px;border-radius:5px;border:1px solid rgba(140,140,146,.2);background:#161618;color:#95959b;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
-.etl-act-btn:hover{border-color:#ff8a00;color:#ff8a00}
+.etl-track-actions{display:flex;gap:4px;flex-shrink:0;align-items:center}
+.etl-act-btn{position:relative;width:24px;height:24px;border-radius:6px;border:1px solid rgba(140,140,146,.2);background:#161618;color:#bdbdc4;font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;transition:all .12s}
+/* Up/Down stacked into one column, last in the row. Each arrow is the same
+   width as the × and tall enough to read as a proper button (the row above is
+   just the short clip name, so there's vertical room). */
+/* ↑ pinned to the top (level with the name), ↓ pinned to the bottom (level with
+   the icon row) — the arrow column frames the cell's right edge. */
+.etl-act-vstack{position:absolute;right:8px;top:6px;bottom:6px;display:flex;flex-direction:column;justify-content:space-between;flex-shrink:0}
+.etl-act-mini{width:24px;height:20px;border-radius:6px;font-size:12px;line-height:1}
+.etl-act-btn:hover{border-color:#ff8a00;color:#ff8a00;background:rgba(255,138,0,.16)}
+/* Light theme forces a dark !important colour on these buttons, so the hover
+   needs !important too or it never lights up. Add a clear orange fill. */
+[data-theme="light"] .etl-act-btn:hover{border-color:#ff8a00!important;color:#ff8a00!important;background:rgba(255,138,0,.18)!important}
+[data-theme="light"] .etl-del:hover{border-color:#f05050!important;color:#e23a3a!important;background:rgba(240,80,80,.16)!important}
+/* Same !important-override fix for the subtitle panel's dropdowns and colour swatches. */
+[data-theme="light"] .ed-font-sel:hover,[data-theme="light"] .ed-color-inp:hover{border-color:#ff8a00!important;box-shadow:0 0 0 1px rgba(255,138,0,.45)!important}
+/* Red strike-through overlay when the eye/speaker is OFF. */
+.etl-act-btn.etl-off{color:#ff5a5a;border-color:rgba(255,90,90,.4)}
+.etl-act-slash{position:absolute;top:50%;left:1px;right:1px;height:2px;background:#ff3b3b;border-radius:1px;transform:rotate(-45deg);transform-origin:center;box-shadow:0 0 0 1px rgba(0,0,0,.35);pointer-events:none}
+[data-theme="light"] .etl-act-btn.etl-off{color:#e23a3a;border-color:rgba(226,58,58,.4)}
 .etl-del:hover{border-color:#f87171;color:#f87171}
 .etl-track-area{position:relative;flex:1;background:#0a0a0c}
 .etl-clip{position:absolute;top:4px;bottom:4px;border-radius:5px;border:1px solid transparent;box-sizing:border-box;min-width:4px;overflow:hidden}
-.etl-clip-handle{position:absolute;top:0;bottom:0;width:8px;cursor:ew-resize;z-index:2}
+/* Expanded subtitle track: each phrase becomes a draggable block so the user
+   can nudge a mis-timed subtitle left/right along the timeline. */
+.etl-row-subs-expanded{min-height:76px;background:rgba(255,154,31,.06)}
+.etl-subseg{
+  position:absolute;top:9px;bottom:9px;min-width:8px;box-sizing:border-box;
+  border:1px solid;border-radius:5px;cursor:grab;overflow:hidden;
+  display:flex;align-items:center;padding:0 6px;
+  box-shadow:0 1px 5px rgba(0,0,0,.35);transition:filter .12s,box-shadow .12s;
+}
+.etl-subseg:hover{filter:brightness(1.12);box-shadow:0 0 0 2px rgba(255,255,255,.55)}
+.etl-subseg:active{cursor:grabbing;filter:brightness(1.18)}
+.etl-subseg-label{font-size:10.5px;line-height:1.2;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 2px rgba(0,0,0,.7);font-weight:600;pointer-events:none}
+/* Edge handles — drag to make a phrase shorter/longer (resize its duration). */
+.etl-subseg-handle{position:absolute;top:0;bottom:0;width:9px;cursor:ew-resize;z-index:3;display:flex;align-items:center;justify-content:center}
+.etl-subseg-s{left:0}
+.etl-subseg-e{right:0}
+.etl-subseg-handle::after{content:'';width:2px;height:46%;background:rgba(255,255,255,.65);border-radius:2px}
+.etl-subseg:hover .etl-subseg-handle::after{background:#fff}
+/* Resize handles — narrow (5px) so even a 30px clip has a draggable middle.
+   The visible gripper bar inside makes the handle discoverable without it
+   needing to be wide. The container query shrinks them further AND keeps
+   grippers always-on for very short clips so the user can still grab them. */
+.etl-clip{container-type:inline-size}
+@container (max-width: 30px){
+  .etl-clip-handle{width:3px}
+  .etl-clip-handle::after{opacity:1!important;top:20%;bottom:20%}
+}
+.etl-clip-handle{position:absolute;top:0;bottom:0;width:5px;cursor:ew-resize;z-index:2;display:flex;align-items:center;justify-content:center}
 .etl-clip-handle.etl-clip-s{left:0}
 .etl-clip-handle.etl-clip-e{right:0}
+.etl-clip-handle::after{
+  content:"";position:absolute;top:30%;bottom:30%;width:2px;
+  background:rgba(255,255,255,.45);border-radius:1px;
+  box-shadow:0 0 0 1px rgba(0,0,0,.25);
+  opacity:.0;transition:opacity .12s;pointer-events:none;
+}
+.etl-clip:hover .etl-clip-handle::after,
+.etl-clip.selected .etl-clip-handle::after,
+.etl-clip-handle:hover::after{opacity:.95}
+/* On very short clips (under ~40px width), keep grippers always visible so
+   the user can tell where to grab. */
+.etl-clip.short .etl-clip-handle::after{opacity:.95}
 .etl-add-row{display:flex;gap:8px;padding:8px 10px;background:#030810;flex-wrap:wrap}
 .etl-add-btn{height:26px;padding:0 12px;border-radius:8px;border:1px solid rgba(140,140,146,.25);background:#161618;color:#95959b;font-size:12px;cursor:pointer;transition:all .15s}
 .etl-add-btn:hover{border-color:#ff8a00;color:#ff8a00;background:#13202f}
@@ -720,7 +804,7 @@
 
 /* Editor timeline: clip inner labels and waveform */
 /* NOTE: do NOT re-set position on .etl-clip here — the base rule already has position:absolute */
-.etl-clip-inner-label{position:absolute;left:22px;right:22px;top:50%;transform:translateY(-50%);font-size:11px;font-weight:800;color:rgba(255,255,255,.95);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;z-index:2;text-shadow:0 1px 4px rgba(0,0,0,.85);}
+.etl-clip-inner-label{position:absolute;left:34px;right:14px;top:50%;transform:translateY(-50%);font-size:11px;font-weight:800;color:rgba(255,255,255,.95);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;z-index:2;text-shadow:0 1px 4px rgba(0,0,0,.85);}
 .etl-video-label{left:8px;right:8px;}
 .etl-waveform{position:absolute;inset:3px 18px;display:flex;align-items:center;gap:1.5px;opacity:.55;overflow:hidden;pointer-events:none;z-index:1;}
 .etl-waveform-bar{flex:1 1 2px;min-width:1.5px;max-width:4px;background:rgba(255,210,80,.9);border-radius:1px;}
@@ -729,6 +813,11 @@
    Each cell is a true 1:1 square — no horizontal stretch — and they're
    distributed along the clip width so each one sits near its second mark. */
 .etl-clip-thumbstrip{position:absolute;inset:3px;display:flex;gap:0;border-radius:3px;overflow:hidden;z-index:1;pointer-events:none}
+/* 1:1 layer-type badge pinned to the clip's start — sits ABOVE the thumbnails
+   so you can always read the layer type at a glance. */
+.etl-clip-typebadge{position:absolute;left:0;top:0;bottom:0;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;border-radius:5px 0 0 5px;z-index:3;pointer-events:none;box-shadow:1px 0 5px rgba(0,0,0,.45)}
+.etl-clip-typebadge img{width:60%;height:60%;object-fit:contain;filter:brightness(0) invert(1);opacity:.95}
+.etl-clip-typebadge>span{color:#fff;font-weight:800;font-size:13px;line-height:1}
 
 /* Cmall reset link under the colour-correction sliders in the Properties tab. */
 .ed-cc-reset{margin-top:8px;background:transparent;border:1px solid rgba(140,140,146,.28);color:#b0b0b6;font-size:11px;border-radius:8px;padding:5px 10px;cursor:pointer}
@@ -740,13 +829,15 @@
    different track. Clip shrinks slightly and casts a soft shadow; the
    target row glows so the user sees where it'll drop. */
 .etl-clip.etl-clip-reorder-active{
-  transform:scale(.82);
+  transform:translateY(var(--reorder-dy,0px)) scale(.9);
   transform-origin:center;
   filter:brightness(1.05);
   box-shadow:0 8px 22px rgba(0,0,0,.55),0 0 0 2px rgba(255,255,255,.18)!important;
-  z-index:5!important;
-  transition:transform .15s cubic-bezier(.2,.9,.25,1);
+  z-index:50!important;
+  /* snappy magnetic feel: clip springs onto the track row under the cursor */
+  transition:transform .13s cubic-bezier(.2,.9,.25,1);
   cursor:grabbing!important;
+  pointer-events:none;
 }
 .etl-track-row.etl-reorder-hover{
   background:rgba(255,138,0,.13)!important;
@@ -757,7 +848,7 @@
 .etl-clip-thumbstrip .etl-thumb-cell{flex:1 1 0;min-width:0;height:100%;object-fit:cover;display:block;background:#0d0e10}
 .etl-clip-img .etl-clip-inner-label{left:72px}
 .etl-clip-fx{position:absolute;right:20px;top:3px;display:flex;align-items:center;justify-content:center;height:14px;padding:0 5px;border-radius:4px;font-size:9px;font-weight:900;letter-spacing:.3px;text-transform:uppercase;color:#1a1206;background:linear-gradient(135deg,#ffd24f,#ffa927);box-shadow:0 1px 4px rgba(0,0,0,.5);z-index:3;pointer-events:none;}
-.etl-act-color{flex:0 0 auto;width:18px;height:18px;border-radius:5px;border:1px solid rgba(255,255,255,.3);cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4);padding:0}
+.etl-act-color{flex:0 0 auto;width:22px;height:22px;border-radius:6px;border:1px solid rgba(255,255,255,.3);cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4);padding:0}
 .etl-color-menu{position:fixed;z-index:200;display:grid;grid-template-columns:repeat(6,1fr);gap:5px;padding:8px;background:#0b1322;border:1px solid rgba(140,140,146,.32);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.62)}
 .etl-color-cube{width:21px;height:21px;border-radius:5px;border:1px solid rgba(255,255,255,.16);cursor:pointer;padding:0;transition:transform .12s}
 .etl-color-cube:hover{transform:scale(1.18);border-color:#fff}
@@ -769,6 +860,13 @@
 .nav-new-badge::after{content:'';position:absolute;top:0;right:0;width:7px;height:10px;background:#b81e2c;clip-path:polygon(0 0,100% 0,100% 100%)}
 .ed-clear-btn{border-color:rgba(255,98,98,.4)!important;color:#ff9a9a!important}
 .ed-clear-btn:hover:not(:disabled){border-color:rgba(255,98,98,.7)!important;background:rgba(255,98,98,.1)!important}
+/* Help / controls button — gently accented so it stands out in the toolbar. */
+.ed-help-btn{display:inline-flex;align-items:center;gap:7px;border-color:rgba(255,138,0,.5)!important;color:#ffb866!important;background:rgba(255,138,0,.08)!important}
+.ed-help-btn:hover{border-color:#ff8a00!important;color:#fff!important;background:linear-gradient(135deg,rgba(255,154,31,.9),rgba(255,75,31,.9))!important}
+.ed-help-q{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;font-size:11px;font-weight:900;background:#ff8a00;color:#1a1206;flex-shrink:0}
+.ed-help-btn:hover .ed-help-q{background:#fff;color:#c24a00}
+[data-theme="light"] .ed-help-btn{color:#c25f0f!important;border-color:rgba(255,138,0,.5)!important;background:rgba(255,138,0,.12)!important}
+[data-theme="light"] .ed-help-btn:hover{color:#fff!important;background:linear-gradient(135deg,#ff9a1f,#ff4b1f)!important;border-color:#ff8a00!important}
 .ed-learn-btn{display:inline-flex;align-items:center;gap:6px;border-color:rgba(163,60,255,.45)!important;color:#c79bff!important}
 .ed-learn-btn:hover{border-color:rgba(163,60,255,.78)!important;background:rgba(163,60,255,.12)!important;color:#d9bbff!important}
 .ed-learn-btn svg{display:block;flex-shrink:0}
@@ -812,7 +910,7 @@
 .editor-upload-actions .ed-effect-btn{min-width:120px}
 .etl-vis svg{display:block}
 .etl-video-clip{min-height:36px;}
-.etl-video-track .etl-track-area{min-height:36px;}
+.etl-video-track .etl-track-area{min-height:46px;}
 .editor-quick-sizes{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;}
 /* home output row — single clean line */
 .home-output-grid.clean{grid-template-columns:100px minmax(190px,260px) 72px 1fr!important;gap:10px!important;align-items:end!important;}
@@ -851,14 +949,35 @@
 .ed-dim-inp:focus{border-color:#ff8a00}
 .ed-dim-x{color:#63636a;font-size:12px;font-weight:700}
 .ed-tb-label{font-size:11px;color:#85858c;font-weight:700;white-space:nowrap}
-.ed-color-inp{width:28px;height:28px;border:1px solid rgba(140,140,146,.25);border-radius:7px;padding:2px;background:#161618;cursor:pointer}
+.ed-color-inp{width:28px;height:28px;border:1px solid rgba(140,140,146,.25);border-radius:7px;padding:2px;background:#161618;cursor:pointer;transition:border-color .12s,box-shadow .12s}
+.ed-color-inp:hover{border-color:#ff8a00;box-shadow:0 0 0 1px rgba(255,138,0,.45)}
+.sub-style-acc{margin-top:10px}
+.sub-style-acc .ed-acc-toggle{height:40px}
+.sub-wpg-btns{display:flex;gap:3px;flex:1;min-width:0}
+.sub-wpg-btn{flex:1;min-width:0;width:auto;height:26px;border-radius:6px;border:1px solid rgba(140,140,146,.25);background:#161618;color:#95959b;font-size:12px;font-weight:700;cursor:pointer;transition:all .12s;padding:0}
+.sub-wpg-btn:hover{border-color:#ff8a00;color:#ff8a00}
+.sub-wpg-btn.active{background:linear-gradient(135deg,#ff9a1f,#ff4b1f);color:#fff;border-color:transparent}
+[data-theme="light"] .sub-wpg-btn{background:rgba(255,255,255,.7);color:#5c606d;border-color:rgba(30,36,56,.16)}
+[data-theme="light"] .sub-wpg-btn.active{background:linear-gradient(135deg,#ff9a1f,#ff4b1f);color:#fff;border-color:transparent}
+[data-theme="light"] .sub-wpg-btn:hover{border-color:#ff8a00;color:#ff8a00;background:rgba(255,138,0,.1)}
+.ed-outline-pick{display:flex;gap:6px;align-items:center}
+.ed-outline-pick .ed-color-inp.active{border-color:#ff8a00;box-shadow:0 0 0 1px #ff8a00}
+.ed-outline-none{width:28px;height:28px;border-radius:7px;border:1px solid rgba(140,140,146,.25);background:#fff;cursor:pointer;position:relative;padding:0;flex-shrink:0}
+.ed-outline-none::after{content:"";position:absolute;top:50%;left:-2px;right:-2px;height:2px;background:#e23a3a;transform:rotate(-45deg);border-radius:1px;transform-origin:center}
+.ed-outline-none.active{border-color:#ff8a00;box-shadow:0 0 0 1px #ff8a00}
 .ed-fade-rng{width:72px;accent-color:#ff8a00;cursor:pointer}
 .ed-fade-val{font-size:11px;color:#b0b0b6;font-weight:700;min-width:28px}
 .ed-save-btn{margin-left:auto;height:34px;padding:0 18px;flex-shrink:0}
 
 /* Workspace */
-.ed-workspace{display:grid;grid-template-columns:1fr 280px;gap:14px;min-height:200px;align-items:start}
+.ed-workspace{display:grid;grid-template-columns:1fr 280px;gap:14px;min-height:200px;align-items:stretch}
 .ed-preview-col{display:flex;flex-direction:column;gap:6px;min-height:0}
+/* Right column wrapper: the grid stretches it to the PREVIEW column's height
+   (its only in-flow child — the panel — is absolutely positioned, so it adds
+   no height of its own). The panel then scrolls internally instead of growing
+   the workspace row, which keeps the timeline glued right under the preview. */
+.ed-props-col{position:relative;min-height:0}
+.ed-props-col > .ed-props{position:absolute;inset:0}
 .ed-preview-wrap{position:relative;background:#2a2a2a;border-radius:14px;display:flex;align-items:center;justify-content:center;min-height:120px;overflow:hidden}
 .ed-preview-resize{height:7px;border-radius:4px;background:rgba(140,140,146,.14);cursor:ns-resize;transition:background .15s;flex-shrink:0}
 .ed-preview-resize:hover,.ed-preview-resize:active{background:rgba(255,138,0,.45)}
@@ -972,7 +1091,9 @@
 .ed-prop-label{font-size:11px;color:#95959b;font-weight:700;white-space:nowrap;flex-shrink:0}
 .ed-textarea{width:100%;background:#0e0e11;border:1px solid rgba(140,140,146,.22);border-radius:8px;color:#fff;padding:6px 8px;font-size:13px;font-family:inherit;resize:none;outline:none;margin-bottom:2px}
 .ed-textarea:focus{border-color:#ff8a00}
-.ed-font-sel{flex:1;min-width:0;height:28px;border:1px solid rgba(140,140,146,.22);background:#0e0e11;border-radius:8px;color:#fff;padding:0 8px;font-size:12px;outline:none}
+.ed-font-sel{flex:1;min-width:0;height:28px;border:1px solid rgba(140,140,146,.22);background:#0e0e11;border-radius:8px;color:#fff;padding:0 8px;font-size:12px;outline:none;cursor:pointer;transition:border-color .12s,box-shadow .12s}
+.ed-font-sel:hover{border-color:#ff8a00;box-shadow:0 0 0 1px rgba(255,138,0,.35)}
+.ed-font-sel:focus{border-color:#ff8a00}
 .ed-align-btns{display:flex;gap:4px}
 .ed-align-btns button{width:26px;height:26px;border:1px solid rgba(140,140,146,.22);background:#161618;border-radius:7px;color:#95959b;font-size:11px;display:flex;align-items:center;justify-content:center}
 .ed-align-btns button.active{border-color:#ff8a00;color:#ff8a00;background:rgba(255,138,0,.12)}
@@ -997,7 +1118,7 @@
 .etl-track-row.etl-hidden{opacity:.55}
 .etl-vis-off{opacity:.5}
 
-@media(max-width:1100px){.ed-workspace{grid-template-columns:1fr}.ed-props{max-height:300px}}
+@media(max-width:1100px){.ed-workspace{grid-template-columns:1fr}.ed-props-col{position:static}.ed-props-col > .ed-props{position:static}.ed-props{max-height:300px}}
 
 /* Editor-mode: natural content height. Scroll only appears when the window
    can't fit everything (small monitors). On big monitors the editor takes
@@ -1310,7 +1431,7 @@
 .notif-mute:hover,.notif-close:hover{background:#1c2740;color:#fff}
 .notif-mute.on{color:#ff7a59}
 .notif-close{font-size:18px;line-height:1}
-.notif-panel-body{padding:10px;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.notif-panel-body{padding:10px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-height:0}
 .notif-empty{padding:26px 10px;text-align:center;color:#76829a;font-size:12.5px}
 
 .notif-item{padding:9px 11px;border-radius:10px;background:#131d30;border:1px solid rgba(122,139,174,.12)}
@@ -1331,6 +1452,36 @@
 .nuc-btn{margin-top:9px;width:100%;padding:8px;border:0;border-radius:9px;font-weight:900;font-size:12px;color:#04140c;background:linear-gradient(135deg,#3ddc91,#28c8b0);cursor:pointer;transition:filter .15s,transform .1s}
 .nuc-btn:hover{filter:brightness(1.08)}
 .nuc-btn:active{transform:scale(.98)}
+.nuc-btn[disabled]{opacity:.6;cursor:default;filter:none}
+/* Persistent "current version" card + its secondary check button. */
+.notif-update-card.current{border-color:rgba(122,139,174,.28);background:linear-gradient(135deg,#15203a,#161a2e)}
+.nuc-btn.ghost{color:#dfe6f5;background:rgba(143,92,255,.16);border:1px solid rgba(143,92,255,.4)}
+.nuc-btn.ghost:hover{filter:none;background:rgba(143,92,255,.26)}
+[data-theme="light"] .notif-update-card.current{background:linear-gradient(135deg,#eef1f8,#eceefb);border-color:rgba(30,36,56,.14)}
+[data-theme="light"] .nuc-btn.ghost{color:#4a2da6;background:rgba(140,70,235,.12);border-color:rgba(140,70,235,.34)}
+
+/* ═══════ Centered one-time patch-notes modal ═══════ */
+.update-modal-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(6,8,14,.62);backdrop-filter:blur(4px);animation:notifPop .16s ease}
+.update-modal{position:relative;width:min(460px,92vw);max-height:84vh;overflow-y:auto;padding:24px 24px 20px;border-radius:18px;background:linear-gradient(145deg,#141a2c,#171426);border:1px solid rgba(143,92,255,.34);box-shadow:0 30px 80px rgba(0,0,0,.6)}
+.update-modal-x{position:absolute;top:12px;right:12px;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:#aeb6c8;font-size:20px;line-height:1;cursor:pointer}
+.update-modal-x:hover{background:rgba(255,255,255,.08);color:#fff}
+.update-modal-badge{display:inline-flex;align-items:center;min-height:24px;padding:0 12px;margin-bottom:12px;border-radius:999px;font-size:12px;font-weight:900;letter-spacing:.02em;color:#ffd098;background:linear-gradient(135deg,rgba(255,122,20,.22),rgba(255,61,24,.16));border:1px solid rgba(255,138,0,.45);box-shadow:0 0 14px rgba(255,138,0,.14)}
+.update-modal-title{margin:0 0 14px;font-size:21px;font-weight:900;letter-spacing:-.02em;color:#f4f6fd;padding-right:28px}
+.update-modal-body{font-size:14px;line-height:1.55;color:#c2cadb}
+.update-modal-body .umb-line{margin:3px 0}
+.update-modal-body .umb-line strong{color:#f4f6fd}
+.update-modal-body .umb-gap{height:9px}
+.update-modal-actions{display:flex;gap:10px;margin-top:20px}
+.update-modal-actions .nuc-btn{margin-top:0;flex:1}
+.update-modal-ok{flex:1;padding:10px;border:1px solid rgba(143,92,255,.4);border-radius:10px;background:rgba(143,92,255,.16);color:#e7e9f5;font-weight:800;font-size:13px;cursor:pointer;transition:background .14s}
+.update-modal-ok:hover{background:rgba(143,92,255,.28)}
+[data-theme="light"] .update-modal{background:linear-gradient(145deg,#ffffff,#f6f4ff);border-color:rgba(140,70,235,.28);box-shadow:0 30px 80px rgba(20,24,40,.28)}
+[data-theme="light"] .update-modal-title{color:#1c2030}
+[data-theme="light"] .update-modal-body{color:#454b5e}
+[data-theme="light"] .update-modal-body .umb-line strong{color:#1c2030}
+[data-theme="light"] .update-modal-x{color:#6a7280}
+[data-theme="light"] .update-modal-ok{color:#4a2da6;background:rgba(140,70,235,.12);border-color:rgba(140,70,235,.34)}
+[data-theme="light"] .update-modal-badge{color:#a8430a;background:linear-gradient(135deg,rgba(255,122,20,.16),rgba(255,61,24,.10));border-color:rgba(255,138,0,.42);box-shadow:none}
 /* Rollback escape-hatch link: small, subtle, sits under the main action.
    Opens the GitHub Releases page so user can grab a previous version. */
 .nuc-rollback{display:block;margin-top:8px;text-align:center;font-size:11px;color:#85929c;text-decoration:none;cursor:pointer;transition:color .12s}
@@ -1724,3 +1875,416 @@ html[data-theme="light"] .save-fmt-dialog{
 [data-theme="light"] .notif-panel{background:rgba(255,255,255,.38)!important;border-color:rgba(255,255,255,.5)!important;box-shadow:0 8px 22px rgba(20,24,40,.10)!important}
 [data-theme="light"] .notif-toast,
 [data-theme="light"] .notif-toast.update-ready{background:rgba(255,255,255,.38)!important;border-color:rgba(255,255,255,.5)!important;box-shadow:0 6px 18px rgba(20,24,40,.10)!important}
+
+/* ═══════════════ Editor: collapsible left sidebar ═══════════════
+   Small round orange button sitting ON the sidebar/main boundary. Click
+   shrinks the sidebar grid column to 0 so the canvas/timeline gets the full
+   window width. The button slides with the boundary as the column animates. */
+.app-shell{position:relative;transition:grid-template-columns .32s cubic-bezier(.4,0,.2,1)}
+.app-shell.sidebar-collapsed{grid-template-columns:0 1fr}
+.app-shell.sidebar-collapsed .sidebar{opacity:0;pointer-events:none;transform:translateX(-12px)}
+.sidebar{transition:opacity .24s ease,transform .32s cubic-bezier(.4,0,.2,1);will-change:opacity,transform}
+
+.sidebar-toggle{
+  position:absolute;top:50%;left:238px;z-index:35;
+  width:26px;height:26px;
+  display:flex;align-items:center;justify-content:center;
+  border:0;border-radius:50%;
+  background:linear-gradient(135deg,#ff9a1f,#ff4b1f);
+  color:#fff;padding:0;cursor:pointer;
+  box-shadow:0 4px 14px rgba(255,138,0,.45),0 2px 5px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.22);
+  transform:translateY(-50%);
+  transition:left .32s cubic-bezier(.4,0,.2,1),transform .2s cubic-bezier(.4,0,.2,1),box-shadow .2s,filter .15s;
+}
+.sidebar-toggle:hover{filter:brightness(1.08);transform:translateY(-50%) scale(1.08);box-shadow:0 6px 20px rgba(255,138,0,.6),0 2px 6px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.28)}
+.sidebar-toggle:active{transform:translateY(-50%) scale(.96)}
+.sidebar-toggle.collapsed svg{transform:rotate(180deg)}
+.sidebar-toggle svg{transition:transform .3s cubic-bezier(.4,0,.2,1)}
+.app-shell.sidebar-collapsed .sidebar-toggle{left:0}
+@media(max-width:1250px){.sidebar-toggle{left:216px}}
+
+/* ═══════════════ Preview zoom controls ═══════════════ */
+.preview-zoom-ctrl{
+  position:absolute;bottom:8px;right:8px;z-index:25;
+  display:flex;align-items:center;gap:2px;
+  padding:4px 6px;
+  background:rgba(15,15,18,.78);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:10px;
+  color:#dfe6f5;
+  font-size:11px;font-weight:800;
+  user-select:none;
+  backdrop-filter:blur(6px);
+  -webkit-backdrop-filter:blur(6px);
+  box-shadow:0 4px 14px rgba(0,0,0,.4);
+}
+.preview-zoom-ctrl button{
+  width:24px;height:24px;
+  display:flex;align-items:center;justify-content:center;
+  border:0;background:transparent;color:inherit;
+  border-radius:6px;cursor:pointer;
+  font-size:16px;font-weight:700;line-height:1;
+  padding:0;transition:background .12s,color .12s;
+}
+.preview-zoom-ctrl button:hover{background:rgba(255,255,255,.12);color:#fff}
+.preview-zoom-ctrl button:active{background:rgba(255,138,0,.22)}
+.preview-zoom-ctrl .zoom-pct{min-width:38px;text-align:center;font-variant-numeric:tabular-nums;color:#fff;position:relative;cursor:ns-resize;user-select:none}
+.preview-zoom-ctrl .zoom-pct-scrub.active{color:#ff8a00}
+/* Vertical zoom-scrub track — pops up above the % label while the user is
+   dragging. Anchors to the bottom-center of the % span, height ~150px. */
+.zoom-scrub-track{
+  position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%);
+  display:flex;flex-direction:column;align-items:center;gap:4px;
+  background:#1a1a1d;border:1px solid rgba(255,138,0,.5);border-radius:10px;
+  padding:8px 6px;box-shadow:0 8px 24px rgba(0,0,0,.55);
+  pointer-events:none;
+  animation:zoomScrubIn .14s ease-out;
+}
+.zoom-scrub-label{font-size:9px;font-weight:700;color:#85858c;letter-spacing:.3px}
+.zoom-scrub-bar{position:relative;width:6px;height:110px;background:rgba(255,255,255,.10);border-radius:3px;overflow:hidden}
+.zoom-scrub-mid{position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(255,138,0,.5)}
+.zoom-scrub-thumb{
+  position:absolute;left:-4px;width:14px;height:14px;border-radius:50%;
+  background:#ff8a00;box-shadow:0 0 0 2px #1a1a1d, 0 0 12px rgba(255,138,0,.6);
+  transform:translateY(50%);
+  transition:bottom .06s linear;
+}
+@keyframes zoomScrubIn{from{opacity:0;transform:translateX(-50%) translateY(6px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+[data-theme="light"] .zoom-scrub-track{background:#fff;border-color:rgba(255,138,0,.55);box-shadow:0 8px 24px rgba(30,36,56,.18)}
+[data-theme="light"] .zoom-scrub-bar{background:rgba(30,36,56,.10)}
+[data-theme="light"] .zoom-scrub-thumb{box-shadow:0 0 0 2px #fff, 0 0 12px rgba(255,138,0,.6)}
+[data-theme="light"] .zoom-scrub-label{color:#5c606d}
+.preview-zoom-ctrl .zoom-reset svg{display:block}
+
+[data-theme="light"] .preview-zoom-ctrl{background:rgba(255,255,255,.85);border-color:rgba(30,36,56,.16);color:#1c2030;box-shadow:0 4px 14px rgba(20,24,40,.16)}
+[data-theme="light"] .preview-zoom-ctrl .zoom-pct{color:#1c2030}
+[data-theme="light"] .preview-zoom-ctrl button:hover{background:rgba(30,36,56,.08);color:#1c2030}
+
+/* ═══════════════ Project save progress modal ═══════════════ */
+.proj-save-progress{min-width:340px;max-width:420px}
+.psp-status{margin:8px 0 14px;color:#aeb6c8;font-size:13px;line-height:1.4;min-height:18px}
+.psp-status b{color:#f4f6fd;font-weight:700}
+.psp-bar{height:10px;border-radius:999px;background:rgba(15,15,18,.7);border:1px solid rgba(255,255,255,.08);overflow:hidden}
+.psp-bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#ff8a00,#ff421b);transition:width .25s cubic-bezier(.2,.8,.2,1);box-shadow:0 0 12px rgba(255,138,0,.4)}
+.psp-meta{display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:#aeb6c8;font-variant-numeric:tabular-nums}
+.psp-meta span:first-child{color:#fff;font-weight:800}
+[data-theme="light"] .psp-status{color:#454b5e}
+[data-theme="light"] .psp-status b{color:#1c2030}
+[data-theme="light"] .psp-bar{background:rgba(230,232,240,.7);border-color:rgba(30,36,56,.1)}
+[data-theme="light"] .psp-meta{color:#5b6276}
+[data-theme="light"] .psp-meta span:first-child{color:#1c2030}
+
+/* ═══════════════ Auto-subtitles (CapCut-style) ═══════════════ */
+/* Matches the "Разрезать" button shape (same height/padding/border) but with
+   an orange accent so it still reads as the "smart" feature without shouting. */
+.etl-subs-btn{
+  height:26px;padding:0 12px;border-radius:8px;
+  border:1px solid rgba(255,138,0,.4);background:#161618;color:#ff8a00;
+  font-size:12px;font-weight:600;cursor:pointer;
+  transition:all .15s ease;
+  display:inline-flex;align-items:center;margin-right:8px;
+}
+/* Interactive subtitle box-area overlay. Dashed orange outline + faint fill
+   so the rect is clearly the "subtitle wrap area" and obviously interactive. */
+.sub-box-overlay{
+  border:2px dashed #ff8a00;
+  background:rgba(255,138,0,.06);
+  box-shadow:inset 0 0 0 1px rgba(0,0,0,.35);
+  z-index:4;
+}
+/* In-app hint toast — replaces native alert() so warnings match the editor's
+   look. Slides in from the top-center, auto-dismisses after 4 s. Clickable to
+   dismiss early; × button for explicit close. */
+.ed-hint-toast{
+  position:fixed;top:18px;left:50%;transform:translateX(-50%);
+  display:flex;align-items:center;gap:10px;
+  max-width:min(560px,calc(100vw - 40px));padding:11px 14px 11px 16px;
+  background:#1a1a1d;border:1px solid rgba(255,138,0,.5);border-left:3px solid #ff8a00;
+  border-radius:11px;color:#dcdce0;font-size:13px;line-height:1.4;
+  box-shadow:0 12px 36px rgba(0,0,0,.55),0 0 0 1px rgba(255,138,0,.08);
+  z-index:9999;cursor:pointer;
+  animation:edHintIn .22s cubic-bezier(.2,.9,.3,1.2);
+}
+.ed-hint-toast.ed-hint-error{border-color:rgba(255,80,80,.55);border-left-color:#ff5050}
+.ed-hint-toast.ed-hint-info{border-color:rgba(70,180,255,.5);border-left-color:#46b4ff}
+.ed-hint-icon{flex-shrink:0;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(255,138,0,.18);color:#ffb155;font-size:13px;font-weight:800}
+.ed-hint-error .ed-hint-icon{background:rgba(255,80,80,.18);color:#ff8a8a}
+.ed-hint-info  .ed-hint-icon{background:rgba(70,180,255,.18);color:#7ec9ff}
+.ed-hint-text{flex:1;min-width:0}
+.ed-hint-close{flex-shrink:0;width:22px;height:22px;border:0;background:transparent;color:#85858c;font-size:18px;line-height:1;cursor:pointer;border-radius:5px;padding:0;transition:all .12s}
+.ed-hint-close:hover{background:rgba(255,255,255,.08);color:#fff}
+@keyframes edHintIn{from{opacity:0;transform:translate(-50%,-12px)}to{opacity:1;transform:translate(-50%,0)}}
+[data-theme="light"] .ed-hint-toast{background:#fff;color:#1a1c25;box-shadow:0 12px 36px rgba(30,36,56,.18),0 0 0 1px rgba(255,138,0,.1)}
+[data-theme="light"] .ed-hint-close{color:#5c606d}
+[data-theme="light"] .ed-hint-close:hover{background:rgba(30,36,56,.08);color:#1a1c25}
+
+.etl-subs-btn:hover:not(:disabled){border-color:#ff8a00;background:#22150a;color:#ffb155}
+.etl-subs-btn:active:not(:disabled){background:#1a0e05}
+.etl-subs-btn:disabled{opacity:.45;cursor:not-allowed}
+/* Light theme — keep the orange accent but match the white/cream base of the
+   sibling toolbar buttons (Разрезать, Объединить). */
+[data-theme="light"] .etl-subs-btn{background:rgba(255,255,255,.7)!important;color:#d96400!important;border-color:rgba(255,138,0,.5)!important}
+[data-theme="light"] .etl-subs-btn:hover:not(:disabled){background:#fff3e6!important;border-color:#ff8a00!important;color:#b8550a!important}
+
+/* Generation progress modal */
+.sub-gen-modal{min-width:280px!important;max-width:320px!important;padding:18px 22px 20px!important;gap:8px!important}
+.sub-gen-modal .editor-save-modal-title{font-size:15px!important}
+.sub-gen-modal .psp-status{font-size:12px}
+.sub-gen-modal .psp-meta{font-size:11px}
+.sgm-engine{color:#7b8093;font-size:11px}
+.sub-gen-err{color:#ff8a8a;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.25);padding:10px 12px;border-radius:8px;margin:10px 0 14px;font-size:13px;line-height:1.45}
+.sub-gen-actions{display:flex;justify-content:flex-end;gap:8px}
+.sgm-btn-primary{height:32px;padding:0 16px;border-radius:8px;border:0;background:linear-gradient(135deg,#ff9a1f,#ff4b1f);color:#fff;font-weight:700;cursor:pointer}
+.sgm-btn-primary:hover{filter:brightness(1.08)}
+
+/* Position quick-picker (top/center/bottom) */
+.sub-pos-btns{display:flex;gap:6px}
+.sub-pos-btn{
+  flex:1;height:28px;border-radius:7px;border:1px solid rgba(140,140,146,.25);
+  background:#161618;color:#95959b;font-size:11.5px;cursor:pointer;
+  transition:all .12s ease;
+}
+.sub-pos-btn:hover{color:#ff8a00;border-color:#ff8a00}
+.sub-pos-btn.active{background:linear-gradient(135deg,rgba(255,154,31,.18),rgba(255,75,31,.12));color:#ffb858;border-color:#ff8a00}
+
+/* Subtitle effect presets — 6 ready-made colour looks */
+.sub-fx-label{font-size:11px;color:#95959b;margin:2px 0 6px}
+.sub-fx-row{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.sub-fx-btn{
+  display:flex;flex-direction:column;align-items:center;gap:4px;padding:7px 4px;
+  border-radius:9px;border:1px solid rgba(140,140,146,.25);background:#161618;
+  color:#95959b;cursor:pointer;transition:all .12s ease;
+}
+.sub-fx-btn:hover{border-color:#ff8a00}
+.sub-fx-btn.active{border-color:#ff8a00;background:linear-gradient(135deg,rgba(255,154,31,.16),rgba(255,75,31,.1))}
+.sub-fx-swatch{display:flex;align-items:center;justify-content:center;width:34px;height:24px;border-radius:6px;font-weight:800;font-size:13px;line-height:1}
+.sub-fx-name{font-size:10.5px}
+.sub-fx-btn.active .sub-fx-name{color:#ffb858}
+.sub-fx-hint{font-size:11px;color:#7b8093;margin:9px 0 2px;line-height:1.4}
+
+/* Segment list inside the right-panel editor */
+.sub-seg-hint{font-size:11px;color:#7b8093;margin:10px 0 6px;line-height:1.4}
+.sub-seg-list{display:flex;flex-direction:column;gap:4px;max-height:300px;overflow-y:auto;padding-right:4px;margin-top:6px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px}
+.sub-seg-list::-webkit-scrollbar{width:6px}
+.sub-seg-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:4px}
+.sub-seg-item{
+  display:flex;align-items:flex-start;gap:6px;padding:4px 6px;border-radius:6px;
+  background:rgba(255,255,255,.02);border:1px solid transparent;transition:background .12s ease;
+}
+.sub-seg-time,.sub-seg-acts{margin-top:3px}
+.sub-seg-item:hover{background:rgba(255,255,255,.04)}
+.sub-seg-item.active{background:rgba(255,154,31,.10);border-color:rgba(255,154,31,.35)}
+.sub-seg-time{
+  background:transparent;border:0;color:#7b8093;font-size:10.5px;font-variant-numeric:tabular-nums;
+  padding:2px 4px;cursor:pointer;min-width:42px;text-align:left;border-radius:4px;
+}
+.sub-seg-time:hover{color:#ff9a1f;background:rgba(255,154,31,.08)}
+.sub-seg-item.active .sub-seg-time{color:#ffb858}
+.sub-seg-text{
+  flex:1;min-width:0;background:rgba(15,15,18,.4);border:1px solid rgba(255,255,255,.06);
+  color:#e7e9f1;font-size:12px;padding:5px 8px;border-radius:5px;outline:none;
+  font-family:inherit;line-height:1.35;resize:none;display:block;
+  /* Collapsed: one clipped line so the list stays compact. */
+  height:28px;white-space:nowrap;overflow:hidden;
+}
+/* Clicked/focused: grow to fit and wrap so the WHOLE phrase is visible. */
+.sub-seg-text:focus{
+  border-color:#ff9a1f;background:rgba(15,15,18,.65);
+  white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;
+  field-sizing:content;height:auto;min-height:28px;
+}
+.sub-seg-acts{display:flex;gap:2px}
+.sub-seg-act{
+  width:22px;height:22px;border-radius:5px;border:0;cursor:pointer;
+  background:transparent;color:#7b8093;font-size:11px;display:inline-flex;
+  align-items:center;justify-content:center;transition:all .12s ease;
+}
+.sub-seg-act:hover{background:rgba(255,154,31,.14);color:#ff9a1f}
+.sub-seg-act.danger:hover{background:rgba(255,80,80,.15);color:#ff8a8a}
+
+.sub-regen-btn{
+  width:100%;margin-top:12px;height:30px;border-radius:7px;border:1px solid rgba(255,154,31,.35);
+  background:rgba(255,154,31,.08);color:#ffb858;font-size:12px;font-weight:600;cursor:pointer;
+  transition:all .15s ease;
+}
+.sub-regen-btn:hover:not(:disabled){background:rgba(255,154,31,.16);border-color:#ff8a00}
+.sub-regen-btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* Light theme overrides */
+[data-theme="light"] .sub-pos-btn{background:#fff;color:#5b6276;border-color:rgba(30,36,56,.15)}
+[data-theme="light"] .sub-pos-btn.active{background:linear-gradient(135deg,rgba(255,154,31,.2),rgba(255,75,31,.15));color:#c25f0f}
+[data-theme="light"] .sub-seg-hint{color:#7b8093}
+[data-theme="light"] .sub-seg-item{background:rgba(30,36,56,.03)}
+[data-theme="light"] .sub-seg-item:hover{background:rgba(30,36,56,.06)}
+[data-theme="light"] .sub-seg-text{background:#fff;color:#1c2030;border-color:rgba(30,36,56,.15)}
+[data-theme="light"] .sub-seg-text:focus{background:#fff;border-color:#ff9a1f}
+[data-theme="light"] .sub-seg-act{color:#5b6276}
+[data-theme="light"] .sub-seg-act:hover{background:rgba(30,36,56,.07);color:#1c2030}
+[data-theme="light"] .sub-regen-btn{background:rgba(255,154,31,.07);color:#c25f0f}
+[data-theme="light"] .sgm-engine{color:#7b8093}
+
+/* ── Speech-to-text view (left-sidebar "Распознавание речи" tab) ───────── */
+.tr-view{display:flex;justify-content:center;padding:8px 4px 40px}
+.tr-card{width:100%;max-width:720px;display:flex;flex-direction:column;gap:14px;background:rgba(255,255,255,.025);border:1px solid rgba(140,140,146,.15);border-radius:18px;padding:24px 26px}
+.tr-title{margin:0;font-size:21px;font-weight:800;color:#f0f0f3}
+.tr-sub{margin:0;font-size:13px;color:#9a9aa2;line-height:1.5}
+.tr-controls{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.tr-lang{display:flex;flex-direction:column;gap:6px;font-size:12px;color:#b0b0b6;font-weight:600}
+.tr-lang select{height:40px;min-width:200px;border:1px solid rgba(140,140,146,.25);background:#0e0e11;border-radius:10px;color:#fff;padding:0 12px;font-size:13px;outline:none;cursor:pointer;transition:border-color .12s}
+.tr-lang select:hover{border-color:#ff8a00}
+.tr-load-btn{height:40px;padding:0 22px;border:0;border-radius:10px;background:linear-gradient(135deg,#ff9a1f,#ff4b1f);color:#fff;font-size:13px;font-weight:800;cursor:pointer;box-shadow:0 4px 14px rgba(255,90,30,.3);transition:filter .12s,transform .12s}
+.tr-load-btn:hover:not(:disabled){filter:brightness(1.07)}
+.tr-load-btn:active:not(:disabled){transform:translateY(1px)}
+.tr-load-btn:disabled{opacity:.6;cursor:not-allowed}
+.tr-file{font-size:12px;color:#9a9aa2;background:rgba(255,255,255,.04);border:1px solid rgba(140,140,146,.18);border-radius:9px;padding:9px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tr-prog{display:flex;flex-direction:column;gap:7px}
+.tr-prog-bar{height:8px;border-radius:5px;background:rgba(140,140,146,.2);overflow:hidden}
+.tr-prog-fill{height:100%;border-radius:5px;background:linear-gradient(90deg,#ff9a1f,#ff4b1f);transition:width .25s ease}
+.tr-prog-label{font-size:12px;color:#b0b0b6;font-weight:600}
+.tr-error{font-size:13px;color:#ff8a8a;background:rgba(255,80,80,.1);border:1px solid rgba(255,80,80,.3);border-radius:10px;padding:11px 13px;line-height:1.45}
+.tr-text{width:100%;min-height:240px;max-height:50vh;resize:vertical;border:1px solid rgba(140,140,146,.22);background:#0e0e11;border-radius:12px;color:#e6e6ea;padding:14px 15px;font-size:14px;line-height:1.6;outline:none;font-family:inherit}
+.tr-text:focus{border-color:#ff8a00}
+.tr-acts{display:flex;gap:10px}
+.tr-copy,.tr-redo{flex:1;height:42px;border-radius:11px;border:1px solid rgba(140,140,146,.25);background:#161618;color:#cdcdd3;font-size:13px;font-weight:700;cursor:pointer;transition:all .12s}
+.tr-copy:hover,.tr-redo:hover{border-color:#ff8a00;color:#ff8a00;background:rgba(255,138,0,.12)}
+.tr-redo:disabled{opacity:.5;cursor:not-allowed}
+/* Drop zone reuses the уникализация upload-card look; show the drag feedback. */
+.tr-drop{margin:0;cursor:pointer;text-align:center}
+.tr-drop.drag-over{border-color:rgba(169,96,255,.78);box-shadow:inset 0 0 58px rgba(163,60,255,.16),inset 0 0 44px rgba(255,138,0,.08),0 18px 46px rgba(0,0,0,.28);background:linear-gradient(135deg,rgba(16,28,51,.96),rgba(18,13,34,.96))}
+.tr-drop.drag-over .upload-bg{opacity:.24;transform:scale(1.04)}
+[data-theme="light"] .tr-drop.drag-over{background:rgba(255,255,255,.6)!important;border-color:rgba(122,60,255,.9)!important}
+[data-theme="light"] .tr-card{background:rgba(255,255,255,.7);border-color:rgba(30,36,56,.12)}
+[data-theme="light"] .tr-title{color:#1a1c25}
+[data-theme="light"] .tr-sub,[data-theme="light"] .tr-lang,[data-theme="light"] .tr-prog-label{color:#5c606d}
+[data-theme="light"] .tr-lang select{background:#fff;color:#262934;border-color:rgba(30,36,56,.16)}
+[data-theme="light"] .tr-file{color:#5c606d;background:rgba(20,24,40,.04);border-color:rgba(30,36,56,.14)}
+[data-theme="light"] .tr-text{background:#fff;color:#1c2030;border-color:rgba(30,36,56,.15)}
+[data-theme="light"] .tr-copy,[data-theme="light"] .tr-redo{background:rgba(255,255,255,.8);color:#3a3e4a;border-color:rgba(30,36,56,.16)}
+[data-theme="light"] .tr-copy:hover,[data-theme="light"] .tr-redo:hover{border-color:#ff8a00!important;color:#ff8a00!important;background:rgba(255,138,0,.14)!important}
+
+/* ── Hotkeys cheat-sheet modal ───────────────────────────────────────── */
+.hk-overlay{position:fixed;inset:0;z-index:9000;background:rgba(6,7,12,.66);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;animation:hkFade .18s ease}
+@keyframes hkFade{from{opacity:0}to{opacity:1}}
+.hk-modal{width:100%;max-width:760px;max-height:86vh;overflow:auto;background:#141418;border:1px solid rgba(140,140,146,.2);border-radius:18px;box-shadow:0 24px 70px rgba(0,0,0,.55);padding:20px 22px}
+.hk-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.hk-head h2{margin:0;font-size:19px;font-weight:800;color:#f0f0f3}
+.hk-close{width:32px;height:32px;border-radius:9px;border:1px solid rgba(140,140,146,.25);background:#1c1c20;color:#bdbdc4;font-size:18px;line-height:1;cursor:pointer;transition:all .12s}
+.hk-close:hover{border-color:#ff8a00;color:#ff8a00;background:rgba(255,138,0,.12)}
+.hk-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.hk-row{display:flex;gap:13px;align-items:center;background:rgba(255,255,255,.025);border:1px solid rgba(140,140,146,.14);border-radius:13px;padding:11px}
+.hk-info{min-width:0}
+.hk-keys{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:5px}
+.hk-keys kbd{font-family:inherit;font-size:11px;font-weight:800;color:#ffd9ad;background:linear-gradient(180deg,#2a2a30,#202024);border:1px solid rgba(255,138,0,.35);border-bottom-width:2px;border-radius:6px;padding:3px 7px;white-space:nowrap}
+.hk-title{font-size:13.5px;font-weight:700;color:#ececf0}
+.hk-desc{font-size:11.5px;color:#9a9aa2;line-height:1.4;margin-top:2px}
+
+/* Animated demo box — a miniature of the real editor so the gesture reads
+   instantly. Pure CSS, loops. */
+.hk-demo{position:relative;width:158px;height:84px;flex-shrink:0;border-radius:11px;background:#0a0a0d;border:1px solid rgba(140,140,146,.16);overflow:hidden;padding:8px}
+.hk-scene{position:relative;width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;gap:6px}
+.hk-scene-2row{justify-content:center;gap:7px}
+
+/* — mini timeline track row (label column + lane + clip) — */
+.hk-trow{display:flex;height:26px;border-radius:6px;overflow:hidden;background:rgba(255,255,255,.022)}
+.hk-lbl{width:30px;flex-shrink:0;background:#17171c;border-right:1px solid rgba(140,140,146,.14);display:flex;flex-direction:column;justify-content:center;gap:3px;padding:0 5px}
+.hk-lbl i{height:3px;border-radius:2px;background:rgba(180,180,190,.35)}
+.hk-lbl i:nth-child(2){width:60%;background:rgba(180,180,190,.2)}
+.hk-lane{position:relative;flex:1;background:#0d0d11}
+.hk-clip{position:absolute;top:3px;left:6px;width:48px;height:18px;border-radius:4px;overflow:hidden;background:linear-gradient(135deg,#2aa7c4,#1d6f9e);box-shadow:0 1px 4px rgba(0,0,0,.4)}
+.hk-clip-strip{position:absolute;inset:0;background:linear-gradient(90deg,rgba(255,255,255,.14) 0 1px,transparent 1px 9px);opacity:.5}
+.hk-clip-lbl{position:absolute;left:4px;top:6px;width:22px;height:3px;border-radius:2px;background:rgba(255,255,255,.6)}
+.hk-clip-sel{outline:2px solid #ff8a00;outline-offset:0;box-shadow:0 0 8px rgba(255,138,0,.5)}
+
+/* cursor pointer that follows a drag */
+.hk-cursor{position:absolute;width:13px;height:13px;z-index:5;pointer-events:none;background:no-repeat center/contain url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M5 2l14 11-6 1 3.5 7-3 1.5L10 15l-5 4z' fill='white' stroke='black' stroke-width='1.5' stroke-linejoin='round'/></svg>");filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}
+
+/* badge (small circular hint, e.g. ↶ / C / V / ✕) */
+.hk-badge{position:absolute;right:8px;top:8px;width:20px;height:20px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:#fff;background:linear-gradient(135deg,#ff9a1f,#ff4b1f);box-shadow:0 2px 6px rgba(255,90,30,.45);animation:hkBadge 2.2s ease-in-out infinite}
+.hk-badge-x{background:linear-gradient(135deg,#ff6a6a,#e23a3a)}
+@keyframes hkBadge{0%,20%{transform:scale(0);opacity:0}35%,70%{transform:scale(1);opacity:1}90%,100%{transform:scale(0);opacity:0}}
+
+/* — play: mini preview frame + playback bar with sweeping head — */
+.hk-prev{position:relative;align-self:center;width:54px;height:40px;border-radius:5px;background:linear-gradient(160deg,#1d2230,#11131b);border:1px solid rgba(140,140,146,.2);overflow:hidden}
+.hk-prev-sub{position:absolute;left:50%;bottom:6px;transform:translateX(-50%);width:30px;height:6px;border-radius:2px;background:#fff;box-shadow:0 0 0 2px rgba(0,0,0,.5);animation:hkSub 1.9s steps(1) infinite}
+@keyframes hkSub{0%,50%{opacity:.25}55%,100%{opacity:1}}
+.hk-pbbar{display:flex;align-items:center;gap:6px;align-self:center;width:118px}
+.hk-pbplay,.hk-pbpause{width:12px;height:12px;flex-shrink:0}
+.hk-pbplay{background:#ff8a00;clip-path:polygon(0 0,100% 50%,0 100%);animation:hkIconA 1.9s steps(1) infinite}
+.hk-pbpause{margin-left:-12px;background:linear-gradient(90deg,#ff8a00 0 4px,transparent 4px 8px,#ff8a00 8px 12px);animation:hkIconB 1.9s steps(1) infinite}
+@keyframes hkIconA{0%,49%{opacity:1}50%,100%{opacity:0}}
+@keyframes hkIconB{0%,49%{opacity:0}50%,100%{opacity:1}}
+.hk-pbtrack{position:relative;flex:1;height:4px;border-radius:3px;background:rgba(140,140,146,.3)}
+.hk-pbhead{position:absolute;top:-4px;left:0;width:3px;height:12px;border-radius:2px;background:#ff8a00;box-shadow:0 0 6px #ff8a00;animation:hkHead 1.9s linear infinite}
+@keyframes hkHead{0%{left:2px}92%{left:94px}100%{left:94px}}
+
+/* — undo: clip slides out then snaps back — */
+.hk-clip-undo{animation:hkUndo 2.6s ease-in-out infinite}
+@keyframes hkUndo{0%,10%{left:6px}38%{left:54px}50%{left:54px}74%,100%{left:6px}}
+
+/* — copy: a translucent ghost lifts off the selected clip — */
+.hk-clip-ghost{opacity:0;background:linear-gradient(135deg,#54c8e4,#2f8fc0);animation:hkGhost 2.4s ease-in-out infinite}
+@keyframes hkGhost{0%,22%{transform:translate(0,0);opacity:0}50%{transform:translate(9px,-10px);opacity:.6}80%,100%{transform:translate(16px,-16px);opacity:0}}
+
+/* — paste: a copy lands as a NEW layer (top row) above the original — */
+.hk-trow-new{animation:hkPasteRow 2.5s ease-in-out infinite}
+@keyframes hkPasteRow{0%,28%{outline:1.5px solid transparent}46%,80%{outline:1.5px solid rgba(255,138,0,.55)}95%,100%{outline-color:transparent}}
+.hk-clip-pastein{opacity:0;animation:hkPasteIn 2.5s ease-in-out infinite}
+@keyframes hkPasteIn{0%,28%{opacity:0;transform:translateY(-12px) scale(.95)}50%,100%{opacity:1;transform:translateY(0) scale(1)}}
+
+/* — delete: selected clip poofs away — */
+.hk-clip-del{transform-origin:center;animation:hkDel 2.2s ease-in-out infinite}
+@keyframes hkDel{0%,34%{transform:scale(1);opacity:1}64%{transform:scale(.1) rotate(12deg);opacity:0}99%{opacity:0}100%{transform:scale(1);opacity:1}}
+
+/* — snap: a clip slides in and magnetically butts against another's edge — */
+.hk-clip-static{left:56px;background:linear-gradient(135deg,#9a6cff,#6d4ad6)}
+.hk-clip-snapmove{left:8px;animation:hkSnap 2.6s ease-in-out infinite}
+@keyframes hkSnap{0%{left:-34px}48%{left:14px}60%{left:6px}66%,100%{left:8px}}
+.hk-snapline{position:absolute;left:56px;top:1px;bottom:1px;width:2px;background:#ff8a00;box-shadow:0 0 7px #ff8a00;opacity:0;animation:hkSnapLine 2.6s ease-in-out infinite}
+@keyframes hkSnapLine{0%,60%{opacity:0}68%{opacity:1}86%{opacity:1}100%{opacity:0}}
+
+/* — axis: preview with a text box dragged strictly horizontally — */
+.hk-prev-lg{width:100%;height:100%;align-self:stretch}
+.hk-axis-guide{position:absolute;left:8px;right:8px;top:50%;height:2px;transform:translateY(-50%);background:repeating-linear-gradient(90deg,rgba(255,138,0,.55) 0 5px,transparent 5px 11px)}
+.hk-prev-box{position:absolute;top:50%;left:14px;transform:translateY(-50%);min-width:22px;height:20px;padding:0 5px;display:flex;align-items:center;justify-content:center;border-radius:5px;font-size:11px;font-weight:800;color:#1a1206;background:#fff;box-shadow:0 1px 5px rgba(0,0,0,.5);animation:hkAxisBox 2.4s ease-in-out infinite}
+@keyframes hkAxisBox{0%{left:14px}50%{left:104px}100%{left:14px}}
+.hk-cursor-axis{top:calc(50% + 6px);animation:hkAxisCur 2.4s ease-in-out infinite}
+@keyframes hkAxisCur{0%{left:30px}50%{left:120px}100%{left:30px}}
+
+/* — reorder: clip dragged from the top row down to the highlighted row — */
+.hk-scene-2row .hk-trow{position:relative}
+.hk-trow-hl{outline:1.5px solid rgba(255,138,0,.6);background:rgba(255,138,0,.1)!important;animation:hkHl 2.6s ease-in-out infinite}
+@keyframes hkHl{0%,40%{outline-color:transparent;background:rgba(255,255,255,.022)}55%,82%{outline-color:rgba(255,138,0,.6);background:rgba(255,138,0,.1)}95%,100%{outline-color:transparent}}
+.hk-clip-move{z-index:4;animation:hkReorder 2.6s ease-in-out infinite}
+@keyframes hkReorder{0%,16%{transform:translateY(0);box-shadow:0 1px 4px rgba(0,0,0,.4)}50%,70%{transform:translateY(33px) scale(.94);box-shadow:0 6px 14px rgba(0,0,0,.55)}100%{transform:translateY(0)}}
+.hk-cursor-reorder{left:30px;top:14px;animation:hkReCur 2.6s ease-in-out infinite}
+@keyframes hkReCur{0%,16%{top:14px}50%,70%{top:47px}100%{top:14px}}
+
+/* — multi: two selected clips drag together — */
+.hk-clip-m1,.hk-clip-m2{animation:hkMulti 2.6s ease-in-out infinite}
+@keyframes hkMulti{0%,26%{transform:translateX(0)}62%,100%{transform:translateX(34px)}}
+.hk-cursor-multi{left:30px;top:22px;animation:hkMultiCur 2.6s ease-in-out infinite}
+@keyframes hkMultiCur{0%,26%{transform:translateX(0)}62%,100%{transform:translateX(34px)}}
+
+/* — zoom: the preview frame scales its subject in and out — */
+.hk-prev-clip{overflow:hidden}
+.hk-zoom-subj{position:absolute;left:50%;top:50%;width:30px;height:22px;margin:-11px 0 0 -15px;border-radius:4px;background:linear-gradient(135deg,#2aa7c4,#1d6f9e);box-shadow:0 2px 6px rgba(0,0,0,.4);animation:hkZoom 2.6s ease-in-out infinite}
+@keyframes hkZoom{0%,14%{transform:scale(1)}54%{transform:scale(1.9)}90%,100%{transform:scale(1)}}
+.hk-zoom-badge{position:absolute;right:4px;bottom:3px;font-size:12px;line-height:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6));animation:hkZoomB 2.6s ease-in-out infinite}
+@keyframes hkZoomB{0%,14%{transform:scale(1)}54%{transform:scale(1.25)}90%,100%{transform:scale(1)}}
+
+@media(max-width:680px){.hk-grid{grid-template-columns:1fr}}
+
+[data-theme="light"] .hk-lbl{background:#e7e7ec;border-right-color:rgba(30,36,56,.12)}
+[data-theme="light"] .hk-lane{background:#f4f4f7}
+[data-theme="light"] .hk-trow{background:rgba(20,24,40,.03)}
+
+/* Light theme */
+[data-theme="light"] .hk-modal{background:#fff;border-color:rgba(30,36,56,.12)}
+[data-theme="light"] .hk-head h2{color:#1a1c25}
+[data-theme="light"] .hk-row{background:rgba(20,24,40,.03);border-color:rgba(30,36,56,.1)}
+[data-theme="light"] .hk-title{color:#262934}
+[data-theme="light"] .hk-desc{color:#5c606d}
+[data-theme="light"] .hk-keys kbd{color:#9a4f00;background:linear-gradient(180deg,#fff,#f2f2f4);border-color:rgba(255,138,0,.45)}
+[data-theme="light"] .hk-demo{background:#f1f1f4;border-color:rgba(30,36,56,.12)}
+[data-theme="light"] .hk-close{background:#f2f2f4;color:#5c606d;border-color:rgba(30,36,56,.16)}
+[data-theme="light"] .hk-close:hover{border-color:#ff8a00!important;color:#ff8a00!important}

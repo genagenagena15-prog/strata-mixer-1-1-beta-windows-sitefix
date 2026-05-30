@@ -323,11 +323,16 @@ const repo = pkg.build?.publish?.[0]?.repo;
       progress.set('site', { status: 'updating', detail: 'Правлю version.json + HTML', percent: 25 });
       console.log('\n🌐 Updating marketing site on Cloudflare Pages…');
       progress.set('site', { status: 'deploying', detail: 'wrangler pages deploy…', percent: 70 });
-      const siteRes = spawnSync('node', [
+      // NO shell:true here. With a shell, Windows joins argv into one cmd.exe
+      // string and the project path (".../Project 1/...") splits on the space,
+      // so node tried to run "...\Desktop\Project" and crashed with
+      // MODULE_NOT_FOUND. Passing process.execPath + an arg array directly
+      // (shell:false) preserves spaces in both the path and the multiline notes.
+      const siteRes = spawnSync(process.execPath, [
         path.join(root, 'scripts', 'update-site.cjs'),
         newVersion,
         ...(notes ? ['--notes', notes] : []),
-      ], { stdio: 'inherit', shell: true, cwd: root, env: process.env });
+      ], { stdio: 'inherit', cwd: root, env: process.env });
       if (siteRes.status !== 0) {
         console.error('   ✗ site update failed — release on GitHub is still live');
         progress.set('site', { status: 'failed', detail: 'wrangler упал', percent: 100 });

@@ -3,8 +3,22 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.2.7';
+const APP_VERSION = 'v1.3.0';
 const DONATE_WALLET = 'TGoUEoM6AjG6KjnXJi9hFYRn54c6HsTybE';
+
+// Volume slider taper: piecewise for fine control at both ends.
+//   • 0 – 50 %:   2 v²   (smooth taper into silence — 5 % ≈ −46 dB, 1 % ≈ −74 dB)
+//   • 50 – 100 %: linear (no surprise — 75 % = −2.5 dB)
+//   • 100 – 200 %: v³    (cubic boost — 200 % = +18 dB)
+// Continuous at the boundaries. The ffmpeg export has loudnorm on the master
+// so quieting one layer doesn't drop the overall export level — the slider
+// affects only RELATIVE mix balance.
+function volumeCurve(percent) {
+  const v = Math.max(0, Number(percent) || 0) / 100;
+  if (v <= 0.5) return 2 * v * v;
+  if (v <= 1) return v;
+  return v * v * v;
+}
 
 const A = {
   icon: new URL('../assets/strata-icon.svg', import.meta.url).href,
@@ -25,16 +39,174 @@ const LAYER_ICONS = {
   image:        new URL('../assets/layer-icons/image.png', import.meta.url).href,
   audio:        new URL('../assets/layer-icons/audio.png', import.meta.url).href,
   text:         new URL('../assets/layer-icons/text.png', import.meta.url).href,
+  subtitles:    new URL('../assets/layer-icons/text.png', import.meta.url).href,
   mask:         new URL('../assets/layer-icons/mask.png', import.meta.url).href,
   blur:         new URL('../assets/layer-icons/blur.png', import.meta.url).href,
   zoom:         new URL('../assets/layer-icons/zoom.png', import.meta.url).href,
   transition:   new URL('../assets/layer-icons/transition.png', import.meta.url).href,
 };
 
+// Subtitle layout constants — SHARED contract with the ASS export in
+// electron/main.js (buildAssForSubtitles must use the same fractions so the
+// burned-in result wraps identically to the preview).
+const SUB_MAX_WIDTH_FRAC = 0.88;  // wrap when a line exceeds 88% of canvas width
+const SUB_LINE_HEIGHT = 1.25;     // line advance as a multiple of font size
+
+// Greedy word-wrap: pack words onto a line until the next word would exceed
+// maxWidth, then start a new line. `measure(text)` returns the pixel width of
+// a string in the current font. Never breaks a single word (a too-long word
+// just gets its own line). Returns an array of lines, each an array of words.
+function wrapSubtitleWords(words, measure, maxWidth) {
+  const lines = [];
+  let line = [];
+  let lineW = 0;
+  const spaceW = measure(' ');
+  for (const w of words) {
+    const ww = measure(w.text || '');
+    const addW = line.length ? spaceW + ww : ww;
+    if (line.length && lineW + addW > maxWidth) {
+      lines.push(line);
+      line = [w];
+      lineW = ww;
+    } else {
+      line.push(w);
+      lineW += addW;
+    }
+  }
+  if (line.length) lines.push(line);
+  return lines.length ? lines : [[]];
+}
+
+// Compute the EXACT on-canvas layout of one subtitle segment: wrapped lines and
+// each word's CENTER point (in output pixels) plus its active-time window. This
+// is the SINGLE source of truth shared by the canvas preview AND the burned-in
+// export — the export serializes these coordinates into absolute \pos ASS, so
+// preview and final video can never diverge on wrapping, line spacing or
+// position. `measure(text)` must use the SAME font the preview draws with.
+function layoutSubtitleSegment(seg, style, W, H, measure) {
+  const fsOrig = Math.max(8, Number(style.fontSize) || 56);
+  const segStart = Number(seg.startTime) || 0;
+  const segEnd = Math.max(segStart + 0.05, Number(seg.endTime) || segStart);
+  let words = Array.isArray(seg.words) && seg.words.length ? seg.words : null;
+  if (!words) {
+    // No per-word timings (text typed in the editor) — distribute evenly.
+    const parts = String(seg.text || '').split(/\s+/).filter(Boolean);
+    const each = parts.length ? (segEnd - segStart) / parts.length : 0;
+    words = parts.map((t, i) => ({ text: t, start: segStart + i * each, end: segStart + (i + 1) * each }));
+  }
+  if (!words.length) return { lines: [], fs: fsOrig, segStart, segEnd };
+  // PHOTOSHOP / AFTER-EFFECTS text-box model: the font size is EXPLICIT (the
+  // panel slider) and is NEVER auto-shrunk. The box only controls where the
+  // text WRAPS — its width (boxW) is the wrap width. Text renders at its real
+  // size and freely overflows the box / canvas edges (so you CAN make subs that
+  // bleed past the frame). boxH is purely the visual frame height; it no longer
+  // shrinks the text. Wrap caps at 300 % so the box can exceed the canvas.
+  const boxWFrac = Math.max(10, Math.min(300, Number(style.boxW) || 88)) / 100;
+  const maxLineWidth = W * boxWFrac;
+  const spaceW = measure(' ');
+  const wrapped = wrapSubtitleWords(words, measure, maxLineWidth);
+  // Per-layer line spacing — percent of fontSize (60–300; default 125 ≡ 1.25).
+  const lhPct = Math.max(60, Math.min(300, Number(style.lineHeight) || (SUB_LINE_HEIGHT * 100)));
+  const fs = fsOrig;                          // explicit — no auto-fit shrink
+  const lineH = fs * (lhPct / 100);
+  const blockH = wrapped.length * lineH;
+  const cx0 = ((style.x ?? 50) / 100) * W;
+  const cy0 = ((style.y ?? 85) / 100) * H;
+  let cy = cy0 - blockH / 2 + lineH / 2;
+  const out = [];
+  for (const line of wrapped) {
+    const widths = line.map(w => measure(w.text || ''));
+    const spW = spaceW;
+    const totalW = widths.reduce((a, b) => a + b, 0) + spW * Math.max(0, line.length - 1);
+    let cursor = cx0 - totalW / 2;
+    const lineWords = line.map((w, i) => {
+      const wd = widths[i];
+      const cxw = cursor + wd / 2;
+      cursor += wd + spW;
+      return {
+        text: w.text, cx: cxw, cy, w: wd,
+        start: Number(w.start) || segStart,
+        end: Math.max((Number(w.start) || segStart) + 0.02, Number(w.end) || segEnd),
+      };
+    });
+    out.push({ cy, words: lineWords });
+    cy += lineH;
+  }
+  return { lines: out, fs, segStart, segEnd };
+}
+
+// Six ready-made subtitle looks. Each preset is purely a colour trio
+// (text / outline / active-word highlight) so it renders byte-identically in
+// the canvas preview and the libass-burned export — no rasterizer-dependent
+// effects that could drift between the two.
+const SUB_EFFECTS = [
+  { id: 'classic', name: 'Классика', color: '#ffffff', outlineColor: '#000000', highlightColor: '#ff9a1f' },
+  { id: 'yellow',  name: 'Жёлтый',   color: '#ffd60a', outlineColor: '#000000', highlightColor: '#ffffff' },
+  { id: 'neon',    name: 'Неон',     color: '#aaff00', outlineColor: '#103000', highlightColor: '#ffffff' },
+  { id: 'pink',    name: 'Розовый',  color: '#ff5cc8', outlineColor: '#2a0420', highlightColor: '#ffffff' },
+  { id: 'fire',    name: 'Огонь',    color: '#ffffff', outlineColor: '#000000', highlightColor: '#ff3b1f' },
+  { id: 'ice',     name: 'Лёд',      color: '#eaffff', outlineColor: '#003b57', highlightColor: '#46d3ff' },
+];
+
+// Per-word/phrase subtitle animations. The timing constants here are the SHARED
+// contract between the canvas preview (src/main.jsx) and the ASS export
+// (electron/main.js buildAssForSubtitles) — change them in both or they drift.
+const SUB_ANIMS = [
+  { id: 'none',      name: 'Без анимации' },
+  { id: 'pop',       name: 'Поп' },              // active word scale-punches when spoken
+  { id: 'bam',       name: 'Бам' },              // overshooting pop: 150% → 85% → 100%
+  { id: 'scale',     name: 'Масштаб (зум-ин)' }, // whole phrase scales 60→100 + fades in
+  { id: 'zoomout',   name: 'Зум-аут' },          // whole phrase scales 140→100 + fades in
+  { id: 'type',      name: 'Печатная' },         // words appear one-by-one as spoken
+  { id: 'rise',      name: 'Подъём' },           // words rise up + fade in as spoken
+  { id: 'blurfocus', name: 'Размытие в фокус' }, // active word starts blurred → sharp
+  { id: 'glow',      name: 'Glow-пульс' },       // outline width pulses on active word
+  { id: 'colorwave', name: 'Цвет-волна' },       // active word cycles colours
+  { id: 'neon',      name: 'Неон-мерцание' },    // thick neon outline + rapid alpha flicker
+  { id: 'typewriter',name: 'Печатная + курсор' },// type reveal + blinking | cursor after last word
+  { id: 'shake',     name: 'Тряска' },           // ±4° rotation jitter on active word
+  { id: 'bounce',    name: 'Отскок' },           // drops in from above with squash-and-stretch
+];
+const SUB_ANIM = {
+  POP_MS: 130, POP_SCALE: 1.30,         // pop: 130% → 100% over 130ms
+  SCALE_MS: 200, SCALE_FROM: 0.60, SCALE_FADE_MS: 120,
+  RISE_MS: 150, RISE_OFFSET: 28, RISE_FADE_MS: 100,
+  // NEW:
+  BAM_MS1: 100, BAM_MS2: 180,           // bam: 150%→85% over 0-100ms, 85%→100% over 100-180ms
+  BAM_FROM: 1.50, BAM_MID: 0.85,
+  BLUR_MS: 200, BLUR_PX: 8,             // blurfocus: 8px → 0 over 200ms
+  ZOUT_MS: 200, ZOUT_FROM: 1.40, ZOUT_FADE_MS: 120,
+  GLOW_MS: 500, GLOW_MUL: 2.5,          // outline width pulses base → base*MUL → base, triangle wave
+  WAVE_MS: 350,                          // colour-wave: 350ms per colour
+  WAVE_COLORS: ['#ff9a1f', '#ff3bb8', '#46d3ff', '#aaff00'],
+  // neon: outline becomes thick + cyan, alpha flickers in 6 stages over 200ms then stable
+  NEON_MS: 200, NEON_BORD_MUL: 2.2, NEON_COLOR: '#00f0ff',
+  NEON_STAGES: [[0,50,1.0],[50,70,0.0],[70,100,1.0],[100,120,0.0],[120,160,0.45],[160,Infinity,1.0]],
+  // typewriter: cursor | blinks 250ms on / 250ms off after each revealed word
+  TYPE_CURSOR_MS: 500,                  // full blink period (on+off)
+  TYPE_CURSOR_PAD: 0.18,                // gap between word end and cursor, in fontSize units
+  // shake: 5 stages of rotation pivoting around the word center, ±4° decaying
+  SHAKE_STAGES: [[0,40,4],[40,80,-4],[80,120,3],[120,160,-2],[160,200,0]],
+  // bounce: drops from above with squash; 3 phases (drop / squash / settle)
+  BOUNCE_OFFSET: 60, BOUNCE_DROP_MS: 120, BOUNCE_SQUASH_MS: 80, BOUNCE_SETTLE_MS: 100,
+  BOUNCE_FROM_FSCX: 80, BOUNCE_FROM_FSCY: 140,   // drop start (tall+thin)
+  BOUNCE_HIT_FSCX: 120, BOUNCE_HIT_FSCY: 70,    // impact (wide+short)
+};
+// Linear lerp between two #rrggbb hex colours → "rgb(r,g,b)".
+function lerpHex(c1, c2, f) {
+  const h = (s) => [parseInt(s.slice(1,3),16), parseInt(s.slice(3,5),16), parseInt(s.slice(5,7),16)];
+  const a = h(c1), b = h(c2);
+  const r = Math.round(a[0] + (b[0]-a[0]) * f);
+  const g = Math.round(a[1] + (b[1]-a[1]) * f);
+  const bl= Math.round(a[2] + (b[2]-a[2]) * f);
+  return `rgb(${r},${g},${bl})`;
+}
+
 const nav = [
   ['home', 'Главная'],
   ['unique', 'Уникализация'],
   ['format', 'Формат и экспорт'],
+  ['transcribe', 'Распознавание речи'],
   ['editor', 'Редактирование'],
 ];
 
@@ -119,6 +291,9 @@ function App() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [donateOpen, setDonateOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // Editor-only: collapse the left sidebar so the canvas/timeline gets the
+  // full window width. CSS transitions the grid-template-columns smoothly.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem('strata_theme') === 'light' ? 'light' : 'dark'; } catch { return 'dark'; }
   });
@@ -249,10 +424,10 @@ function App() {
     <>
       <Titlebar theme={theme} onToggleTheme={toggleTheme} />
       <WindowProgressBorder progress={progress} />
-      <div className="app-shell">
+      <div className={`app-shell${active === 'editor' && sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
         <aside className="sidebar">
-          <div className="nav-list">{nav.map(([id, label]) => <button key={id} className={`nav ${active === id ? 'active' : ''}${id === 'editor' ? ' nav-editor' : ''}`} onClick={() => setActive(id)}>{label}{id === 'editor' && <span className="nav-new-badge">new</span>}</button>)}</div>
-          {active !== 'editor' && <Preview settings={settings} update={update} files={files} />}
+          <div className="nav-list">{nav.map(([id, label]) => <button key={id} className={`nav ${active === id ? 'active' : ''}${id === 'editor' ? ' nav-editor' : ''}${id === 'transcribe' ? ' nav-transcribe' : ''}`} onClick={() => setActive(id)}>{label}</button>)}</div>
+          {active !== 'editor' && active !== 'transcribe' && <Preview settings={settings} update={update} files={files} />}
           <div className="sidebar-bottom-actions">
             <button className="report-mini-btn" onClick={() => window.strata.openExternal('https://stratamixer.net/report/')} title="Сообщить об ошибке">Сообщить об ошибке</button>
             <div className="sidebar-mini-row">
@@ -262,12 +437,23 @@ function App() {
             </div>
           </div>
         </aside>
+        {active === 'editor' && (
+          <button className={`sidebar-toggle${sidebarCollapsed ? ' collapsed' : ''}`}
+            onClick={() => setSidebarCollapsed(c => !c)}
+            title={sidebarCollapsed ? 'Показать панель' : 'Скрыть панель'}
+            aria-label={sidebarCollapsed ? 'Показать панель' : 'Скрыть панель'}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+          </button>
+        )}
         <main className="main">
           <div className={`main-scroll${active === 'editor' ? ' editor-mode' : ''}`}>
             <CompactHeader active={active} files={files.length} formatText={formatText} totalOutput={totalOutput} settings={settings} />
             <div key={active} className="page-animate">
               {active === 'home' && <Home files={files} visibleFiles={visibleFiles} chooseFiles={chooseFiles} clearFiles={clearFiles} onDrop={onDrop} queueOpen={queueOpen} setQueueOpen={setQueueOpen} settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} totalOutput={totalOutput} removeFileAt={removeFileAt} moveFile={moveFile} dragIndex={dragIndex} fileNames={fileNames} setFileNames={setFileNames} />}
               {active === 'editor' && <Editor state={editorState} setState={setEditorState} />}
+              {active === 'transcribe' && <TranscribeView />}
               {active === 'format' && (
                 <Format settings={settings} applyFormat={applyFormat} update={update}>
                   <Settings settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} logs={logs} embedded />
@@ -280,8 +466,8 @@ function App() {
               )}
             </div>
           </div>
-          {active !== 'editor' && <BottomProgress progress={progress} result={result} openResults={() => setResult(result)} />}
-          {active !== 'editor' && (
+          {active !== 'editor' && active !== 'transcribe' && <BottomProgress progress={progress} result={result} openResults={() => setResult(result)} />}
+          {active !== 'editor' && active !== 'transcribe' && (
             <div className="floating-actions">
               <div className="start-summary">
                 <b>{files.length ? `Готово к запуску · видео: ${files.length} · копий: ${settings.copies} · выход: ${totalOutput}` : 'Видео не выбраны'}</b>
@@ -346,6 +532,11 @@ const BellIcon = () => <svg width="17" height="17" viewBox="0 0 24 24" fill="non
 function NotificationBell() {
   const [notifs, setNotifs] = useState([]);
   const [update, setUpdate] = useState({ status: 'idle', version: null, percent: 0, error: null });
+  // Whether the user has run a manual "check for updates" this session (so we
+  // can show "you're on the latest version" only after an explicit check).
+  const [checkedOnce, setCheckedOnce] = useState(false);
+  // One-time centered popup that shows a fresh release's patch notes.
+  const [centerModal, setCenterModal] = useState(null);
   const [open, setOpen] = useState(false);
   const [seen, setSeen] = useState(() => loadSeenIds());
   const [toasts, setToasts] = useState([]);
@@ -387,9 +578,13 @@ function NotificationBell() {
       } else {
         fresh.forEach(n => announcedRef.current.add(n.id));
       }
-      fresh.forEach((n) => {
-        spawnToast({ kind: 'info', title: n.title || 'Новое сообщение', body: n.body || '' });
-      });
+      if (fresh.length) {
+        // The one-time "what's new" popup is now a CENTERED modal showing the
+        // release's patch notes (instead of a corner toast). Show the newest.
+        const newest = [...fresh].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))[0];
+        if (!mutedRef.current) playNotifChime();
+        setCenterModal({ title: newest.title || 'Что нового', body: newest.body || '', version: newest.version, kind: 'info' });
+      }
       // Mark them as seen so we never re-toast on next launch.
       if (fresh.length) {
         const next = new Set(seenSet);
@@ -423,7 +618,10 @@ function NotificationBell() {
   }, []);
 
   useEffect(() => {
-    if (!open) return;
+    // Pause the outside-click + Escape handlers while a centered modal is on
+    // top — otherwise the same click that dismisses the modal also closes the
+    // bell. Result: one click closes just the modal and the bell stays open.
+    if (!open || centerModal) return;
     const onDown = (e) => {
       if (panelRef.current?.contains(e.target) || btnRef.current?.contains(e.target)) return;
       setOpen(false);
@@ -432,7 +630,7 @@ function NotificationBell() {
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
-  }, [open]);
+  }, [open, centerModal]);
 
   const updateUnread = (update.status === 'downloaded' || update.status === 'mac-available') && update.version && !seen.has('update:' + update.version);
   const unreadCount = notifs.filter((n) => !seen.has(n.id)).length + (updateUnread ? 1 : 0);
@@ -454,8 +652,44 @@ function NotificationBell() {
   function toggleMute() {
     setMuted((m) => { const nm = !m; try { localStorage.setItem(NOTIF_MUTE_KEY, nm ? '1' : '0'); } catch {} return nm; });
   }
+  // Manual "check for updates" from the persistent card. Triggers the main
+  // process to poll GitHub; the bell's update state reacts via the onState
+  // subscription further up.
+  function doCheck() {
+    setCheckedOnce(true);
+    try { window.strata?.update?.check?.(); } catch {}
+  }
+  function closeCenterModal() {
+    if (centerModal && centerModal.id) {
+      const next = new Set(seen); next.add(centerModal.id);
+      saveSeenIds(next); setSeen(next);
+    }
+    setCenterModal(null);
+  }
+  // Download + run the previous published version (real rollback), instead of
+  // just opening the GitHub releases page. Main handles confirm + download.
+  function doRollback() { try { window.strata?.update?.rollback?.(); } catch { openReleases(); } }
+  // Render a patch-notes body string into lines, honouring **bold** and blank
+  // lines as gaps.
+  function renderNotesBody(body) {
+    return String(body || '').split(/\r?\n/).map((line, i) => {
+      const t = line.trim();
+      if (!t) return <div key={i} className="umb-gap" />;
+      const parts = t.split(/(\*\*[^*]+\*\*)/g).map((seg, j) =>
+        /^\*\*[^*]+\*\*$/.test(seg) ? <strong key={j}>{seg.slice(2, -2)}</strong> : seg);
+      return <div key={i} className="umb-line">{parts}</div>;
+    });
+  }
 
-  const ordered = [...notifs].reverse();
+  // Newest first: sort by ISO date (YYYY-MM-DD) descending. Falls back to the
+  // original order for entries that share a date or have none.
+  const ordered = [...notifs]
+    .map((n, i) => ({ n, i }))
+    .sort((a, b) => {
+      const d = String(b.n.date || '').localeCompare(String(a.n.date || ''));
+      return d !== 0 ? d : a.i - b.i;
+    })
+    .map((x) => x.n);
   const showEmpty = ordered.length === 0 && update.status !== 'downloaded' && update.status !== 'downloading' && update.status !== 'mac-available';
 
   return <>
@@ -477,30 +711,39 @@ function NotificationBell() {
           </div>
         </div>
         <div className="notif-panel-body">
-          {update.status === 'downloaded' && (
+          {(update.status === 'downloaded' || update.status === 'mac-available') ? (
             <div className="notif-update-card ready">
-              <div className="nuc-title">Обновление готово{update.version ? ` · v${update.version}` : ''}</div>
-              <div className="nuc-text">Обновись сейчас или просто закрой программу — новая версия установится автоматически при следующем запуске.</div>
-              <button className="nuc-btn" onClick={doInstall}>Обновить сейчас</button>
-              <a className="nuc-rollback" onClick={(e) => { e.preventDefault(); openReleases(); }} href="#">Проблемы? Скачать старую версию</a>
+              <div className="nuc-title">{update.status === 'mac-available' ? 'Доступна новая версия' : 'Обновление готово'}{update.version ? ` · v${update.version}` : ''}</div>
+              <div className="nuc-text">{update.status === 'mac-available'
+                ? 'На Mac обновление ставится вручную: нажми «Скачать», установи DMG в Applications.'
+                : 'Обновись сейчас или просто закрой программу — новая версия установится автоматически при следующем запуске.'}</div>
+              <button className="nuc-btn" onClick={doInstall}>{update.status === 'mac-available' ? 'Скачать' : 'Обновить сейчас'}</button>
+              <a className="nuc-rollback" onClick={(e) => { e.preventDefault(); doRollback(); }} href="#">Проблемы? Скачать предыдущую версию</a>
+            </div>
+          ) : (
+            <div className="notif-update-card current">
+              <div className="nuc-title">Текущая версия · {APP_VERSION}</div>
+              {update.status === 'downloading' ? (
+                <>
+                  <div className="nuc-bar"><i style={{ width: `${Math.round(update.percent || 0)}%` }} /></div>
+                  <div className="nuc-text">Загрузка обновления… {Math.round(update.percent || 0)}%</div>
+                </>
+              ) : (
+                <div className="nuc-text">
+                  {update.status === 'checking' ? 'Проверяем обновления…'
+                    : update.status === 'error' ? 'Не удалось проверить. Попробуй позже.'
+                    : checkedOnce ? 'У вас последняя версия ✓'
+                    : 'Проверьте, есть ли новая версия.'}
+                </div>
+              )}
+              {update.status !== 'downloading' && (
+                <button className="nuc-btn ghost" onClick={doCheck} disabled={update.status === 'checking'}>
+                  {update.status === 'checking' ? 'Проверяем…' : 'Проверить обновление'}
+                </button>
+              )}
+              <a className="nuc-rollback" onClick={(e) => { e.preventDefault(); doRollback(); }} href="#">Скачать предыдущую версию</a>
             </div>
           )}
-          {update.status === 'mac-available' && (
-            <div className="notif-update-card ready">
-              <div className="nuc-title">Доступна новая версия{update.version ? ` · v${update.version}` : ''}</div>
-              <div className="nuc-text">На Mac обновление ставится вручную: нажми «Скачать», установи DMG в Applications.</div>
-              <button className="nuc-btn" onClick={doInstall}>Скачать</button>
-              <a className="nuc-rollback" onClick={(e) => { e.preventDefault(); openReleases(); }} href="#">Проблемы? Скачать старую версию</a>
-            </div>
-          )}
-          {update.status === 'downloading' && (
-            <div className="notif-update-card">
-              <div className="nuc-title">Загрузка обновления{update.version ? ` · v${update.version}` : ''}</div>
-              <div className="nuc-bar"><i style={{ width: `${Math.round(update.percent || 0)}%` }} /></div>
-              <div className="nuc-text">{Math.round(update.percent || 0)}% — можно продолжать работу</div>
-            </div>
-          )}
-          {update.status === 'checking' && <div className="notif-update-card subtle"><div className="nuc-text">Проверяем обновления…</div></div>}
           {showEmpty && <div className="notif-empty">Пока нет уведомлений</div>}
           {ordered.map((n) => (
             <div key={n.id} className={`notif-item ${n.type === 'update' ? 'is-update' : 'is-info'}${seen.has(n.id) ? '' : ' fresh'}`}>
@@ -528,12 +771,25 @@ function NotificationBell() {
               {t.kind === 'update-ready' && <button className="nt-btn" onClick={(e) => { e.stopPropagation(); doInstall(); }}>Обновить</button>}
               {t.kind === 'update-mac' && <button className="nt-btn" onClick={(e) => { e.stopPropagation(); doInstall(); }}>Скачать</button>}
               {(t.kind === 'update-ready' || t.kind === 'update-mac') && (
-                <a className="nt-rollback" onClick={(e) => { e.stopPropagation(); e.preventDefault(); openReleases(); }} href="#">Проблемы? Скачать старую версию</a>
+                <a className="nt-rollback" onClick={(e) => { e.stopPropagation(); e.preventDefault(); doRollback(); }} href="#">Проблемы? Скачать предыдущую версию</a>
               )}
             </div>
             <button className="nt-close" onClick={(e) => { e.stopPropagation(); dismissToast(t.key); }} aria-label="Скрыть">×</button>
           </div>
         ))}
+      </div>, document.body)}
+    {centerModal && createPortal(
+      <div className="update-modal-overlay" onClick={closeCenterModal}>
+        <div className="update-modal" onClick={(e) => e.stopPropagation()}>
+          <button className="update-modal-x" onClick={closeCenterModal} aria-label="Закрыть">×</button>
+          {centerModal.version && <div className="update-modal-badge">v{centerModal.version}</div>}
+          <h2 className="update-modal-title">{centerModal.title}</h2>
+          <div className="update-modal-body">{renderNotesBody(centerModal.body)}</div>
+          <div className="update-modal-actions">
+            {centerModal.kind === 'update-ready' && <button className="nuc-btn" onClick={() => { doInstall(); closeCenterModal(); }}>Обновить сейчас</button>}
+            <button className="update-modal-ok" onClick={closeCenterModal}>Понятно</button>
+          </div>
+        </div>
       </div>, document.body)}
   </>;
 }
@@ -594,8 +850,217 @@ function WindowProgressBorder({ progress }) {
     <i className="wpb-left" style={{ height: side(75) }} />
   </div>;
 }
+// Standalone "speech → text" view (left-sidebar tab). Pick any video/audio
+// file and read out what's spoken in it — same Groq Whisper backend as the
+// auto-subtitles, but as a plain transcript with copy.
+function TranscribeView() {
+  const [file, setFile] = useState(null);
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [prog, setProg] = useState(null);
+  const [err, setErr] = useState('');
+  const [lang, setLang] = useState('auto');
+  const [copied, setCopied] = useState(false);
+
+  async function run(which) {
+    const f = which || file;
+    if (!f || busy) return;
+    if (!window.strata?.transcribe?.file) { setErr('Движок распознавания недоступен — обнови программу.'); return; }
+    setErr(''); setText(''); setCopied(false); setBusy(true); setProg({ phase: 'extract', percent: 0 });
+    let off = null;
+    try { off = window.strata.transcribe.onProgress(info => setProg(info)); } catch {}
+    try {
+      const res = await window.strata.transcribe.file({ file: f, language: lang });
+      if (!res?.ok) { setErr(res?.error || 'Не удалось распознать речь'); setProg(null); return; }
+      setText(res.fullText || '');
+      setProg({ phase: 'done', percent: 100 });
+      setTimeout(() => setProg(null), 600);
+    } catch (e) { setErr(String(e?.message || e)); setProg(null); }
+    finally { setBusy(false); if (off) try { off(); } catch {} }
+  }
+  async function pickAndRun() {
+    if (busy) return;
+    let f;
+    try { f = await window.strata?.pickMedia?.(); } catch {}
+    if (Array.isArray(f)) f = f[0];
+    if (f && typeof f === 'object') f = f.path || f.file || '';
+    if (!f) return;
+    setFile(f);
+    run(f);
+  }
+  function copy() { if (!text) return; try { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {} }
+  function onDrop(e) {
+    e.preventDefault();
+    e.currentTarget.classList.remove('drag-over');
+    if (busy) return;
+    const f = Array.from(e.dataTransfer.files || []).map(x => window.strata?.getPathForFile?.(x)).filter(Boolean)[0];
+    if (!f) return;
+    setFile(f); run(f);
+  }
+
+  const phaseLabel = prog && (prog.phase === 'extract' ? 'Извлекаем звук…'
+    : prog.phase === 'upload' ? 'Распознаём речь…'
+    : prog.phase === 'pack' ? 'Почти готово…'
+    : prog.phase === 'done' ? 'Готово' : 'Обработка…');
+
+  return (
+    <div className="tr-view">
+      <div className="tr-card">
+        <h2 className="tr-title">Распознавание речи</h2>
+        <p className="tr-sub">Загрузи видео или аудио — определим, что в нём говорят, и покажем текст. Его можно скопировать.</p>
+
+        <div className="tr-controls">
+          <label className="tr-lang">
+            <span>Язык речи</span>
+            <select value={lang} onChange={e => setLang(e.target.value)} disabled={busy}>
+              <option value="auto">Авто (определить)</option>
+              <option value="ru">Русский</option>
+              <option value="pt">Português</option>
+              <option value="en">English</option>
+              <option value="es">Español</option>
+              <option value="de">Deutsch</option>
+              <option value="fr">Français</option>
+              <option value="it">Italiano</option>
+              <option value="uk">Українська</option>
+            </select>
+          </label>
+          <button className="tr-load-btn" onClick={pickAndRun} disabled={busy}>
+            {busy ? 'Распознаём…' : (text ? 'Другое видео' : '＋ Загрузить видео')}
+          </button>
+        </div>
+
+        {file && <div className="tr-file" title={file}>📄 {fileName(file)}</div>}
+
+        {busy && prog && (
+          <div className="tr-prog">
+            <div className="tr-prog-bar"><div className="tr-prog-fill" style={{ width: `${prog.percent || 0}%` }} /></div>
+            <span className="tr-prog-label">{phaseLabel} {prog.percent != null ? `${prog.percent}%` : ''}</span>
+          </div>
+        )}
+
+        {err && <div className="tr-error">⚠ {err}</div>}
+
+        {text && !busy && (
+          <>
+            <textarea className="tr-text" readOnly value={text} spellCheck={false} />
+            <div className="tr-acts">
+              <button className="tr-copy" onClick={copy}>{copied ? '✓ Скопировано' : '📋 Копировать текст'}</button>
+              <button className="tr-redo" onClick={() => run(file)} disabled={busy || !file}>↻ Распознать заново</button>
+            </div>
+          </>
+        )}
+
+        {!text && !busy && !err && (
+          <section className="card wide upload-card tr-drop"
+            onClick={pickAndRun}
+            onDrop={onDrop}
+            onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }}
+            onDragLeave={e => e.currentTarget.classList.remove('drag-over')}>
+            <img className="upload-bg" src={A.upload} alt="" aria-hidden="true" />
+            <h2>Перетащи видео сюда</h2><p>или нажми, чтобы выбрать файл</p>
+            <strong>Распознаем речь и покажем текст</strong>
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Editor hotkeys cheat-sheet. Each row has a tiny CSS-animated demo (no gif
+// assets) that loops to show what the shortcut does.
+function HotkeysOverlay({ onClose }) {
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); onClose(); } };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onClose]);
+  const isMac = /Mac/i.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '');
+  const mod = isMac ? '⌘' : 'Ctrl';
+  const rows = [
+    { keys: ['Пробел'], title: 'Играть / пауза', desc: 'Запускает и останавливает предпросмотр', demo: 'play' },
+    { keys: [mod, 'Z'], title: 'Отменить', desc: 'Откатывает последнее действие', demo: 'undo' },
+    { keys: [mod, 'C'], title: 'Копировать', desc: 'Копирует выделенный слой или несколько выделенных слоёв', demo: 'copy' },
+    { keys: [mod, 'V'], title: 'Вставить', desc: 'Вставляет копию отдельным новым слоем', demo: 'paste' },
+    { keys: ['Delete'], title: 'Удалить', desc: 'Удаляет выделенный слой или несколько выделенных слоёв', demo: 'delete' },
+    { keys: ['Shift', '+ тащить'], title: 'Ровное перемещение', desc: 'На превью объект едет строго по горизонтали или вертикали', demo: 'axis' },
+    { keys: ['Shift', '+ тащить'], title: 'Прилипание к клипам', desc: 'На таймлайне клип примагничивается к началу и концу других — стык встык без зазоров', demo: 'snap' },
+    { keys: ['Тащить', '↑ ↓'], title: 'Сменить дорожку', desc: 'Веди клип вверх/вниз — он прилипнет к другой дорожке', demo: 'reorder' },
+    { keys: ['Shift / Ctrl', '+ клик'], title: 'Выделить несколько', desc: 'Shift — выделить диапазон слоёв, Ctrl — добавлять по одному; двигаются вместе', demo: 'multi' },
+    { keys: ['Масштабирование'], title: 'Масштаб превью', desc: 'Нажми на лупу с процентами на превью и тяни вверх/вниз — приближай и отдаляй кадр', demo: 'zoom' },
+  ];
+  // A mini timeline track row that mirrors the real editor: dark label column
+  // (clip name + a row of action dots) + a lane holding a coloured clip.
+  const Clip = (cls = '') => (
+    <span className={`hk-clip ${cls}`}><i className="hk-clip-strip" /><i className="hk-clip-lbl" /></span>
+  );
+  const Row = (laneChildren, cls = '') => (
+    <span className={`hk-trow ${cls}`}>
+      <span className="hk-lbl"><i /><i /></span>
+      <span className="hk-lane">{laneChildren}</span>
+    </span>
+  );
+  const Cursor = (cls = '') => <span className={`hk-cursor ${cls}`} aria-hidden="true" />;
+  const Demo = ({ type }) => {
+    switch (type) {
+      case 'play':
+        return (
+          <div className="hk-scene hk-scene-play">
+            <span className="hk-prev"><i className="hk-prev-sub" /></span>
+            <span className="hk-pbbar"><i className="hk-pbplay" /><i className="hk-pbpause" /><span className="hk-pbtrack"><i className="hk-pbhead" /></span></span>
+          </div>
+        );
+      case 'undo':
+        return <div className="hk-scene">{Row(<>{Clip('hk-clip-undo')}</>)}<span className="hk-badge">↶</span></div>;
+      case 'copy':
+        return <div className="hk-scene">{Row(<>{Clip('hk-clip-sel')}{Clip('hk-clip-ghost')}</>)}<span className="hk-badge hk-badge-c">C</span></div>;
+      case 'paste':
+        return <div className="hk-scene hk-scene-2row">{Row(<>{Clip('hk-clip-pastein')}</>, 'hk-trow-a hk-trow-new')}{Row(<>{Clip()}</>, 'hk-trow-b')}<span className="hk-badge hk-badge-v">V</span></div>;
+      case 'delete':
+        return <div className="hk-scene">{Row(<>{Clip('hk-clip-sel hk-clip-del')}</>)}<span className="hk-badge hk-badge-x">✕</span></div>;
+      case 'axis':
+        return (
+          <div className="hk-scene hk-scene-prev">
+            <span className="hk-prev hk-prev-lg"><i className="hk-axis-guide" /><span className="hk-prev-box">Aa</span>{Cursor('hk-cursor-axis')}</span>
+          </div>
+        );
+      case 'snap':
+        return <div className="hk-scene">{Row(<>{Clip('hk-clip-snapmove')}{Clip('hk-clip-static')}<i className="hk-snapline" /></>)}</div>;
+      case 'reorder':
+        return <div className="hk-scene hk-scene-2row">{Row(<>{Clip('hk-clip-move')}</>, 'hk-trow-a')}{Row(null, 'hk-trow-b hk-trow-hl')}{Cursor('hk-cursor-reorder')}</div>;
+      case 'multi':
+        return <div className="hk-scene hk-scene-2row">{Row(<>{Clip('hk-clip-sel hk-clip-m1')}</>, 'hk-trow-a')}{Row(<>{Clip('hk-clip-sel hk-clip-m2')}</>, 'hk-trow-b')}{Cursor('hk-cursor-multi')}</div>;
+      case 'zoom':
+        return <div className="hk-scene hk-scene-prev"><span className="hk-prev hk-prev-lg hk-prev-clip"><span className="hk-zoom-subj" /><span className="hk-zoom-badge">🔍</span></span></div>;
+      default: return null;
+    }
+  };
+  return createPortal(
+    <div className="hk-overlay" onClick={onClose}>
+      <div className="hk-modal" onClick={e => e.stopPropagation()}>
+        <div className="hk-head">
+          <h2>Управление редактором</h2>
+          <button className="hk-close" onClick={onClose} aria-label="Закрыть">×</button>
+        </div>
+        <div className="hk-grid">
+          {rows.map((r, i) => (
+            <div className="hk-row" key={i}>
+              <div className="hk-demo" data-demo={r.demo}><Demo type={r.demo} /></div>
+              <div className="hk-info">
+                <div className="hk-keys">{r.keys.map((k, j) => <kbd key={j}>{k}</kbd>)}</div>
+                <div className="hk-title">{r.title}</div>
+                <div className="hk-desc">{r.desc}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 function CompactHeader({ active, files, formatText, totalOutput, settings }) {
-  const titles = { home: 'Главная', format: 'Формат и экспорт', unique: 'Уникализация и водяной знак', editor: 'Редактирование' };
+  const titles = { home: 'Главная', format: 'Формат и экспорт', unique: 'Уникализация и водяной знак', transcribe: 'Распознавание речи', editor: 'Редактирование' };
   // Editor tab gets a focused header: just the title + the project-level
   // action buttons. The info chips (видео / формат / копий / выход) only
   // make sense for the batch-uniqualization pipeline, not for the editor.
@@ -606,7 +1071,7 @@ function CompactHeader({ active, files, formatText, totalOutput, settings }) {
       <div className="editor-header-actions">
         <button className="ed-file-btn" onClick={fire('strata:editor-open-project')} title="Открыть проект (Ctrl+O)">Открыть проект</button>
         <button className="ed-file-btn" onClick={fire('strata:editor-save-project')} title="Сохранить проект (Ctrl+S)">Сохранить проект</button>
-        <button className="btn primary ed-header-save-btn" onClick={fire('strata:editor-save')} title="Сохранить готовое видео">Сохранить</button>
+        <button className="btn primary ed-header-save-btn" data-onb="save" onClick={fire('strata:editor-save')} title="Сохранить готовое видео">Сохранить</button>
       </div>
     </div>;
   }
@@ -964,7 +1429,85 @@ function DonateModal({ onClose }) {
   </div></div>;
 }
 
-function Slider({ label, value, min, max, onChange, disabled=false }) { return <label className={`slider ${disabled ? 'disabled' : ''}`} aria-disabled={disabled}><span>{label}<b>{value}</b></span><input type="range" min={min} max={max} value={value} aria-disabled={disabled} tabIndex={disabled ? -1 : 0} onChange={(e) => { if (!disabled) onChange(Number(e.target.value)); }} /></label>; }
+// Slider with click-to-type value. Clicking the bold value swaps it for an
+// inline number input so the user can punch in exact percents instead of
+// wrestling the range thumb (which on small ranges jumps in coarse steps).
+// Font dropdown with per-row preview: "Aa" rendered in that font followed by
+// the family name in a neutral face. The native <select>/<option> can't render
+// each option in its own font face reliably + can't mix font-families inside
+// one row, so this is a custom popover.
+function FontPicker({ value, fonts, onChange }) {
+  const [open, setOpen] = React.useState(false);
+  const wrapRef = React.useRef(null);
+  const current = fonts.find(f => f.name === value);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+  // Bundled fonts use the smf_<id> @font-face we registered on mount; system
+  // fonts are referenced by the OS family name directly.
+  const previewFamily = (f) => f.name.startsWith('★ ')
+    ? fontCss({ fontFile: f.file })
+    : `"${f.name.replace(/"/g, '')}", Arial, sans-serif`;
+  const pickItem = (name) => { onChange(name); setOpen(false); };
+  return (
+    <div className="font-picker" ref={wrapRef}>
+      <button type="button" className="font-picker-btn" onClick={() => setOpen(o => !o)}>
+        <span className="font-picker-sample" style={current ? { fontFamily: previewFamily(current) } : undefined}>Aa</span>
+        <span className="font-picker-name">{current ? current.name : 'По умолчанию'}</span>
+        <span className="font-picker-chev" aria-hidden="true">▾</span>
+      </button>
+      {open && (
+        <div className="font-picker-list" role="listbox">
+          <div className={`font-picker-item${!current ? ' active' : ''}`}
+            onMouseDown={(e) => { e.preventDefault(); pickItem(''); }}>
+            <span className="font-picker-sample">Aa</span>
+            <span className="font-picker-name">По умолчанию</span>
+          </div>
+          {fonts.map(f => (
+            <div key={f.file}
+              className={`font-picker-item${f.name === value ? ' active' : ''}`}
+              onMouseDown={(e) => { e.preventDefault(); pickItem(f.name); }}>
+              <span className="font-picker-sample" style={{ fontFamily: previewFamily(f) }}>Aa</span>
+              <span className="font-picker-name">{f.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+function Slider({ label, value, min, max, onChange, disabled=false, step=1 }) {
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState('');
+  const commit = () => {
+    const n = Number(draft);
+    if (Number.isFinite(n)) onChange(Math.max(Number(min), Math.min(Number(max), Math.round(n))));
+    setEditing(false);
+  };
+  return <label className={`slider ${disabled ? 'disabled' : ''}`} aria-disabled={disabled}>
+    <span>{label}
+      {editing
+        ? <input className="slider-edit" type="number" min={min} max={max} value={draft} autoFocus
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={e => { if (e.key === 'Enter') commit(); else if (e.key === 'Escape') setEditing(false); }} />
+        : <b onClick={() => { if (!disabled) { setDraft(String(value)); setEditing(true); } }} title="Клик чтобы вписать значение">{value}</b>}
+    </span>
+    <input type="range" min={min} max={max} step={step} value={value}
+      aria-disabled={disabled} tabIndex={disabled ? -1 : 0}
+      onChange={(e) => { if (!disabled) onChange(Number(e.target.value)); }}
+      onWheel={(e) => {
+        if (disabled) return;
+        e.preventDefault();
+        const dir = e.deltaY < 0 ? 1 : -1;
+        const next = Math.max(Number(min), Math.min(Number(max), Number(value) + dir * Number(step || 1)));
+        if (next !== Number(value)) onChange(next);
+      }} />
+  </label>;
+}
 function Switch({ label, checked, onChange, disabled=false }) { return <label className={`switch ${disabled ? 'disabled' : ''}`}><input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} /><span className="switch-toggle"/><div className="switch-label">{label}</div></label>; }
 function playDoneSound() { try { const ctx = new (window.AudioContext || window.webkitAudioContext)(); [523, 659, 784].forEach((f, i) => { const o = ctx.createOscillator(); const g = ctx.createGain(); o.frequency.value = f; o.type = 'sine'; o.connect(g); g.connect(ctx.destination); g.gain.setValueAtTime(0.0001, ctx.currentTime + i * 0.11); g.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + i * 0.11 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.11 + 0.23); o.start(ctx.currentTime + i * 0.11); o.stop(ctx.currentTime + i * 0.11 + 0.25); }); } catch {} }
 
@@ -994,13 +1537,13 @@ const ONBOARD_STEPS = [
   // — Практика —
   { t: 'Откройте эффекты', d: 'Откройте подсвеченную вкладку «Эффекты».', sel: '[data-onb="effects"]', resetTab: true,
     done: c => c.edPropTab === 'effects' },
-  { t: 'Добавьте текст', d: 'В блоке «Эффект-слои» нажмите подсвеченную кнопку «Текст» — на видео появится текстовый слой.', sel: '[data-onb="text"]', selAlt: '[data-onb="effects"]',
+  { t: 'Добавьте текст', d: 'В блоке «Эффект-слои» нажмите подсвеченную кнопку «Текст» — на видео появится текстовый слой.', sel: '[data-onb="text"]', selAlt: '[data-onb="effects"]', openAcc: 'layers',
     done: c => c.layers.some(l => l.type === 'text') },
   { t: 'Впишите текст', d: 'Откройте вкладку «Свойства» и впишите свой текст в подсвеченное поле.', sel: '[data-onb="textinput"]', selAlt: '[data-onb="propstab"]', delay: 2000,
     done: c => c.layers.some(l => l.type === 'text' && (l.text || '').trim().length > 0) },
   { t: 'Разместите слой на превью', d: 'Перетащите текстовый слой прямо на превью туда, где он нужен, и за уголки рамки растяните его до нужного размера.', sel: '[data-onb="preview"]',
     done: c => c.layers.some(l => l.type === 'text' && ((l.x ?? 50) !== 50 || (l.y ?? 80) !== 80) && (l.size ?? 48) !== 48) },
-  { t: 'Добавьте блюр', d: 'Вернитесь на вкладку «Эффекты» и в блоке «Эффект-слои» нажмите подсвеченную кнопку «Блюр» — на видео появится размытая область.', sel: '[data-onb="blur"]', selAlt: '[data-onb="effects"]',
+  { t: 'Добавьте блюр', d: 'В блоке «Эффект-слои» нажмите подсвеченную кнопку «Блюр» — на видео появится размытая область.', sel: '[data-onb="blur"]', selAlt: '[data-onb="effects"]', openAcc: 'layers',
     done: c => c.layers.some(l => l.type === 'blur') },
   { t: 'Настройте блюр', d: 'Во вкладке «Свойства» задайте «Силу блюра», а на превью растяните рамку блюра за уголки до нужного размера и поставьте туда, где надо размыть.', sel: '[data-onb="preview"]',
     done: c => c.layers.some(l => l.type === 'blur' && ((l.strength ?? 15) !== 15 || (l.width ?? 50) !== 50 || (l.height ?? 30) !== 30 || (l.x ?? 25) !== 25 || (l.y ?? 25) !== 25)) },
@@ -1181,23 +1724,46 @@ function Editor({ state, setState }) {
   // Stable string of text-layer fontFiles — recomputed when layers change,
   // but only TRIGGERS the font-loader effect when the set of fontFiles
   // actually differs (drag/move/color tweaks no longer wake it up).
+  // A layer's physical font file: text layers store it on the layer, subtitle
+  // layers store it on `.style`. Both must be loaded so the canvas preview
+  // measures and renders with the SAME face FFmpeg burns in.
+  const layerFontFile = (l) => l.type === 'subtitles' ? (l.style?.fontFile || '') : (l.type === 'text' ? (l.fontFile || '') : '');
   const textFontKey = useMemo(
-    () => layers.filter(l => l.type === 'text' && l.fontFile).map(l => l.fontFile).sort().join('|'),
+    () => layers.map(layerFontFile).filter(Boolean).sort().join('|'),
     [layers]
   );
   useEffect(() => {
     layers.forEach(layer => {
-      if (layer.type !== 'text' || !layer.fontFile) return;
-      const id = fontIdFor(layer.fontFile);
+      const fontFile = layerFontFile(layer);
+      if (!fontFile) return;
+      const id = fontIdFor(fontFile);
       if (!id || loadedFontsRef.current.has(id)) return;
       loadedFontsRef.current.add(id);
-      const url = `file:///${layer.fontFile.replace(/\\/g, '/').replace(/^\/+/, '')}`;
+      const url = `file:///${fontFile.replace(/\\/g, '/').replace(/^\/+/, '')}`;
       new FontFace(id, `url("${url}")`).load()
         .then(f => { document.fonts.add(f); setFontRevision(r => r + 1); })
         .catch(() => { loadedFontsRef.current.delete(id); });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [textFontKey]);
+
+  // Eagerly @font-face-register bundled fonts (★ prefix) so the picker dropdown
+  // renders each row in its own face for preview. System fonts don't need this
+  // — the OS already has them registered for CSS font-family lookup.
+  useEffect(() => {
+    if (!systemFonts.length) return;
+    for (const f of systemFonts) {
+      if (!f.name.startsWith('★ ')) continue;
+      const id = fontIdFor(f.file);
+      if (!id || loadedFontsRef.current.has(id)) continue;
+      loadedFontsRef.current.add(id);
+      const url = `file:///${f.file.replace(/\\/g, '/').replace(/^\/+/, '')}`;
+      new FontFace(id, `url("${url}")`).load()
+        .then(face => { document.fonts.add(face); setFontRevision(r => r + 1); })
+        .catch(() => { loadedFontsRef.current.delete(id); });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [systemFonts]);
 
   const [widthStr, setWidthStr] = useState(String(outWidth));
   const [heightStr, setHeightStr] = useState(String(outHeight));
@@ -1212,12 +1778,39 @@ function Editor({ state, setState }) {
   const [playing, setPlaying] = useState(false);
   const [selectedId, setSelectedId] = useState(null);
   const [edPropTab, setEdPropTab] = useState('props');
+  const [hotkeysOpen, setHotkeysOpen] = useState(false);
+  // Collapsed by default so the subtitle panel isn't a wall of controls.
+  const [subStyleOpen, setSubStyleOpen] = useState(false);
+  // Lightweight in-app toast for soft errors / hints. Replaces native alert()
+  // so notifications match the editor's look — dark card, orange accent.
+  const [editorHint, setEditorHint] = useState(null);
+  const editorHintTimerRef = useRef(null);
+  function showEditorHint(text, kind = 'warn') {
+    setEditorHint({ text, kind, key: Date.now() });
+    if (editorHintTimerRef.current) clearTimeout(editorHintTimerRef.current);
+    editorHintTimerRef.current = setTimeout(() => setEditorHint(null), 4000);
+  }
+  // When a subtitle layer becomes selected (timeline click / keyboard / etc),
+  // force the side panel onto «Свойства» so the user always sees subtitle
+  // controls. Otherwise switching from «Эффекты» → subtitle click leaves the
+  // panel on Эффекты with no clue where to tune the subtitle.
+  useEffect(() => {
+    if (!selectedId) return;
+    const sel = layers.find(l => l.id === selectedId);
+    if (sel?.type === 'subtitles') setEdPropTab('props');
+  }, [selectedId, layers]);
   // Which Effects section is currently expanded (accordion: only one at a time).
   // Defaults to null so all three start collapsed on tab open.
   const [effectsOpen, setEffectsOpen] = useState(null);
-  const [saveProgress, setSaveProgress] = useState(null);
   const [saveFinishing, setSaveFinishing] = useState(false);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  // Subtitle generation: { phase: 'extract'|'upload'|'pack'|'done'|'error', percent, error? }
+  // null when nothing is happening. When non-null, the progress modal renders.
+  const [subProgress, setSubProgress] = useState(null);
+  // Recognition language for auto-subtitles. 'auto' lets Whisper detect it
+  // (handles Portuguese/Russian/English/… correctly); forcing the wrong one
+  // makes the model hallucinate instead of transcribing.
+  const [subLang, setSubLang] = useState('auto');
   const [saveFmt, setSaveFmt] = useState('mp4');
   const [saveQual, setSaveQual] = useState('max');
   const [saveCustom, setSaveCustom] = useState({ videoBitrate: 0, crf: 23, fps: 0, audioBitrate: 160 });
@@ -1276,6 +1869,54 @@ function Editor({ state, setState }) {
     // ≈ 38 titlebar + 48 header + 80 editor toolbar + 200 timeline + 32 padding
     return Math.max(180, Math.min(440, wh - 420));
   });
+  // Preview zoom — driven by the +/-/reset buttons in the corner overlay.
+  // 1.0 = fit-to-frame; clamped [0.3, 5.0]. CSS transform scales the canvas
+  // visually without touching the canvas's internal resolution.
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [zoomScrubActive, setZoomScrubActive] = useState(false);
+  // Preview pan: when zoomed past 1×, the user can click-and-drag empty space
+  // on the preview to pan around. Layer hit-area pointerDown handlers call
+  // stopPropagation, so this only fires on empty preview clicks.
+  const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
+  const previewPanRef = useRef({ x: 0, y: 0 });
+  useEffect(() => { previewPanRef.current = previewPan; }, [previewPan]);
+  // Save-progress modal: driven by IPC events from the main-process bundler.
+  // Two SEPARATE states — saveProgress (number 0..100) drives the VIDEO render
+  // modal; projSaveProgress (object {phase,percent,...}) drives the PROJECT save
+  // modal. They were merged before, and a non-zero render number would also
+  // satisfy the project modal's truthy check → both modals shown simultaneously.
+  const [saveProgress, setSaveProgress] = useState(null);
+  const [projSaveProgress, setProjSaveProgress] = useState(null);
+  useEffect(() => {
+    if (!window.strata?.onSaveProgress) return;
+    return window.strata.onSaveProgress((info) => {
+      if (info?.phase === 'done') {
+        setProjSaveProgress({ ...info, percent: 100 });
+        setTimeout(() => setProjSaveProgress(null), 1100);
+      } else {
+        setProjSaveProgress(info);
+      }
+    });
+  }, []);
+  function formatBytes(b) {
+    const n = Number(b) || 0;
+    if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + ' ГБ';
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' МБ';
+    if (n >= 1024) return Math.round(n / 1024) + ' КБ';
+    return n + ' Б';
+  }
+  function resetPreviewZoom() { setPreviewZoom(1); setPreviewPan({ x: 0, y: 0 }); }
+  function startPreviewPan(e) {
+    // Always allowed (any zoom). Layer hit-area handlers call stopPropagation,
+    // so this only fires on empty preview clicks — moving layers still works.
+    e.preventDefault();
+    const startX = e.clientX, startY = e.clientY;
+    const startPanX = previewPanRef.current.x, startPanY = previewPanRef.current.y;
+    const onMove = (ev) => setPreviewPan({ x: startPanX + (ev.clientX - startX), y: startPanY + (ev.clientY - startY) });
+    const onUp = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
   // If the window is resized smaller than the current previewH allows,
   // clamp it down so the timeline and resize handle stay visible.
   useEffect(() => {
@@ -1307,13 +1948,57 @@ function Editor({ state, setState }) {
   // capture only), so we mirror them with audio-only HTML elements driven
   // by the same timeline sync logic.
   const videoAudioRefs = useRef({});
+  // Preview volume via WebAudio: routes each <audio>/<video> through a gain
+  // node so the slider can actually boost past 1.0 in the preview (the native
+  // HTMLMediaElement.volume is clamped at 1.0). The gain node uses exactly
+  // the same volumeCurve as the ffmpeg export, so what you hear in preview
+  // is what's written to the file. WeakMap keys auto-clean when React
+  // remounts an element (src change).
+  const audioCtxRef = useRef(null);
+  const gainNodesRef = useRef(new WeakMap());
+  function getAudioCtx() {
+    if (!audioCtxRef.current) {
+      try { audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch { audioCtxRef.current = null; }
+    }
+    return audioCtxRef.current;
+  }
+  function setBoostedVolume(el, percent) {
+    if (!el) return;
+    const gain = volumeCurve(percent);
+    const ctx = getAudioCtx();
+    if (!ctx) { el.volume = Math.max(0, Math.min(1, gain)); return; }
+    let node = gainNodesRef.current.get(el);
+    if (!node) {
+      try {
+        const source = ctx.createMediaElementSource(el);
+        const g = ctx.createGain();
+        source.connect(g);
+        g.connect(ctx.destination);
+        node = { source, gain: g };
+        gainNodesRef.current.set(el, node);
+      } catch {
+        el.volume = Math.max(0, Math.min(1, gain));
+        return;
+      }
+    }
+    node.gain.gain.value = gain;
+    el.volume = 1; // native volume must stay at 1 — gain node owns the level
+    if (ctx.state === 'suspended') { try { ctx.resume(); } catch {} }
+  }
   const imgCacheRef = useRef(new Map());
   const renderFrameRef = useRef(null);
+  const subtitleLayoutsRef = useRef(new Map());
   const rafRef = useRef(null);
   const measureCanvasRef = useRef(null);
   const blurTmpRef = useRef(null);
   const selAnchorRef = useRef(null);
   const layerDragRef = useRef(null);
+  // Timestamp (ms) of the last clip drag that actually moved, so the click event
+  // that fires right after pointerup doesn't reset a multi-selection. Using a
+  // timestamp (not a bare flag) means a never-delivered click can't leave it
+  // stuck and swallow a later legitimate click.
+  const suppressRowClickRef = useRef(0);
   const videoFrameCacheRef = useRef(new Map());
   // Timeline thumbnail cache. Generated once per file via a hidden <video>
   // element + canvas at low resolution; reused for every clip-instance of
@@ -1402,11 +2087,14 @@ function Editor({ state, setState }) {
   }, [onboardStep, layers.length, edPropTab, selectedId]);
 
   // Onboarding: a step marked `resetTab` forces the properties panel back to
-  // «Свойства» on entry, so the user has to open «Эффекты» again themselves.
+  // «Свойства» on entry; `openAcc` opens the named effects accordion so the
+  // button it points at (e.g. «Текст»/«Блюр» inside «Эффект-слои») is actually
+  // visible — otherwise the highlight lands on a collapsed, clipped button.
   useEffect(() => {
-    if (onboardStep >= 0 && onboardStep < ONBOARD_STEPS.length && ONBOARD_STEPS[onboardStep].resetTab) {
-      setEdPropTab('props');
-    }
+    if (onboardStep < 0 || onboardStep >= ONBOARD_STEPS.length) return;
+    const step = ONBOARD_STEPS[onboardStep];
+    if (step.resetTab) setEdPropTab('props');
+    if (step.openAcc) { setEdPropTab('effects'); setEffectsOpen(step.openAcc); }
   }, [onboardStep]);
 
   // Onboarding auto-advance: when the user performs the action the current
@@ -1510,6 +2198,11 @@ function Editor({ state, setState }) {
     });
   };
   const toggleVis = (id) => { pushUndo(); set('layers', (l) => l.map(x => x.id === id ? { ...x, hidden: !x.hidden } : x)); };
+  // Speaker toggle — silences ONLY the layer's audio (preview + export), leaving
+  // the picture untouched. Independent of `hidden` (the eye, visual-only).
+  const toggleMute = (id) => { pushUndo(); set('layers', (l) => l.map(x => x.id === id ? { ...x, muted: !x.muted } : x)); };
+  // Which layer types actually carry audio (so we only show the speaker on them).
+  const LAYER_HAS_AUDIO = (t) => t === 'mainVideo' || t === 'videoOverlay' || t === 'maskedVideo' || t === 'audio';
 
   async function addImageOverlay() {
     const f = await window.strata?.pickImage?.();
@@ -1551,6 +2244,12 @@ function Editor({ state, setState }) {
     if (kind === 'whippan') return { shift: 35 + (100 - 35) * s,  blur: 10 + (40 - 10) * s };
     if (kind === 'zoom')    return { scale: 1.5 + (3.0 - 1.5) * s, blur: 4 + (18 - 4) * s };
     if (kind === 'blur')    return { blur: 10 + (50 - 10) * s };
+    if (kind === 'seamzoom') return {
+      scale: 3 + (6 - 3) * s,         // max zoom 3× → 6×
+      blur:  8 + (22 - 8) * s,        // gaussian blur sigma at peak
+      rgb:   4 + (14 - 4) * s,        // chromatic aberration px at peak
+      flash: 0.18 + (0.38 - 0.18) * s,// white flash alpha at peak
+    };
     return {};
   }
 
@@ -1594,8 +2293,8 @@ function Editor({ state, setState }) {
       const curWpx = (x.width / 100) * outWidth;
       const curHpx = (x.height / 100) * outHeight;
       const sizePx = Math.max(curWpx, curHpx);
-      const wPct = clamp((sizePx / outWidth) * 100, 5, 100);
-      const hPct = clamp((sizePx / outHeight) * 100, 5, 100);
+      const wPct = clamp((sizePx / outWidth) * 100, 5, 300);
+      const hPct = clamp((sizePx / outHeight) * 100, 5, 300);
       return { ...x, shape: newShape, width: wPct, height: hPct };
     }));
   }
@@ -1674,6 +2373,112 @@ function Editor({ state, setState }) {
     const sysFont = systemFonts[0];
     addLayer({ id: Date.now(), type: 'text', text: '', color: '#ffffff', size: 48, opacity: 100, align: 'center', x: 50, y: 80, startTime: 0, endTime: dur, fontFamily: sysFont?.name || 'Arial', fontFile: sysFont?.file || '' });
   }
+
+  // ── Auto-subtitles via Groq Whisper ────────────────────────────────────
+  // Sends the project's full mixed audio to the cloud, gets back word-level
+  // timestamps, packs them into ~7-word phrase segments, and drops a single
+  // 'subtitles' layer on the timeline that spans the entire project.
+  async function generateSubtitlesLayer() {
+    if (subProgress) return;  // already running — modal is open
+    if (!window.strata?.subtitles?.generate) {
+      setSubProgress({ phase: 'error', error: 'Подключение к движку субтитров недоступно (обнови программу).' });
+      return;
+    }
+    // Wire up progress listener BEFORE invoking so we don't miss the first ticks.
+    let off = null;
+    try {
+      off = window.strata.subtitles.onProgress((info) => setSubProgress(info));
+    } catch {}
+    setSubProgress({ phase: 'extract', percent: 0 });
+    try {
+      const sysFont = systemFonts[0];
+      // Send the exact payload the export pipeline needs — main.js then
+      // reuses the same audio-mix logic to bake a 16kHz mono mp3 for Whisper.
+      const res = await window.strata.subtitles.generate({
+        file: state.file,
+        videoStart: state.videoStart || 0,
+        videoEnd: state.videoEnd || state.totalDuration || 0,
+        totalDuration: state.totalDuration || 0,
+        layers: state.layers || [],
+        mainVideo: state.mainVideo || (state.layers || []).find(l => l.type === 'mainVideo') || null,
+        baseAudio: state.baseAudio || null,
+        language: subLang || 'auto',
+      });
+      if (!res?.ok) {
+        setSubProgress({ phase: 'error', error: res?.error || 'Неизвестная ошибка распознавания' });
+        return;
+      }
+      const segs = Array.isArray(res.segments) ? res.segments : [];
+      if (segs.length === 0) {
+        setSubProgress({ phase: 'error', error: 'В аудио не нашлось речи. Проверь что в проекте есть голос.' });
+        return;
+      }
+      // Drop any previous subtitles layer — only one active set at a time
+      // (the user can split/merge segments inside the editor, but adding a
+      // second auto-set on top is just confusing).
+      const existingSubId = (state.layers || []).find(l => l.type === 'subtitles')?.id;
+      if (existingSubId) {
+        set('layers', (ls) => ls.filter(l => l.id !== existingSubId));
+      }
+      // Initial box-area: measure the actual widest segment + line count at the
+      // default fontSize so the orange resize frame on the preview HUGS the
+      // text from the start, instead of always opening at 88 %×100 % of the
+      // canvas (which made the frame look bigger than the subs themselves).
+      // Padding: +6 % width and +2 % height per line so the frame breathes.
+      const fsDefault = 56;
+      const fontFam = sysFont?.name || 'Arial';
+      const mc = measureCtx();
+      mc.font = `${fsDefault}px "${fontFam}", Arial, sans-serif`;
+      let maxTextW = 0, maxLines = 1;
+      for (const s of segs) {
+        const txt = String(s.text || '').trim();
+        if (!txt) continue;
+        const w = mc.measureText(txt).width;
+        if (w > maxTextW) maxTextW = w;
+        // A naive line estimate — if the segment text doesn't fit a single
+        // line at boxW≈70 %, it'll wrap; bump line count so boxH still hugs.
+        const wrapLimit = (state.outWidth || 1080) * 0.7;
+        if (w > wrapLimit) maxLines = Math.max(maxLines, Math.ceil(w / wrapLimit));
+      }
+      const outW = state.outWidth || 1080;
+      const outH = state.outHeight || 1920;
+      const initBoxW = Math.max(20, Math.min(120, Math.round((maxTextW / outW) * 100) + 6));
+      const initBoxH = Math.max(8,  Math.min(60,  Math.round((maxLines * fsDefault * 1.3 / outH) * 100) + 2));
+      addLayer({
+        id: 'sub_' + Date.now().toString(36),
+        type: 'subtitles',
+        startTime: 0,
+        endTime: state.totalDuration || segs[segs.length - 1].endTime,
+        segments: segs,
+        style: {
+          fontFamily: fontFam,
+          fontFile: sysFont?.file || '',
+          fontSize: fsDefault,
+          anim: 'pop',
+          color: '#ffffff',
+          outlineColor: '#000000',
+          highlightColor: '#ff9a1f',
+          x: 50,
+          y: 85,
+          boxW: initBoxW,
+          boxH: initBoxH,
+        },
+        clipColor: '#ff9a1f',
+      });
+      // Jump the playhead onto the first phrase so the user immediately SEES the
+      // subtitles in the preview (otherwise they only show during speech and the
+      // playhead may be parked in silence).
+      const firstStart = Number(segs[0]?.startTime) || 0;
+      setCurrentTime(Math.max(0, firstStart + 0.05));
+      setSubProgress({ phase: 'done', percent: 100 });
+      setTimeout(() => setSubProgress(null), 900);
+    } catch (e) {
+      setSubProgress({ phase: 'error', error: String(e?.message || e) });
+    } finally {
+      if (off) try { off(); } catch {}
+    }
+  }
+
   // Probe a media file for its real duration via a hidden DOM element.
   // Resolves with 0 on error so callers can fall back to the timeline default.
   function probeMediaDuration(file) {
@@ -2012,24 +2817,48 @@ function Editor({ state, setState }) {
   }
 
   function splitAtPlayhead() {
-    if (!selectedId) return;
-    const layer = layers.find(l => l.id === selectedId); if (!layer) return;
     const t = currentTime;
-    if (t <= (layer.startTime || 0) + 0.05 || t >= layer.endTime - 0.05) return;
+    // Prefer the explicitly selected layer; otherwise find any layer the
+    // playhead is currently inside (most editors auto-pick — clicking the clip
+    // first should not be required).
+    let layer = selectedId ? layers.find(l => l.id === selectedId) : null;
+    // Subtitle layers hold many phrases — splitting the whole track makes no
+    // sense (each phrase is edited individually), so they're never splittable.
+    if (layer && layer.type === 'subtitles') {
+      showEditorHint('Слой субтитров нельзя разрезать — редактируй отдельные фразы в панели субтитров.');
+      return;
+    }
+    const inside = (l) => l && t > (l.startTime || 0) + 0.05 && t < (l.endTime ?? totalDuration) - 0.05;
+    if (!inside(layer)) {
+      // Pick a splittable layer the playhead is inside. Prefer media types.
+      const order = ['videoOverlay', 'mainVideo', 'audio', 'image', 'text'];
+      const candidates = layers
+        .filter(l => inside(l) && l.type !== 'blur' && l.type !== 'mask' && l.type !== 'maskedVideo' && l.type !== 'effect' && l.type !== 'subtitles')
+        .sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
+      layer = candidates[0];
+    }
+    if (!layer) {
+      showEditorHint('Поставь курсор воспроизведения внутри клипа и попробуй ещё раз — нечего резать в этой точке.');
+      return;
+    }
+    if (t <= (layer.startTime || 0) + 0.05 || t >= (layer.endTime ?? totalDuration) - 0.05) {
+      showEditorHint('Курсор слишком близко к краю клипа — двинь его в середину и разрежь.');
+      return;
+    }
     pushUndo();
     const newId = uid();
     const consumed = t - (layer.startTime || 0);
     set('layers', (ls) => {
-      const idx = ls.findIndex(x => x.id === selectedId);
-      const res = ls.map(x => x.id === selectedId ? { ...x, endTime: t } : x);
+      const idx = ls.findIndex(x => x.id === layer.id);
+      const res = ls.map(x => x.id === layer.id ? { ...x, endTime: t } : x);
       const second = { ...layer, id: newId, startTime: t };
-      // The second piece continues from where the first one was cut.
       if (layer.type === 'videoOverlay' || layer.type === 'audio') {
         second.srcStart = (layer.srcStart || 0) + consumed;
       }
       res.splice(idx + 1, 0, second);
       return res;
     });
+    setSelectedId(layer.id);
   }
 
   function onVideoMeta(e) {
@@ -2038,7 +2867,14 @@ function Editor({ state, setState }) {
     const nAR = (v.videoWidth && v.videoHeight) ? v.videoWidth / v.videoHeight : null;
     setState((s) => {
       const next = { ...s };
-      if (d > 0) { next.totalDuration = d; next.videoStart = 0; next.videoEnd = d; }
+      if (d > 0) {
+        // Auto-fit project duration to the video's length ONLY when the user
+        // hasn't customised it (still the default 10 s). Without this check,
+        // opening a saved project would clobber the persisted totalDuration
+        // with the mainVideo's source length every time.
+        const autoFit = Math.abs(s.totalDuration - 10) < 0.01;
+        if (autoFit) { next.totalDuration = d; next.videoStart = 0; next.videoEnd = d; }
+      }
       if (nAR) {
         const frameAR = s.outWidth / s.outHeight;
         // "contain" the video inside the frame as the initial, undeformed default
@@ -2176,9 +3012,14 @@ function Editor({ state, setState }) {
         // no live audio (HTML5 can't play in reverse) — silenced.
         const aEl = videoAudioRefs.current[l.id];
         if (aEl) {
-          if (Math.abs(aEl.currentTime - t) > 0.12) aEl.currentTime = t;
+          // During playback the element runs natively in sync; only correct a
+          // LARGE drift. A tight threshold here causes audible stutter/dropouts
+          // when a heavy re-render (e.g. selecting a layer) briefly stalls the
+          // RAF loop and currentTime lags — the reseek re-buffers and clicks.
+          const aDrift = playing ? 0.35 : 0.12;
+          if (Math.abs(aEl.currentTime - t) > aDrift) aEl.currentTime = t;
           try { aEl.playbackRate = spd; } catch {}
-          aEl.volume = Math.max(0, Math.min(1, ((l.volume ?? 100) / 100)));
+          setBoostedVolume(aEl, l.volume ?? 100);
           if (playing && inRange && !l.reversed && !l.muted) {
             if (aEl.paused) aEl.play().catch(() => {});
           } else if (!aEl.paused) aEl.pause();
@@ -2188,9 +3029,12 @@ function Editor({ state, setState }) {
         if (!el) return;
         const inRange = currentTime >= (l.startTime || 0) && currentTime <= (l.endTime ?? dur);
         const t = (l.srcStart || 0) + Math.max(0, currentTime - (l.startTime || 0));
-        if (Math.abs(el.currentTime - t) > 0.12) el.currentTime = t;
-        el.volume = Math.max(0, Math.min(1, (l.volume ?? 100) / 100));
-        if (playing && inRange) { if (el.paused) el.play().catch(() => {}); }
+        // Loose during playback (native sync) / tight while scrubbing — avoids
+        // reseek stutter when a re-render briefly stalls the RAF loop.
+        if (Math.abs(el.currentTime - t) > (playing ? 0.35 : 0.12)) el.currentTime = t;
+        setBoostedVolume(el, l.volume ?? 100);
+        // Speaker toggle (muted) silences audio; the eye (hidden) never touches it.
+        if (playing && inRange && !l.muted) { if (el.paused) el.play().catch(() => {}); }
         else { if (!el.paused) el.pause(); }
       }
     });
@@ -2243,6 +3087,22 @@ function Editor({ state, setState }) {
     window.addEventListener('keydown', onKey);
     return () => { document.removeEventListener('fullscreenchange', onFsChange); window.removeEventListener('keydown', onKey); };
   }, []);
+
+  // Global Space-to-toggle-play — fires anywhere in the editor EXCEPT while a
+  // text input/textarea/contentEditable is focused (so typing a space in the
+  // segment editor or filename field doesn't pause the video).
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code !== 'Space' && e.key !== ' ') return;
+      const t = e.target;
+      const tag = t && t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable) || tag === 'SELECT') return;
+      e.preventDefault();
+      togglePlay();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
 
   // Subscribe to proxy-encode progress events. The backend emits the
   // current % per source file; we mirror it onto every layer using that file.
@@ -2419,6 +3279,19 @@ function Editor({ state, setState }) {
 
   function seekTo(t) { const v = videoRef.current; if (v) v.currentTime = t; setCurrentTime(t); }
   function togglePlay() {
+    // Play is a user gesture → resume the WebAudio context if browser
+    // autoplay policy suspended it. Without this the gain-node chain stays
+    // silent on first play.
+    try { const c = audioCtxRef.current; if (c && c.state === 'suspended') c.resume(); } catch {}
+    // On macOS, starting playback clears any layer selection. Selecting a layer
+    // mid-playback triggers a heavy timeline re-render that can stall the audio
+    // sync and cause stutter/dropouts; with nothing selected playback stays
+    // smooth. Windows is unaffected, so it keeps its selection.
+    const isMac = /Mac/i.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '');
+    if (!playing && isMac && (selectedId || selectedIds.size)) {
+      setSelectedId(null);
+      setSelectedIds(new Set());
+    }
     const v = videoRef.current;
     if (!v) {
       // No main video — still allow playing a text/image-only timeline.
@@ -2468,15 +3341,31 @@ function Editor({ state, setState }) {
       const sx = e.clientX, sy = e.clientY;
       // Move the whole group together when the grabbed layer is multi-selected
       const groupIds = (selectedIds.has(id) && selectedIds.size > 1) ? [...selectedIds] : [id];
+      // Subtitles keep their position on `.style` (x/y %), every other layer on
+      // the layer itself. Read the right source so dragging actually moves subs.
+      const readPos = (l) => l.type === 'subtitles'
+        ? { x: l.style?.x ?? 50, y: l.style?.y ?? 85 }
+        : { x: l.x, y: l.y };
       const startPos = {};
-      layers.forEach(l => { if (groupIds.includes(l.id)) startPos[l.id] = { x: l.x, y: l.y }; });
-      if (!startPos[id]) { const L = layers.find(l => l.id === id); if (L) startPos[id] = { x: L.x, y: L.y }; }
+      layers.forEach(l => { if (groupIds.includes(l.id)) startPos[l.id] = readPos(l); });
+      if (!startPos[id]) { const L = layers.find(l => l.id === id); if (L) startPos[id] = readPos(L); }
       const move = (ev) => {
-        const dx = ((ev.clientX - sx) / r.width) * 100;
-        const dy = ((ev.clientY - sy) / r.height) * 100;
+        let pdx = ev.clientX - sx, pdy = ev.clientY - sy;
+        // Shift constrains movement to a single axis (whichever the cursor has
+        // travelled further along) so objects slide perfectly straight.
+        if (ev.shiftKey) {
+          if (Math.abs(pdx) >= Math.abs(pdy)) pdy = 0; else pdx = 0;
+        }
+        const dx = (pdx / r.width) * 100;
+        const dy = (pdy / r.height) * 100;
         set('layers', (l) => l.map(x => {
           const sp = startPos[x.id];
-          return sp ? { ...x, x: Math.max(0, Math.min(100, sp.x + dx)), y: Math.max(0, Math.min(100, sp.y + dy)) } : x;
+          if (!sp) return x;
+          const nx = Math.max(0, Math.min(100, sp.x + dx));
+          const ny = Math.max(0, Math.min(100, sp.y + dy));
+          return x.type === 'subtitles'
+            ? { ...x, style: { ...(x.style || {}), x: nx, y: ny } }
+            : { ...x, x: nx, y: ny };
         }));
       };
       const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
@@ -2519,9 +3408,13 @@ function Editor({ state, setState }) {
             if (Math.abs(nw / startW - 1) > Math.abs(nh / startH - 1)) nh = nw / ratio;
             else nw = nh * ratio;
           }
+          // Mask/maskedVideo can scale up to 300 % of canvas (so the cut-out
+          // can extend past the frame for big-cropout effects). Blur stays
+          // capped at canvas size.
+          const maxPct = L.type === 'blur' ? 100 : 300;
           set('layers', (ls) => ls.map(x => x.id === id ? { ...x,
-            width: Math.max(5, Math.min(100, nw / W * 100)),
-            height: Math.max(5, Math.min(100, nh / H * 100)),
+            width: Math.max(5, Math.min(maxPct, nw / W * 100)),
+            height: Math.max(5, Math.min(maxPct, nh / H * 100)),
             x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
           return;
         }
@@ -2561,6 +3454,123 @@ function Editor({ state, setState }) {
     };
   }
 
+  // Resize the subtitle box-area by dragging its outline on the preview.
+  // Center-anchored (style.x/style.y stays put) and symmetric: dragging an edge
+  // grows both sides by Δ so the rect changes by 2Δ. Font size scales with the
+  // box — corners use the geometric mean of the W/H scale (balanced); edge
+  // handles use the single dimension being changed. fontSize stays clamped to
+  // [20, 160] so a small box doesn't shrink text below readable.
+  function makeSubBoxResize(id, handle) {
+    return (e) => {
+      e.stopPropagation(); e.preventDefault();
+      pushUndo();
+      const r = canvasRef.current?.getBoundingClientRect(); if (!r) return;
+      const L = layers.find(l => l.id === id); if (!L || L.type !== 'subtitles') return;
+      const st = L.style || {};
+      const startW  = Math.max(10, Math.min(300, Number(st.boxW) || 88));
+      const startH  = Math.max(5,  Math.min(300, Number(st.boxH) || 100));
+      const sx = e.clientX, sy = e.clientY;
+      const hsign = handle.includes('e') ? 1 : handle.includes('w') ? -1 : 0;
+      const vsign = handle.includes('s') ? 1 : handle.includes('n') ? -1 : 0;
+      // Photoshop-style: dragging the box edges resizes the BOX ONLY (the wrap
+      // area). Font size is set separately via the panel slider — the box never
+      // changes the text size. Side handles change one dimension; corners both.
+      const move = (ev) => {
+        const dxPct = ((ev.clientX - sx) / r.width)  * 100;
+        const dyPct = ((ev.clientY - sy) / r.height) * 100;
+        let nw = startW, nh = startH;
+        if (hsign) nw = Math.max(10, Math.min(300, startW + dxPct * hsign * 2));
+        if (vsign) nh = Math.max(5,  Math.min(300, startH + dyPct * vsign * 2));
+        set('layers', (ls) => ls.map(x => x.id === id
+          ? { ...x, style: { ...(x.style || {}), boxW: Math.round(nw), boxH: Math.round(nh) } }
+          : x));
+      };
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    };
+  }
+
+  // Drag a single subtitle SEGMENT along the (expanded) subtitle track to fix
+  // its timing. Shifts the segment's start/end AND every word's start/end by the
+  // same delta so the karaoke highlight stays in sync. Derived from a snapshot
+  // taken at drag start, so repeated moves never compound.
+  function makeSubSegDrag(layerId, segId) {
+    return (e) => {
+      e.stopPropagation(); e.preventDefault();
+      const layer = layers.find(l => l.id === layerId);
+      const seg = layer && (layer.segments || []).find(s => s.id === segId);
+      if (!seg) return;
+      const ruler = timelineRef.current?.getBoundingClientRect(); if (!ruler) return;
+      const sx = e.clientX;
+      const snap = JSON.parse(JSON.stringify(seg));
+      const segDur = Math.max(0.01, snap.endTime - snap.startTime);
+      let undoTaken = false;
+      const move = (ev) => {
+        if (Math.abs(ev.clientX - sx) < 3) return;  // ignore micro-jitter on a click
+        if (!undoTaken) { pushUndo(); undoTaken = true; }
+        const delta = ((ev.clientX - sx) / ruler.width) * dur;
+        const newStart = Math.max(0, Math.min(dur - segDur, snap.startTime + delta));
+        const wd = newStart - snap.startTime;
+        const moved = {
+          ...snap,
+          startTime: snap.startTime + wd,
+          endTime: snap.endTime + wd,
+          words: (snap.words || []).map(w => ({ ...w, start: (Number(w.start) || 0) + wd, end: (Number(w.end) || 0) + wd })),
+        };
+        set('layers', ls => ls.map(l => l.id === layerId
+          ? { ...l, segments: (l.segments || []).map(s => s.id === segId ? moved : s) }
+          : l));
+      };
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    };
+  }
+
+  // Resize one subtitle segment by dragging its left (isStart) or right edge —
+  // makes the phrase shorter/longer like a clip. The word timings are remapped
+  // linearly into the new [start,end] range so the karaoke highlight still
+  // spans the whole phrase. Snapshot-based, so it never compounds.
+  function makeSubSegResize(layerId, segId, isStart) {
+    return (e) => {
+      e.stopPropagation(); e.preventDefault();
+      const layer = layers.find(l => l.id === layerId);
+      const seg = layer && (layer.segments || []).find(s => s.id === segId);
+      if (!seg) return;
+      const ruler = timelineRef.current?.getBoundingClientRect(); if (!ruler) return;
+      const sx = e.clientX;
+      const snap = JSON.parse(JSON.stringify(seg));
+      const MIN = 0.1;
+      let undoTaken = false;
+      const remap = (t, oldS, oldE, newS, newE) => {
+        const span = (oldE - oldS) || 1;
+        return newS + ((t - oldS) / span) * (newE - newS);
+      };
+      const move = (ev) => {
+        if (Math.abs(ev.clientX - sx) < 2) return;
+        if (!undoTaken) { pushUndo(); undoTaken = true; }
+        const delta = ((ev.clientX - sx) / ruler.width) * dur;
+        let newS = snap.startTime, newE = snap.endTime;
+        if (isStart) newS = Math.max(0, Math.min(snap.endTime - MIN, snap.startTime + delta));
+        else newE = Math.min(dur, Math.max(snap.startTime + MIN, snap.endTime + delta));
+        const moved = {
+          ...snap,
+          startTime: newS,
+          endTime: newE,
+          words: (snap.words || []).map(w => ({
+            ...w,
+            start: remap(Number(w.start) || 0, snap.startTime, snap.endTime, newS, newE),
+            end: remap(Number(w.end) || 0, snap.startTime, snap.endTime, newS, newE),
+          })),
+        };
+        set('layers', ls => ls.map(l => l.id === layerId
+          ? { ...l, segments: (l.segments || []).map(s => s.id === segId ? moved : s) }
+          : l));
+      };
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    };
+  }
+
   function makeClipBodyDrag(id) {
     if (id === '__mv__') {
       return (e) => {
@@ -2585,19 +3595,36 @@ function Editor({ state, setState }) {
       const layer = layers.find(l => l.id === id); if (!layer) return;
       const startX = e.clientX, startY = e.clientY;
       const clipEl = e.currentTarget;
-      const LONG_PRESS_MS = 700;
-      const MOVE_THRESHOLD = 5; // px before we commit to horizontal drag
+      const hasMod = e.ctrlKey || e.metaKey || e.shiftKey;
+      const MOVE_THRESHOLD = 5; // px of travel before we decide an axis
       let mode = 'pending'; // 'pending' | 'horizontal' | 'reorder'
-      let lpTimer = null;
       let undoTaken = false;
       const takeUndoOnce = () => { if (!undoTaken) { pushUndo(); undoTaken = true; } };
+      // Select the grabbed clip when a drag actually COMMITS (not on a plain
+      // click — the row's click handler owns that, and selecting here too would
+      // make a click select-then-deselect). A clip already inside a multi-
+      // selection is left alone so the whole group drags together.
+      const selectForDrag = () => {
+        if (!hasMod && !selectedIds.has(id)) {
+          setSelectedId(id);
+          setSelectedIds(new Set());
+          selAnchorRef.current = id;
+        }
+      };
+
+      // Reference top of the clip's own row, used to translate the lifted clip
+      // so it visually snaps onto whichever track row sits under the cursor.
+      const ownRow = clipEl.closest && clipEl.closest('.etl-track-row');
+      const ownRowTop = ownRow ? ownRow.getBoundingClientRect().top : 0;
 
       const startHorizontal = () => {
         mode = 'horizontal';
         takeUndoOnce();
+        selectForDrag();
       };
       const startReorder = () => {
         mode = 'reorder';
+        selectForDrag();
         takeUndoOnce();
         try { clipEl.classList.add('etl-clip-reorder-active'); } catch {}
       };
@@ -2609,11 +3636,6 @@ function Editor({ state, setState }) {
       const starts = {};
       group.forEach(l => { starts[l.id] = { s: l.startTime, len: l.endTime - l.startTime }; });
       if (!starts[id]) starts[id] = { s: layer.startTime, len: layer.endTime - layer.startTime };
-
-      // Start the long-press timer for reorder mode.
-      lpTimer = setTimeout(() => {
-        if (mode === 'pending') startReorder();
-      }, LONG_PRESS_MS);
 
       // Pick which track row the cursor is over by walking the DOM.
       const rowIdFromPoint = (cx, cy) => {
@@ -2630,8 +3652,11 @@ function Editor({ state, setState }) {
           const dx = Math.abs(ev.clientX - startX);
           const dy = Math.abs(ev.clientY - startY);
           if (dx > MOVE_THRESHOLD || dy > MOVE_THRESHOLD) {
-            clearTimeout(lpTimer);
-            startHorizontal();
+            // Decide intent by the dominant axis the moment movement is clear:
+            // a mostly-vertical gesture means "move to another track" (reorder),
+            // anything else is a normal horizontal time-drag. No hold needed.
+            if (dy > dx) startReorder();
+            else startHorizontal();
           } else return;
         }
         if (mode === 'horizontal') {
@@ -2654,19 +3679,30 @@ function Editor({ state, setState }) {
             return { ...x, startTime: ns, endTime: ns + st.len };
           }));
         } else if (mode === 'reorder') {
-          // Highlight the row currently under the cursor so the user sees
-          // where the clip will land when they release.
+          // Highlight the row currently under the cursor and magnetically snap
+          // the lifted clip onto that track's centre line so the drop target is
+          // unmistakable (the clip "sticks" to whichever track you hover).
           document.querySelectorAll('.etl-track-row.etl-reorder-hover').forEach(el => el.classList.remove('etl-reorder-hover'));
           const overId = rowIdFromPoint(ev.clientX, ev.clientY);
-          if (overId && overId !== id) {
-            const row = document.querySelector(`.etl-track-row[data-layer-id="${CSS.escape(overId)}"]`);
-            row && row.classList.add('etl-reorder-hover');
+          const row = overId && document.querySelector(`.etl-track-row[data-layer-id="${CSS.escape(overId)}"]`);
+          if (row) {
+            if (overId !== id) row.classList.add('etl-reorder-hover');
+            const snapDy = row.getBoundingClientRect().top - ownRowTop;
+            clipEl.style.setProperty('--reorder-dy', `${snapDy}px`);
+          } else {
+            // Between rows / off the track list — follow the cursor freely.
+            clipEl.style.setProperty('--reorder-dy', `${ev.clientY - startY}px`);
           }
         }
       };
       const up = (ev) => {
-        clearTimeout(lpTimer);
-        try { clipEl.classList.remove('etl-clip-reorder-active'); } catch {}
+        // A real drag happened → swallow the click that browsers fire next, so
+        // it can't fall through to the row handler and wipe a multi-selection.
+        // Store a TIMESTAMP (not a bare flag): if the trailing click never comes
+        // (e.g. released over another row), the value self-expires instead of
+        // silently swallowing the next unrelated click.
+        if (mode !== 'pending') suppressRowClickRef.current = Date.now();
+        try { clipEl.classList.remove('etl-clip-reorder-active'); clipEl.style.removeProperty('--reorder-dy'); } catch {}
         document.querySelectorAll('.etl-track-row.etl-reorder-hover').forEach(el => el.classList.remove('etl-reorder-hover'));
         if (mode === 'reorder') {
           const overId = rowIdFromPoint(ev.clientX, ev.clientY);
@@ -2824,16 +3860,32 @@ function Editor({ state, setState }) {
       length: Math.max(0.01, (baseAud.endTime ?? totalDuration) - (baseAud.startTime || 0)),
       startTime: baseAud.startTime || 0,
       volume: baseAud.volume ?? 100,
+      muted: !!baseAud.muted,
     } : null;
+    // Independent visual/audio: a layer hidden by the eye still contributes
+    // AUDIO; a layer muted by the speaker still contributes VIDEO. main.js is the
+    // authority (skips hidden visuals, drops muted audio). So we must SEND hidden
+    // layers that have audio (video/audio types) — only hidden layers with NO
+    // audio (image/text/subtitle/blur/mask) are dropped here to keep the graph lean.
+    const hasAudioType = (l) => l.type === 'videoOverlay' || l.type === 'maskedVideo' || l.type === 'audio';
     const result = await window.strata?.editVideo?.({
       file: baseFile,
       videoStart: baseVid ? (baseVid.startTime || 0) : baseAud ? (baseAud.startTime || 0) : (videoStart || 0),
       videoEnd: baseVid ? (baseVid.endTime ?? totalDuration) : baseAud ? (baseAud.endTime ?? totalDuration) : (videoEnd || totalDuration),
       totalDuration,
-      mainVideo: baseVid ? { ...baseVid, type: 'mainVideo' } : (layers.find(l => l.type === 'mainVideo' && !l.hidden) || null),
+      mainVideo: baseVid ? { ...baseVid, type: 'mainVideo' } : (layers.find(l => l.type === 'mainVideo') || null),
       baseAudio: baseAudioPayload,
-      // Exclude whichever layer became input 0 so it isn't doubled.
-      layers: layers.filter(l => !l.hidden && l !== baseVid && l !== baseAud && l.type !== 'mainVideo'),
+      baseAudioMuted: !!(baseAud && baseAud.muted),
+      // Exclude whichever layer became input 0 so it isn't doubled. Attach the
+      // pre-computed absolute layout to subtitle layers so the export burns them
+      // in at the exact preview positions.
+      layers: layers
+        .filter(l => l !== baseVid && l !== baseAud && l.type !== 'mainVideo' && !(l.hidden && !hasAudioType(l)))
+        // Reuse the EXACT layout the preview drew from (single source of truth) —
+        // recompute only as a fallback if the cache somehow missed this layer.
+        .map(l => l.type === 'subtitles'
+          ? { ...l, _layout: subtitleLayoutsRef.current.get(l.id) || buildSubtitleLayout(l) }
+          : l),
       outWidth, outHeight, bgColor, fadeIn, fadeOut, outPath,
       format: fmt, quality: qual, custom: saveCustom
     });
@@ -2843,6 +3895,13 @@ function Editor({ state, setState }) {
 
   const sel = selectedId ? layers.find(l => l.id === selectedId) : null;
   const timelineLayers = [...layers].reverse();
+  // Subtitles need an audio source to transcribe. Videos are imported as
+  // `videoOverlay` layers (state.file stays null in this flow), so gate the
+  // button on the SAME sources the export audio-mix reads, not on state.file.
+  const hasAudioSrc = !!file || layers.some(l => l && (
+    l.type === 'mainVideo' ||
+    (l.file && (l.type === 'videoOverlay' || l.type === 'maskedVideo' || l.type === 'audio'))
+  ));
 
   function lColor(l) {
     if (l.clipColor) return l.clipColor;
@@ -2856,6 +3915,7 @@ function Editor({ state, setState }) {
     if (l.type === 'mask') return '#e879f9';
     if (l.type === 'maskedVideo') return '#c084fc';
     if (l.type === 'transition') return '#fde047';
+    if (l.type === 'subtitles') return '#ff9a1f';
     return '#aaa';
   }
   function lIcon(l) {
@@ -2864,6 +3924,7 @@ function Editor({ state, setState }) {
     if (l.type === 'mask') return '◐';
     if (l.type === 'maskedVideo') return '◐';
     if (l.type === 'transition') return '⚡';
+    if (l.type === 'subtitles') return 'CC';
     return l.type === 'text' ? 'T' : l.type === 'blur' ? '◎' : l.type === 'image' ? '🖼' : '🎬';
   }
   function lName(l) {
@@ -2880,6 +3941,10 @@ function Editor({ state, setState }) {
         ? Math.round(l.strength)
         : (l.strength === 'low' ? 25 : l.strength === 'high' ? 80 : l.strength === 'mid' ? 50 : null);
       return s != null ? `${kLbl} ${s}%` : kLbl;
+    }
+    if (l.type === 'subtitles') {
+      const n = Array.isArray(l.segments) ? l.segments.length : 0;
+      return `Субтитры (${n})`;
     }
     return compactName(fileName(l.file || ''), 9) + rev;
   }
@@ -2907,6 +3972,51 @@ function Editor({ state, setState }) {
       keys.forEach(kk => textWidthCacheRef.current.delete(kk));
     }
     return tw;
+  }
+
+  // Pre-compute the subtitle layout (absolute per-word centres, in output px)
+  // using the SAME canvas measureText the preview draws with, and hand it to the
+  // export. libass then positions each word at these exact coordinates with
+  // \pos, so the burned-in subs match the preview pixel-for-pixel (no libass
+  // wrapping/line-spacing of its own). Must run AFTER the subtitle font is
+  // loaded (the font-loader effect handles that on layer change).
+  function buildSubtitleLayout(subL) {
+    const st = subL.style || {};
+    const fsOrig = Math.max(8, Number(st.fontSize) || 56);
+    const mc = measureCtx();
+    // Natural font weight (no forced bold) — both the canvas preview AND the
+    // libass export render the font's real outlines, so the outline thickness
+    // matches 1:1. For a bold look the user picks a Bold font variant. Measuring
+    // must also be non-bold so positions match the drawn (non-bold) glyphs.
+    mc.font = `${fsOrig}px ${fontCss({ fontFamily: st.fontFamily, fontFile: st.fontFile })}`;
+    const measure = (t) => mc.measureText(t || '').width;
+    // The longest segment dictates how aggressively we have to shrink to fit
+    // the box (so all segments share ONE font size and stay visually consistent
+    // — instead of one short phrase being bigger than its neighbours).
+    let layoutFs = fsOrig;
+    const perSeg = (subL.segments || []).map((seg) => {
+      const r = layoutSubtitleSegment(seg, st, outWidth, outHeight, measure);
+      if (r.fs < layoutFs) layoutFs = r.fs;
+      return r;
+    });
+    const scale = layoutFs / fsOrig;
+    const segments = perSeg.map((r) => {
+      const words = [];
+      for (const line of r.lines) {
+        for (const w of line.words) {
+          // Re-scale word positions if some OTHER segment forced a smaller fs,
+          // so every segment ends up at the same size around the phrase anchor.
+          const cx = scale === 1 ? w.cx : phraseAnchor(st).x + (w.cx - phraseAnchor(st).x) * (layoutFs / r.fs);
+          const cy = scale === 1 ? w.cy : phraseAnchor(st).y + (w.cy - phraseAnchor(st).y) * (layoutFs / r.fs);
+          words.push({ text: w.text, cx: Math.round(cx), cy: Math.round(cy), w: Math.round(w.w * (layoutFs / r.fs)), start: w.start, end: w.end });
+        }
+      }
+      return { start: r.segStart, end: r.segEnd, words };
+    }).filter(s => s.words.length);
+    return { W: outWidth, H: outHeight, fontSize: layoutFs, segments };
+  }
+  function phraseAnchor(st) {
+    return { x: ((st.x ?? 50) / 100) * outWidth, y: ((st.y ?? 85) / 100) * outHeight };
   }
 
   // Single source of truth for a layer's on-canvas rectangle (in output pixels).
@@ -2944,10 +4054,53 @@ function Editor({ state, setState }) {
       const x = layer.align === 'left' ? cx - 12 : layer.align === 'right' ? cx - w + 12 : cx - w / 2;
       return { w, h, x, y: (layer.y / 100) * H - h / 2 };
     }
+    if (layer.type === 'subtitles') {
+      // Bounding box for the CURRENTLY active segment, so drag-to-move feels
+      // like grabbing the visible text. Falls back to the longest segment's
+      // width when nothing is currently active (so the box never collapses).
+      const st = layer.style || {};
+      const fs = Number(st.fontSize) || 56;
+      const segs = Array.isArray(layer.segments) ? layer.segments : [];
+      const active = segs.find(s => currentTime >= s.startTime && currentTime <= s.endTime)
+        || segs.reduce((a, b) => (a && a.text.length >= b.text.length ? a : b), null)
+        || { text: 'Субтитры' };
+      const tw = measureTextCached(active.text || ' ', fontCss({ fontFamily: st.fontFamily, fontFile: st.fontFile }), fs);
+      const w = tw + 36, h = fs * 1.5;
+      const x = ((st.x ?? 50) / 100) * W - w / 2;
+      const y = ((st.y ?? 85) / 100) * H - h / 2;
+      return { w, h, x, y };
+    }
     return { w: 0, h: 0, x: 0, y: 0 };
   }
 
   // Update canvas render function each render (closure over current state)
+  // ── SINGLE SOURCE OF TRUTH for subtitle geometry ──────────────────────────
+  // buildSubtitleLayout measures ONCE (wrapping, per-word centres, the global
+  // auto-fit font size). BOTH the canvas preview AND the libass export consume
+  // this exact layout, so they can never diverge on where text wraps, how big
+  // it is, or where each word sits — the recurring preview↔render bugs all came
+  // from measuring twice (preview on the live canvas, export on a separate one
+  // that sometimes fell back to a different font). Keyed on a cheap signature so
+  // it rebuilds only when subtitle content / style / canvas size / font load
+  // state changes — not every frame.
+  const subtitleLayoutSig = useMemo(() => layers
+    .filter(l => l.type === 'subtitles')
+    .map(l => l.id + ':' + JSON.stringify(l.style || {}) + ':' +
+      (l.segments || []).map(s => `${s.startTime},${s.endTime},${s.text || ''},${(s.words || []).length}`).join('|'))
+    .join('~') + `@${outWidth}x${outHeight}#${fontRevision}`,
+    [layers, outWidth, outHeight, fontRevision]);
+  const subtitleLayouts = useMemo(() => {
+    const map = new Map();
+    for (const l of layers) {
+      if (l.type === 'subtitles' && Array.isArray(l.segments) && l.segments.length) {
+        try { map.set(l.id, buildSubtitleLayout(l)); } catch {}
+      }
+    }
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subtitleLayoutSig]);
+  useEffect(() => { subtitleLayoutsRef.current = subtitleLayouts; }, [subtitleLayouts]);
+
   renderFrameRef.current = (ctx) => {
     const W = outWidth, H = outHeight;
     if (ctx.canvas.width !== W || ctx.canvas.height !== H) { ctx.canvas.width = W; ctx.canvas.height = H; }
@@ -3064,6 +4217,184 @@ function Editor({ state, setState }) {
         ctx.shadowColor = 'rgba(0,0,0,0.85)'; ctx.shadowBlur = 0; ctx.shadowOffsetX = 2; ctx.shadowOffsetY = 2;
         ctx.fillStyle = layer.color || '#ffffff';
         ctx.fillText(layer.text || '', (layer.x/100)*W, (layer.y/100)*H);
+        ctx.restore();
+      } else if (layer.type === 'subtitles') {
+        const st = layer.style || {};
+        // Box-area visualization moved to an HTML overlay (see preview layout
+        // below) — that one is interactive: drag the dashed outline to move,
+        // grab the corners/edges to resize. Drawing on canvas + HTML at the
+        // same time would double the outline, so we skip the canvas draw.
+        // WYSIWYG: show a phrase ONLY while the playhead is inside its
+        // [start,end] window — exactly like the burned-in export. In the gaps
+        // (silence, or time freed by shortening/deleting a phrase) the screen is
+        // empty, both here and in the render. (Right after generation the
+        // playhead is auto-jumped onto the first phrase, and clicking a phrase
+        // in the list jumps to it, so subs are still easy to find.)
+        // SINGLE SOURCE OF TRUTH: read the precomputed layout (shared with the
+        // export) — never re-measure here, or preview and render could disagree
+        // on wrapping/size/position. The layout stores flat positioned words
+        // (line breaks already baked into each word's cy) + the global font size.
+        const layout = subtitleLayouts.get(layer.id);
+        if (!layout) continue;
+        const segL = (layout.segments || []).find(s => currentTime >= s.start && currentTime <= s.end);
+        if (!segL || !segL.words.length) continue;
+        const fs = layout.fontSize;
+        ctx.save();
+        ctx.font = `${fs}px ${fontCss({ fontFamily: st.fontFamily, fontFile: st.fontFile })}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.lineJoin = 'round';
+        ctx.miterLimit = 2;
+        // Wrap all active-segment words in one pseudo-line so the existing
+        // per-word draw loop (animations, highlight, cursor) works unchanged.
+        const lines = [{ words: segL.words }];
+        const baseColor = st.color || '#ffffff';
+        const outlineColor = st.outlineColor || '#000000';
+        const highlightColor = st.highlightColor || '#ff9a1f';
+        // Outline: external (a border outside the glyph) or none, with an explicit
+        // thickness in px. Canvas strokeText straddles the path, so lineWidth =
+        // 2×thickness gives an `olT`-px border OUTSIDE the glyph — matching libass
+        // Outline=olT in the export 1:1.
+        const olMode = (st.outlineMode === 'none' || st.outline === false) ? 'none' : 'external';
+        const olT = (st.outlineWidth != null && st.outlineWidth !== '')
+          ? Math.max(0, Number(st.outlineWidth))
+          : Math.max(2, Math.round(fs * 0.04));
+        const outlineW = Math.max(1, Math.round(olT * 2));   // canvas lineWidth
+        ctx.lineWidth = outlineW;
+        const anim = st.anim || 'pop';
+        const segStart = Number(segL.start) || 0;
+        // 'scale' animates the WHOLE phrase around its anchor (style.x/y point).
+        const phraseCx = ((st.x ?? 50) / 100) * W, phraseCy = ((st.y ?? 85) / 100) * H;
+        // Phrase-level entrance animations — wrap the whole word loop in a
+        // single transform around the phrase anchor (style.x/y point).
+        if (anim === 'scale' || anim === 'zoomout') {
+          const from = anim === 'scale' ? SUB_ANIM.SCALE_FROM : SUB_ANIM.ZOUT_FROM;
+          const ms   = anim === 'scale' ? SUB_ANIM.SCALE_MS   : SUB_ANIM.ZOUT_MS;
+          const fadeMs = anim === 'scale' ? SUB_ANIM.SCALE_FADE_MS : SUB_ANIM.ZOUT_FADE_MS;
+          const tau = (currentTime - segStart) * 1000;
+          const p = Math.max(0, Math.min(1, tau / ms));
+          const sc = from + (1 - from) * p;
+          ctx.globalAlpha = Math.max(0, Math.min(1, tau / fadeMs));
+          ctx.translate(phraseCx, phraseCy);
+          ctx.scale(sc, sc);
+          ctx.translate(-phraseCx, -phraseCy);
+        }
+        for (const line of lines) {
+          for (let wi = 0; wi < line.words.length; wi++) {
+            const w = line.words[wi];
+            const appeared = currentTime >= w.start;
+            // Typewriter / rise / bounce / typewriter-cursor reveal words only once their time arrives.
+            if ((anim === 'type' || anim === 'rise' || anim === 'bounce' || anim === 'typewriter') && !appeared) continue;
+            const isActive = currentTime >= w.start && currentTime <= w.end;
+            const tau = (currentTime - w.start) * 1000;  // ms since the word started
+            let wScale = 1, dy = 0, wAlpha = 1, wBlur = 0, wOutlineMul = 1, wDynColor = null;
+            let wScaleX = 1, wScaleY = 1, wRot = 0, neonOutlineColor = null;
+            if (anim === 'pop' && isActive) {
+              wScale = 1 + (SUB_ANIM.POP_SCALE - 1) * Math.max(0, 1 - tau / SUB_ANIM.POP_MS);
+            } else if (anim === 'rise') {
+              dy = SUB_ANIM.RISE_OFFSET * Math.max(0, 1 - tau / SUB_ANIM.RISE_MS);
+              wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.RISE_FADE_MS));
+            } else if (anim === 'bam' && isActive) {
+              // 3-segment overshoot: 150% → 85% → 100%. Linear pieces — match ASS.
+              if (tau < SUB_ANIM.BAM_MS1) {
+                wScale = SUB_ANIM.BAM_FROM + (SUB_ANIM.BAM_MID - SUB_ANIM.BAM_FROM) * (tau / SUB_ANIM.BAM_MS1);
+              } else if (tau < SUB_ANIM.BAM_MS2) {
+                wScale = SUB_ANIM.BAM_MID + (1 - SUB_ANIM.BAM_MID) * ((tau - SUB_ANIM.BAM_MS1) / (SUB_ANIM.BAM_MS2 - SUB_ANIM.BAM_MS1));
+              }
+            } else if (anim === 'blurfocus' && isActive) {
+              wBlur = SUB_ANIM.BLUR_PX * Math.max(0, 1 - tau / SUB_ANIM.BLUR_MS);
+            } else if (anim === 'glow' && isActive) {
+              // Triangle wave (linear ramp up & down) — matches ASS chained \t.
+              const ph = (tau / SUB_ANIM.GLOW_MS) % 1;
+              const tri = ph < 0.5 ? ph * 2 : (1 - ph) * 2;
+              wOutlineMul = 1 + tri * (SUB_ANIM.GLOW_MUL - 1);
+            } else if (anim === 'colorwave' && isActive) {
+              const pal = SUB_ANIM.WAVE_COLORS;
+              const idxF = tau / SUB_ANIM.WAVE_MS;
+              const idx = Math.floor(idxF) % pal.length;
+              const next = (idx + 1) % pal.length;
+              wDynColor = lerpHex(pal[idx], pal[next], idxF - Math.floor(idxF));
+            } else if (anim === 'neon' && isActive) {
+              // Find which flicker stage tau falls into → alpha for that stage.
+              for (const [t0, t1, a] of SUB_ANIM.NEON_STAGES) { if (tau >= t0 && tau < t1) { wAlpha = a; break; } }
+              wOutlineMul = SUB_ANIM.NEON_BORD_MUL;
+              neonOutlineColor = SUB_ANIM.NEON_COLOR;
+            } else if (anim === 'shake' && isActive) {
+              // Stagewise rotation jitter; linear lerp inside each stage.
+              for (const [t0, t1, deg] of SUB_ANIM.SHAKE_STAGES) {
+                if (tau >= t0 && tau < t1) {
+                  // Lerp from PREVIOUS stage's deg → this stage's deg.
+                  const prev = SUB_ANIM.SHAKE_STAGES[SUB_ANIM.SHAKE_STAGES.indexOf(SUB_ANIM.SHAKE_STAGES.find(([a,b]) => a === t0)) - 1];
+                  const fromDeg = prev ? prev[2] : 0;
+                  const p = (tau - t0) / Math.max(1, t1 - t0);
+                  wRot = fromDeg + (deg - fromDeg) * p;
+                  break;
+                }
+              }
+            } else if (anim === 'bounce') {
+              // Phase 1: drop from above (dy interp negative→0) while squashing fscy 140→100
+              // Phase 2: impact squash fscx→120, fscy→70
+              // Phase 3: settle back to 100/100
+              const D = SUB_ANIM.BOUNCE_DROP_MS, S = SUB_ANIM.BOUNCE_SQUASH_MS, T = SUB_ANIM.BOUNCE_SETTLE_MS;
+              if (tau < D) {
+                const p = tau / D;
+                dy = -SUB_ANIM.BOUNCE_OFFSET * (1 - p);
+                wScaleX = (SUB_ANIM.BOUNCE_FROM_FSCX + (100 - SUB_ANIM.BOUNCE_FROM_FSCX) * p) / 100;
+                wScaleY = (SUB_ANIM.BOUNCE_FROM_FSCY + (100 - SUB_ANIM.BOUNCE_FROM_FSCY) * p) / 100;
+                wAlpha = Math.min(1, p * 1.5);
+              } else if (tau < D + S) {
+                const p = (tau - D) / S;
+                wScaleX = (100 + (SUB_ANIM.BOUNCE_HIT_FSCX - 100) * p) / 100;
+                wScaleY = (100 + (SUB_ANIM.BOUNCE_HIT_FSCY - 100) * p) / 100;
+              } else if (tau < D + S + T) {
+                const p = (tau - D - S) / T;
+                wScaleX = (SUB_ANIM.BOUNCE_HIT_FSCX + (100 - SUB_ANIM.BOUNCE_HIT_FSCX) * p) / 100;
+                wScaleY = (SUB_ANIM.BOUNCE_HIT_FSCY + (100 - SUB_ANIM.BOUNCE_HIT_FSCY) * p) / 100;
+              }
+            }
+            ctx.save();
+            if (wAlpha !== 1) ctx.globalAlpha = ctx.globalAlpha * wAlpha;
+            if (wBlur > 0.1) ctx.filter = `blur(${wBlur}px)`;
+            // Combined transform — uniform scale (pop/bam) OR independent X/Y (bounce) + rotation (shake)
+            // around the word's anchor point (cx, cy+dy).
+            const hasTransform = wScale !== 1 || wScaleX !== 1 || wScaleY !== 1 || wRot !== 0;
+            if (hasTransform) {
+              ctx.translate(w.cx, w.cy + dy);
+              if (wRot !== 0) ctx.rotate(wRot * Math.PI / 180);
+              if (wScale !== 1) ctx.scale(wScale, wScale);
+              if (wScaleX !== 1 || wScaleY !== 1) ctx.scale(wScaleX, wScaleY);
+              ctx.translate(-w.cx, -(w.cy + dy));
+            }
+            if (wOutlineMul !== 1) ctx.lineWidth = outlineW * wOutlineMul;
+            // Outline first, then fill on top — TikTok/CapCut look. Skipped when none.
+            if (olMode !== 'none' || neonOutlineColor) {
+              ctx.strokeStyle = neonOutlineColor || outlineColor;
+              ctx.strokeText(w.text, w.cx, w.cy + dy);
+            }
+            ctx.fillStyle = isActive ? (wDynColor || highlightColor) : baseColor;
+            ctx.fillText(w.text, w.cx, w.cy + dy);
+            ctx.restore();
+            // Typewriter cursor — blinking `|` after the last revealed word in the segment.
+            if (anim === 'typewriter') {
+              const isLastRevealed = (wi === line.words.length - 1)
+                || (currentTime < line.words[wi + 1]?.start);
+              if (isLastRevealed) {
+                const period = SUB_ANIM.TYPE_CURSOR_MS;
+                const phase = ((currentTime - w.end) * 1000) / period;
+                const visible = (Math.floor(phase * 2) % 2) === 0; // on/off halves
+                if (visible) {
+                  const cursorX = w.cx + (w.w || fs * 0.5) / 2 + fs * SUB_ANIM.TYPE_CURSOR_PAD;
+                  if (olMode !== 'none') {
+                    ctx.strokeStyle = outlineColor;
+                    ctx.strokeText('|', cursorX, w.cy);
+                  }
+                  ctx.fillStyle = highlightColor;
+                  ctx.fillText('|', cursorX, w.cy);
+                }
+              }
+            }
+          }
+        }
         ctx.restore();
       } else if (layer.type === 'videoOverlay') {
         const ov = videoOverlayRefs.current[layer.id];
@@ -3225,6 +4556,51 @@ function Editor({ state, setState }) {
             try { ctx.drawImage(tmp, 0, 0); } catch(e) {}
             ctx.restore();
           }
+        } else if (kind === 'seamzoom') {
+          // Seamless zoom: camera "falls" into the frame with motion blur +
+          // chromatic aberration + a peak white flash that hides the cut between
+          // the outgoing and incoming clip. Curve is a sine peaking at midpoint.
+          const scaleMax = layer.scale || 4.5;
+          const blurMax = layer.blur || 16;
+          const rgbMax = layer.rgb || 9;
+          const flashMax = layer.flash ?? 0.28;
+          const sc = 1 + (scaleMax - 1) * peak;
+          const blurNow = blurMax * peak;
+          const rgbNow = rgbMax * peak;
+          // 1. Snapshot the current composition.
+          tctx.clearRect(0, 0, W, H);
+          try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          // 2. Repaint background, then the zoomed+blurred snapshot.
+          ctx.fillStyle = bgColor || '#000000';
+          ctx.fillRect(0, 0, W, H);
+          const dw = W * sc, dh = H * sc;
+          const dx = (W - dw) / 2, dy = (H - dh) / 2;
+          ctx.save();
+          if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
+          try { ctx.drawImage(tmp, dx, dy, dw, dh); } catch(e) {}
+          ctx.restore();
+          // 3. Chromatic ghost — duplicate offsets in screen blend reads as
+          // RGB aberration without needing a per-channel offscreen.
+          if (rgbNow > 0.5) {
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = 0.4;
+            if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
+            try { ctx.drawImage(tmp, dx + rgbNow, dy, dw, dh); } catch(e) {}
+            try { ctx.drawImage(tmp, dx - rgbNow, dy, dw, dh); } catch(e) {}
+            ctx.restore();
+          }
+          // 4. White flash centred on the peak — hides the cut and gives punch.
+          if (peak > 0.5) {
+            const fAlpha = ((peak - 0.5) / 0.5) * flashMax;
+            if (fAlpha > 0.001) {
+              ctx.save();
+              ctx.globalAlpha = Math.min(1, fAlpha);
+              ctx.fillStyle = '#ffffff';
+              ctx.fillRect(0, 0, W, H);
+              ctx.restore();
+            }
+          }
         }
       } else if (layer.type === 'zoom') {
         // Zoom ramps the whole composition: 1× → max at the midpoint → 1× at the end.
@@ -3310,6 +4686,17 @@ function Editor({ state, setState }) {
         </div>
       );
     })()}
+    {editorHint && (
+      <div key={editorHint.key} className={`ed-hint-toast ed-hint-${editorHint.kind}`}
+        onClick={() => setEditorHint(null)}>
+        <span className="ed-hint-icon" aria-hidden="true">
+          {editorHint.kind === 'warn' ? '⚠' : editorHint.kind === 'error' ? '✕' : 'ℹ'}
+        </span>
+        <span className="ed-hint-text">{editorHint.text}</span>
+        <button className="ed-hint-close" aria-label="Закрыть"
+          onClick={(e) => { e.stopPropagation(); setEditorHint(null); }}>×</button>
+      </div>
+    )}
     {colorMenu && (
       <div className="etl-color-menu" style={{ left: colorMenu.x, top: colorMenu.y }} onPointerDown={e=>e.stopPropagation()}>
         {CLIP_COLORS.map(c => (
@@ -3397,6 +4784,72 @@ function Editor({ state, setState }) {
         </div>
       </div>
     )}
+    {projSaveProgress && (() => {
+      // Same visual language as the video-render modal — Кубик waiting → finish
+      // animation, so the user gets a single consistent "we're working on it"
+      // experience for both video save and project save.
+      const lightTheme = document.documentElement.getAttribute('data-theme') === 'light';
+      const cubeBg = lightTheme ? '#ebf1f8' : '#020202';
+      const done = projSaveProgress.phase === 'done';
+      const vidSrc = done
+        ? (lightTheme ? A.cubeFinishWhite : A.cubeFinishBlack)
+        : (lightTheme ? A.cubeWaitWhite : A.cubeWaitBlack);
+      const pct = Math.max(0, Math.min(100, Math.round(projSaveProgress.percent || 0)));
+      return (
+        <div className="editor-save-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="editor-save-modal-box render-box" style={{ background: cubeBg }}>
+            <video key={vidSrc} className="editor-save-modal-video" src={vidSrc}
+              autoPlay muted playsInline loop={!done} style={{ background: cubeBg }} />
+            <div className="editor-save-modal-title" style={{ color: lightTheme ? '#1a1c25' : '#fff' }}>
+              {done ? 'Сохранено!' : 'Сохраняем проект'}
+            </div>
+            {!done && <>
+              <div className="editor-save-modal-pct">{pct}%</div>
+              <div className="editor-save-modal-bar-wrap" style={{ background: lightTheme ? '#d3d8e2' : '#121214' }}>
+                <div className="editor-save-modal-bar" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="psp-status" style={{ color: lightTheme ? '#3a3d4a' : '#b0b0b6', marginTop: 8, fontSize: 13 }}>
+                {projSaveProgress.fileName
+                  ? <>Упаковываю <b>{projSaveProgress.fileName}</b></>
+                  : 'Подготовка файлов…'}
+              </div>
+            </>}
+          </div>
+        </div>
+      );
+    })()}
+    {subProgress && (
+      <div className="editor-save-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="editor-save-modal-box save-fmt-dialog sub-gen-modal">
+          {subProgress.phase === 'error' ? (
+            <>
+              <div className="editor-save-modal-title">Не получилось</div>
+              <div className="sub-gen-err">{subProgress.error || 'Неизвестная ошибка'}</div>
+              <div className="sub-gen-actions">
+                <button className="sgm-btn-primary" onClick={() => setSubProgress(null)}>Закрыть</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="editor-save-modal-title">
+                {subProgress.phase === 'done' ? 'Готово!' : 'Распознаём речь…'}
+              </div>
+              <div className="psp-status">
+                {subProgress.phase === 'extract' && 'Готовим звук проекта…'}
+                {subProgress.phase === 'upload' && 'Отправляем в облако (Whisper)…'}
+                {subProgress.phase === 'pack' && 'Раскладываем по словам…'}
+                {subProgress.phase === 'done' && 'Субтитры добавлены на таймлайн'}
+              </div>
+              <div className="psp-bar"><i style={{ width: `${Math.max(2, Math.round(subProgress.percent || 0))}%` }} /></div>
+              <div className="psp-meta">
+                <span>{Math.round(subProgress.percent || 0)}%</span>
+                <span className="sgm-engine">whisper-large-v3 · Groq</span>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    )}
     {saveDialogOpen && (
       <div className="editor-save-modal" onClick={e => { if (e.target === e.currentTarget) setSaveDialogOpen(false); }}>
         <div className="editor-save-modal-box save-fmt-dialog">
@@ -3464,6 +4917,10 @@ function Editor({ state, setState }) {
             onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(heightStr)||1920));setHeightStr(String(v));set('outHeight',v);setDimFocused(false);}}
             onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
         </div>
+        <div style={{flex:1}} />
+        <button className="ed-file-btn ed-help-btn" onClick={()=>setHotkeysOpen(true)} title="Управление: горячие клавиши и жесты">
+          <span className="ed-help-q" aria-hidden="true">?</span> Управление
+        </button>
       </div>
 
       {/* ── WORKSPACE: Preview + Properties ── */}
@@ -3557,8 +5014,10 @@ function Editor({ state, setState }) {
               style={{ display:'none' }} />
           ))}
 
-          <div className="ed-preview-wrap" data-onb="preview" style={{ flex: '0 0 auto', height: previewH }}>
-            <div ref={canvasRef} style={{ position:'relative', height:'100%', width:'auto', maxWidth:'100%', aspectRatio:`${outWidth}/${outHeight}` }}>
+          <div className="ed-preview-wrap" data-onb="preview"
+            onPointerDown={startPreviewPan}
+            style={{ flex: '0 0 auto', height: previewH, position:'relative', cursor: 'grab' }}>
+            <div ref={canvasRef} style={{ position:'relative', height:'100%', width:'auto', maxWidth:'100%', aspectRatio:`${outWidth}/${outHeight}`, transform:`translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`, transformOrigin:'center center', transition:'transform .08s linear' }}>
                 {/* Clip layer: only the rendered canvas + orange frame get clipped
                     to the project rect. The interactive bounding boxes/handles
                     (rendered as siblings below) are NOT clipped so the user can
@@ -3577,7 +5036,11 @@ function Editor({ state, setState }) {
                     whole element. Corners stretch, edges resize proportionally.
                     These render OUTSIDE the clip — handles stay grabbable even
                     when the layer extends beyond the preview bounds. */}
-                {layers.filter(l => !l.hidden && l.type !== 'audio').map(layer => {
+                {/* Skip subtitle layers — they have their own canvas-drawn orange
+                    box-area visualization that matches their actual style.x/y/boxW
+                    layout. The generic getLayerPx() rectangle for subs is wrong
+                    and the resize handles don't tie to anything meaningful. */}
+                {layers.filter(l => !l.hidden && l.type !== 'audio' && l.type !== 'subtitles').map(layer => {
                   if (layer.type !== 'mainVideo' &&
                       (currentTime < (layer.startTime||0) || currentTime > (layer.endTime??dur))) return null;
                   const isSel = selectedId === layer.id || selectedIds.has(layer.id);
@@ -3598,7 +5061,102 @@ function Editor({ state, setState }) {
                     </div>
                   );
                 })}
+                {/* Photoshop-style subtitle text box. Visible when a subtitle
+                    layer is selected. WIDTH = boxW (the wrap width — drag the
+                    left/right handles to control where lines break). HEIGHT auto-
+                    follows the actual text block so the frame always hugs the text
+                    (one clean box, no mismatch). Body drag = move; font size is the
+                    panel slider, never the box. */}
+                {(() => {
+                  const subSel = layers.find(l => l.id === selectedId && l.type === 'subtitles' && !l.hidden);
+                  if (!subSel) return null;
+                  const st = subSel.style || {};
+                  const boxW = Math.max(10, Math.min(300, Number(st.boxW) || 88));
+                  const cx = st.x ?? 50, cy = st.y ?? 85;
+                  // Auto-height: measure the active (or first) segment's text block
+                  // from the shared layout so the frame snugly wraps the text.
+                  let boxHpct = ((Number(st.fontSize) || 56) * ((st.lineHeight ?? 125) / 100) / outHeight) * 100 + 3;
+                  const subLayout = subtitleLayouts.get(subSel.id);
+                  if (subLayout && subLayout.segments.length) {
+                    const segL = subLayout.segments.find(s => currentTime >= s.start && currentTime <= s.end) || subLayout.segments[0];
+                    if (segL && segL.words.length) {
+                      const cys = segL.words.map(w => w.cy);
+                      const lineH = subLayout.fontSize * ((st.lineHeight ?? 125) / 100);
+                      const blockPx = (Math.max(...cys) - Math.min(...cys)) + lineH;
+                      boxHpct = (blockPx / outHeight) * 100 + 3;
+                    }
+                  }
+                  return (
+                    <div className="sub-box-overlay"
+                      onPointerDown={makePreviewDrag(subSel.id)}
+                      style={{ position:'absolute',
+                        left:`${cx - boxW/2}%`, top:`${cy - boxHpct/2}%`,
+                        width:`${boxW}%`, height:`${boxHpct}%`,
+                        cursor:'move', touchAction:'none', userSelect:'none' }}>
+                      {['e','w'].map(h =>
+                        <div key={h} className={`preview-rh preview-rh-${h}`}
+                          onPointerDown={makeSubBoxResize(subSel.id, h)} />)}
+                    </div>
+                  );
+                })()}
               </div>
+            {/* Zoom controls — bottom-right corner of preview. The "100%"
+                label is a scrubber: hold + drag up/down to zoom in/out
+                continuously (1.2% per pixel), so users can dial in an exact
+                zoom without clicking ± repeatedly. */}
+            <div className="preview-zoom-ctrl">
+              <button onClick={(e) => { e.stopPropagation(); setPreviewZoom(z => Math.max(0.3, z / 1.2)); }} title="Уменьшить (−)">−</button>
+              <span className={`zoom-pct zoom-pct-scrub${zoomScrubActive ? ' active' : ''}`}
+                title="Тяни вверх/вниз чтобы менять зум"
+                onPointerDown={(e) => {
+                  e.stopPropagation(); e.preventDefault();
+                  const startY = e.clientY;
+                  const startZ = previewZoom;
+                  const el = e.currentTarget;
+                  try { el.setPointerCapture(e.pointerId); } catch {}
+                  setZoomScrubActive(true);
+                  const onMove = (ev) => {
+                    const dy = startY - ev.clientY;       // up = positive
+                    const factor = Math.pow(1.012, dy);   // 1.2 % per px
+                    const next = Math.max(0.3, Math.min(5, startZ * factor));
+                    setPreviewZoom(+next.toFixed(3));
+                  };
+                  const onUp = () => {
+                    window.removeEventListener('pointermove', onMove);
+                    window.removeEventListener('pointerup', onUp);
+                    try { el.releasePointerCapture(e.pointerId); } catch {}
+                    setZoomScrubActive(false);
+                  };
+                  window.addEventListener('pointermove', onMove);
+                  window.addEventListener('pointerup', onUp);
+                }}>{Math.round(previewZoom * 100)}%
+                {zoomScrubActive && (() => {
+                  // Vertical track that appears while dragging. Log-scale maps
+                  // the 30 %–500 % range onto a 0-1 position so the thumb feels
+                  // proportional through the whole range (linear would crowd
+                  // everything below 100 %).
+                  const MIN = 0.3, MAX = 5;
+                  const pos = Math.log(previewZoom / MIN) / Math.log(MAX / MIN);
+                  return (
+                    <span className="zoom-scrub-track" aria-hidden="true">
+                      <span className="zoom-scrub-label top">500%</span>
+                      <span className="zoom-scrub-bar">
+                        <span className="zoom-scrub-mid" />
+                        <span className="zoom-scrub-thumb" style={{ bottom: `${pos * 100}%` }} />
+                      </span>
+                      <span className="zoom-scrub-label bot">30%</span>
+                    </span>
+                  );
+                })()}
+              </span>
+              <button onClick={(e) => { e.stopPropagation(); setPreviewZoom(z => Math.min(5, z * 1.2)); }} title="Увеличить (+)">+</button>
+              <button onClick={(e) => { e.stopPropagation(); resetPreviewZoom(); }} title="Сбросить (1:1)" className="zoom-reset">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           {/* Preview resize handle */}
@@ -3654,7 +5212,10 @@ function Editor({ state, setState }) {
           )}
         </div>
 
-        {/* Properties panel */}
+        {/* Properties panel — wrapped so it can be absolutely sized to the
+            preview column's height (it scrolls internally instead of inflating
+            the workspace row, which would push the timeline far below). */}
+        <div className="ed-props-col">
         <div className="ed-props">
           <div className="ed-props-tabs" data-onb="tabs">
             <button className={`ed-props-tab${edPropTab==='props'?' active':''}`} data-onb="propstab" onClick={()=>setEdPropTab('props')}>Свойства</button>
@@ -3703,10 +5264,10 @@ function Editor({ state, setState }) {
             const sizePx = Math.max((sel.width / 100) * outWidth, (sel.height / 100) * outHeight);
             const updSize = (px) => set('layers', ls => ls.map(x => x.id === sel.id ? {
               ...x,
-              width: clamp((px / outWidth) * 100, 5, 100),
-              height: clamp((px / outHeight) * 100, 5, 100),
+              width: clamp((px / outWidth) * 100, 5, 300),
+              height: clamp((px / outHeight) * 100, 5, 300),
             } : x));
-            const maxPx = Math.max(outWidth, outHeight);
+            const maxPx = Math.max(outWidth, outHeight) * 3;
             return (
               <div className="ed-prop-block ed-prop-sel">
                 <div className="ed-prop-head">
@@ -3730,8 +5291,8 @@ function Editor({ state, setState }) {
                   <Slider label="Размер, px" value={Math.round(sizePx)} min="40" max={maxPx} onChange={updSize} />
                 ) : (
                   <>
-                    <Slider label="Ширина, %" value={sel.width} min="5" max="100" onChange={v=>updLayer(sel.id,'width',v)} />
-                    <Slider label="Высота, %" value={sel.height} min="5" max="100" onChange={v=>updLayer(sel.id,'height',v)} />
+                    <Slider label="Ширина, %" value={sel.width} min="5" max="300" onChange={v=>updLayer(sel.id,'width',v)} />
+                    <Slider label="Высота, %" value={sel.height} min="5" max="300" onChange={v=>updLayer(sel.id,'height',v)} />
                   </>
                 )}
                 {sel.shape === 'rounded' && (
@@ -3787,11 +5348,8 @@ function Editor({ state, setState }) {
               {systemFonts.length > 0 && (
                 <div className="ed-prop-row">
                   <span className="ed-prop-label">Шрифт</span>
-                  <select className="ed-font-sel" value={sel.fontFamily||''}
-                    onChange={e=>{ const fn=e.target.value; const ff=systemFonts.find(f=>f.name===fn); set('layers',l=>l.map(x=>x.id===sel.id?{...x,fontFamily:fn,fontFile:ff?.file||''}:x)); }}>
-                    <option value="">По умолчанию</option>
-                    {systemFonts.map(f=><option key={f.file} value={f.name}>{f.name}</option>)}
-                  </select>
+                  <FontPicker value={sel.fontFamily || ''} fonts={systemFonts}
+                    onChange={(fn) => { const ff = systemFonts.find(f => f.name === fn); set('layers', l => l.map(x => x.id === sel.id ? { ...x, fontFamily: fn, fontFile: ff?.file || '' } : x)); }} />
                 </div>
               )}
               <div className="ed-prop-row">
@@ -3802,6 +5360,259 @@ function Editor({ state, setState }) {
               <Slider label="Прозрачность, %" value={sel.opacity} min="0" max="100" onChange={v=>updLayer(sel.id,'opacity',v)} />
             </div>
           )}
+
+          {sel?.type === 'subtitles' && (() => {
+            const st = sel.style || {};
+            const updStyle = (k, v) => set('layers', (ls) => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), [k]: v } } : l));
+            const segs = Array.isArray(sel.segments) ? sel.segments : [];
+            // Edit a single segment's text — we also rebuild the per-word array
+            // so the karaoke highlight stays in sync. New words inherit the
+            // segment's [start,end] interval uniformly.
+            const updSegText = (segId, newText) => {
+              set('layers', (ls) => ls.map(l => {
+                if (l.id !== sel.id) return l;
+                const news = (l.segments || []).map(s => {
+                  if (s.id !== segId) return s;
+                  const parts = (newText || '').split(/\s+/).filter(Boolean);
+                  if (parts.length === 0) return { ...s, text: '', words: [] };
+                  const dur = Math.max(0.01, s.endTime - s.startTime);
+                  const each = dur / parts.length;
+                  const words = parts.map((w, i) => ({
+                    text: w,
+                    start: s.startTime + i * each,
+                    end: s.startTime + (i + 1) * each,
+                  }));
+                  return { ...s, text: parts.join(' '), words };
+                });
+                return { ...l, segments: news };
+              }));
+            };
+            const delSeg = (segId) => set('layers', (ls) => ls.map(l => l.id === sel.id ? { ...l, segments: (l.segments || []).filter(s => s.id !== segId) } : l));
+            const mergeWithNext = (segId) => set('layers', (ls) => ls.map(l => {
+              if (l.id !== sel.id) return l;
+              const arr = l.segments || [];
+              const i = arr.findIndex(s => s.id === segId);
+              if (i < 0 || i >= arr.length - 1) return l;
+              const a = arr[i], b = arr[i + 1];
+              const merged = {
+                id: a.id,
+                startTime: a.startTime,
+                endTime: b.endTime,
+                text: (a.text + ' ' + b.text).trim(),
+                words: [...(a.words || []), ...(b.words || [])],
+              };
+              const news = [...arr.slice(0, i), merged, ...arr.slice(i + 2)];
+              return { ...l, segments: news };
+            }));
+            const splitAtMid = (segId) => set('layers', (ls) => ls.map(l => {
+              if (l.id !== sel.id) return l;
+              const arr = l.segments || [];
+              const i = arr.findIndex(s => s.id === segId);
+              if (i < 0) return l;
+              const s = arr[i];
+              const words = s.words || [];
+              if (words.length < 2) return l;
+              const mid = Math.floor(words.length / 2);
+              const a = {
+                id: s.id,
+                startTime: s.startTime,
+                endTime: words[mid - 1].end,
+                text: words.slice(0, mid).map(w => w.text).join(' '),
+                words: words.slice(0, mid),
+              };
+              const b = {
+                id: s.id + '_b' + Date.now().toString(36),
+                startTime: words[mid].start,
+                endTime: s.endTime,
+                text: words.slice(mid).map(w => w.text).join(' '),
+                words: words.slice(mid),
+              };
+              const news = [...arr.slice(0, i), a, b, ...arr.slice(i + 1)];
+              return { ...l, segments: news };
+            }));
+            // Re-chunk the whole subtitle stream into nicely-sized groups. Unlike
+            // a strict word count (which makes ugly "2+1" splits when short words
+            // appear), this packs words by a CHARACTER budget — the way Submagic /
+            // CapCut / opus do it: short words pack together, long words split, and
+            // it always breaks at sentence-ending punctuation. The "n" control is a
+            // size target: budget ≈ n×7 chars with a soft word ceiling of n+2 so a
+            // run of tiny words can't make one giant line. Flattens every word with
+            // its timing first, so it's fully reversible (1↔3↔5 re-derive cleanly).
+            const regroupSegments = (n) => {
+              pushUndo();
+              set('layers', (ls) => ls.map(l => {
+                if (l.id !== sel.id || l.type !== 'subtitles') return l;
+                const all = [];
+                for (const s of (l.segments || [])) {
+                  const ss = Number(s.startTime) || 0;
+                  const se = Math.max(ss + 0.05, Number(s.endTime) || ss);
+                  let ws = Array.isArray(s.words) && s.words.length ? s.words : null;
+                  if (!ws) {
+                    const parts = String(s.text || '').split(/\s+/).filter(Boolean);
+                    const each = parts.length ? (se - ss) / parts.length : 0;
+                    ws = parts.map((t, i) => ({ text: t, start: ss + i * each, end: ss + (i + 1) * each }));
+                  }
+                  for (const w of ws) all.push({ text: w.text, start: Number(w.start) || ss, end: Number(w.end) || se });
+                }
+                if (!all.length) return l;
+                const budget = n * 7;      // characters per group (soft)
+                const maxW = n + 2;        // word ceiling so tiny-word runs don't blow up
+                const groups = [];
+                let cur = [], curChars = 0;
+                for (const w of all) {
+                  const wl = (w.text || '').length;
+                  const add = cur.length ? wl + 1 : wl;   // +1 for the space
+                  if (cur.length && (curChars + add > budget || cur.length >= maxW)) {
+                    groups.push(cur); cur = []; curChars = 0;
+                  }
+                  cur.push(w);
+                  curChars += cur.length === 1 ? wl : add;
+                  // Sentence end → always break after (keeps phrases whole).
+                  if (/[.!?…]$/.test((w.text || '').trim())) { groups.push(cur); cur = []; curChars = 0; }
+                }
+                if (cur.length) groups.push(cur);
+                const news = groups.map((g, gi) => {
+                  const start = Number(g[0].start) || 0;
+                  const nextG = groups[gi + 1];
+                  // Hold each group until the next begins (no flicker on pauses).
+                  const end = nextG
+                    ? Math.max(start + 0.05, Number(nextG[0].start) || start)
+                    : Math.max(start + 0.05, Number(g[g.length - 1].end) || start);
+                  return {
+                    id: 'seg_' + gi + '_' + Date.now().toString(36),
+                    startTime: start,
+                    endTime: end,
+                    text: g.map(w => w.text).join(' '),
+                    words: g.map(w => ({ ...w })),
+                  };
+                });
+                return { ...l, segments: news, wordsPerGroup: n };
+              }));
+            };
+            const jumpTo = (t) => setCurrentTime(Math.max(0, Math.min(totalDuration, t)));
+            return (
+              <div className="ed-prop-block ed-prop-sel">
+                <div className="ed-prop-head">✦ Субтитры ({segs.length})</div>
+                {systemFonts.length > 0 && (
+                  <div className="ed-prop-row">
+                    <span className="ed-prop-label">Шрифт</span>
+                    <FontPicker value={st.fontFamily || ''} fonts={systemFonts}
+                      onChange={(fn) => { const ff = systemFonts.find(f => f.name === fn); set('layers', ls => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), fontFamily: fn, fontFile: ff?.file || '' } } : l)); }} />
+                  </div>
+                )}
+                <div className="ed-prop-row">
+                  <span className="ed-prop-label">Размер группы</span>
+                  <div className="sub-wpg-btns">
+                    {[1, 2, 3, 4, 5, 6].map(n => (
+                      <button key={n}
+                        className={`sub-wpg-btn${sel.wordsPerGroup === n ? ' active' : ''}`}
+                        title={`≈${n} ${n === 1 ? 'слово' : 'слова'} на экране — умная группировка: короткие слова пакуются вместе, длинные разбиваются, рвётся по знакам препинания`}
+                        onClick={() => regroupSegments(n)}>{n}</button>
+                    ))}
+                  </div>
+                </div>
+                <Slider label="Размер шрифта" value={st.fontSize ?? 56} min="16" max="200" onChange={v => updStyle('fontSize', v)} />
+
+                {/* Collapsible style block — animation, colours, outline, spacing
+                    tucked away so the panel isn't a wall of controls. Collapsed by default. */}
+                <div className={`ed-effects-section sub-style-acc${subStyleOpen ? ' open' : ' collapsed'}`}>
+                  <button className="ed-effects-title ed-acc-toggle" onClick={() => setSubStyleOpen(o => !o)} aria-expanded={subStyleOpen}>
+                    <span>Оформление</span>
+                    <span className="ed-acc-chev" aria-hidden="true">▾</span>
+                  </button>
+                  <div className="ed-acc-body"><div className="ed-acc-inner">
+                    <div className="ed-prop-row">
+                      <span className="ed-prop-label">Анимация</span>
+                      <select className="ed-font-sel" value={st.anim || 'pop'} onChange={e => updStyle('anim', e.target.value)}>
+                        {SUB_ANIMS.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                      </select>
+                    </div>
+                    <Slider label="Межстрочное, %" value={st.lineHeight ?? 125} min="60" max="300" onChange={v => updStyle('lineHeight', v)} />
+                    <div className="ed-prop-row">
+                      <span className="ed-prop-label">Цвет текста</span>
+                      <input type="color" className="ed-color-inp" value={st.color || '#ffffff'} onChange={e => updStyle('color', e.target.value)} />
+                    </div>
+                    {(() => {
+                      const olMode = st.outlineMode || (st.outline === false ? 'none' : 'external');
+                      const setMode = (m) => { updStyle('outlineMode', m); updStyle('outline', m !== 'none'); };
+                      return (
+                        <>
+                          <div className="ed-prop-row">
+                            <span className="ed-prop-label">Обводка</span>
+                            <select className="ed-font-sel" value={olMode === 'internal' ? 'external' : olMode} onChange={e => setMode(e.target.value)}>
+                              <option value="external">Есть</option>
+                              <option value="none">Нет</option>
+                            </select>
+                          </div>
+                          {olMode !== 'none' && (
+                            <>
+                              <div className="ed-prop-row">
+                                <span className="ed-prop-label">Цвет обводки</span>
+                                <input type="color" className="ed-color-inp"
+                                  value={st.outlineColor || '#000000'}
+                                  onChange={e => updStyle('outlineColor', e.target.value)} />
+                              </div>
+                              <Slider label="Толщина обводки" value={st.outlineWidth ?? Math.max(2, Math.round((st.fontSize ?? 56) * 0.04))}
+                                min="1" max="40" onChange={v => updStyle('outlineWidth', v)} />
+                            </>
+                          )}
+                        </>
+                      );
+                    })()}
+                    <div className="ed-prop-row">
+                      <span className="ed-prop-label">Подсветка слова</span>
+                      <input type="color" className="ed-color-inp" value={st.highlightColor || '#ff9a1f'} onChange={e => updStyle('highlightColor', e.target.value)} />
+                    </div>
+                  </div></div>
+                </div>
+
+                <div className="sub-seg-list">
+                  <div className="sub-seg-hint">Клик по фразе → переход к ней. Двойной клик по тексту → редактирование.</div>
+                  {segs.map((s, idx) => {
+                    const isActive = currentTime >= s.startTime && currentTime <= s.endTime;
+                    return (
+                      <div key={s.id} className={`sub-seg-item${isActive ? ' active' : ''}`}>
+                        <button className="sub-seg-time" onClick={() => jumpTo(s.startTime)} title="Перейти к этой фразе">
+                          {fmt(s.startTime)}
+                        </button>
+                        <textarea
+                          className="sub-seg-text"
+                          rows={1}
+                          spellCheck={false}
+                          value={s.text}
+                          onChange={e => updSegText(s.id, e.target.value)}
+                        />
+                        <div className="sub-seg-acts">
+                          <button className="sub-seg-act" title="Разделить пополам" onClick={() => splitAtMid(s.id)}>✂</button>
+                          {idx < segs.length - 1 && (
+                            <button className="sub-seg-act" title="Объединить со следующей" onClick={() => mergeWithNext(s.id)}>⇣</button>
+                          )}
+                          <button className="sub-seg-act danger" title="Удалить" onClick={() => delSeg(s.id)}>×</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="ed-prop-row" style={{ marginTop: 10 }}>
+                  <span className="ed-prop-label">Язык речи</span>
+                  <select className="ed-font-sel" value={subLang} onChange={e => setSubLang(e.target.value)}>
+                    <option value="auto">Авто (определить)</option>
+                    <option value="ru">Русский</option>
+                    <option value="pt">Português</option>
+                    <option value="en">English</option>
+                    <option value="es">Español</option>
+                    <option value="de">Deutsch</option>
+                    <option value="fr">Français</option>
+                    <option value="it">Italiano</option>
+                    <option value="uk">Українська</option>
+                  </select>
+                </div>
+                <button className="sub-regen-btn" onClick={generateSubtitlesLayer} disabled={!!subProgress}>
+                  Распознать заново
+                </button>
+              </div>
+            );
+          })()}
 
           {/* Video overlay properties */}
           {sel?.type === 'videoOverlay' && (
@@ -3911,6 +5722,7 @@ function Editor({ state, setState }) {
                       { kind: 'whippan', label: 'Whip pan',   desc: 'горизонтальный сдвиг' },
                       { kind: 'zoom',    label: 'Zoom punch', desc: 'резкий зум с блюром' },
                       { kind: 'blur',    label: 'Blur burst', desc: 'размытие при склейке' },
+                      { kind: 'seamzoom',label: 'Бесшовный зум', desc: 'провал в кадр + блюр' },
                     ].map(({ kind, label, desc }) => (
                       <button key={kind}
                         className="ed-trans-chip"
@@ -3924,6 +5736,8 @@ function Editor({ state, setState }) {
               </div>
             </div>
           )}
+
+        </div>
         </div>
       </div>
       )}
@@ -3933,7 +5747,14 @@ function Editor({ state, setState }) {
         <div className="ed-tl-section" data-onb="timeline">
           {/* Timeline toolbar */}
           <div className="ed-tl-bar">
-            <button className="etl-add-btn" onClick={splitAtPlayhead} disabled={!sel} title="Разрезать клип по позиции воспроизведения">✂ Разрезать</button>
+            <button
+              className="etl-subs-btn"
+              onClick={generateSubtitlesLayer}
+              disabled={!!subProgress || !hasAudioSrc}
+              title={!hasAudioSrc ? 'Сначала добавь видео или аудио' : 'Автоматически распознать речь и добавить субтитры'}>
+              <span aria-hidden="true" style={{marginRight:6}}>✦</span>Субтитры
+            </button>
+            <button className="etl-add-btn" onClick={splitAtPlayhead} title="Разрезать клип под курсором по позиции воспроизведения">✂ Разрезать</button>
             <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+клик по клипам на таймлайне для мультивыбора)">⛓ Объединить</button>
             <div style={{flex:1}} />
             <div className="ed-zoom">
@@ -3964,14 +5785,23 @@ function Editor({ state, setState }) {
                 const isMV = layer.type === 'mainVideo';
                 const clStart = isMV ? videoStart : layer.startTime;
                 const clEnd = isMV ? videoEnd : layer.endTime;
+                // Subtitle track expands when selected so each phrase can be
+                // dragged to fix its timing.
+                const isSubExpanded = layer.type === 'subtitles' && selectedId === layer.id;
                 return (
                   <div key={layer.id}
                     data-layer-id={layer.id}
-                    className={`etl-track-row${(selectedId===layer.id||selectedIds.has(layer.id))?' etl-selected':''}${layer.hidden?' etl-hidden':''}`}
+                    className={`etl-track-row${(selectedId===layer.id||selectedIds.has(layer.id))?' etl-selected':''}${layer.hidden?' etl-hidden':''}${isSubExpanded?' etl-row-subs-expanded':''}`}
                     onClick={e=>{
+                      // Ignore the synthetic click that immediately follows a drag
+                      // (otherwise moving a group would clear the multi-selection).
+                      // Only suppress a fresh one (<500ms) so a stale value can't
+                      // swallow a later real click.
+                      if (Date.now() - suppressRowClickRef.current < 500) { suppressRowClickRef.current = 0; return; }
                       const idx = timelineLayers.findIndex(l => l.id === layer.id);
-                      if ((e.ctrlKey||e.metaKey) && e.shiftKey) {
-                        // Ctrl+Shift: select every layer between the anchor and this one
+                      if (e.shiftKey) {
+                        // Shift (with or without Ctrl): select every layer
+                        // between the anchor and this one, inclusive.
                         let a = timelineLayers.findIndex(l => l.id === (selAnchorRef.current ?? selectedId));
                         if (a < 0) a = idx;
                         const lo = Math.min(a, idx), hi = Math.max(a, idx);
@@ -3994,30 +5824,55 @@ function Editor({ state, setState }) {
                       onDragLeave={e=>e.currentTarget.classList.remove('etl-drop-target')}
                       onDrop={e=>{ e.preventDefault(); e.currentTarget.classList.remove('etl-drop-target'); reorderLayer(layerDragRef.current, layer.id); layerDragRef.current=null; }}>
                       <span className={`etl-track-label${layer._missing ? ' etl-missing' : ''}`} title={layer._missing ? `Файл не найден: ${layer.file || ''}` : undefined}>
-                        {LAYER_ICONS[layer.type] && (
-                          <img className="etl-track-icon" src={LAYER_ICONS[layer.type]} alt="" aria-hidden="true" />
-                        )}
                         {layer._missing ? '⚠ ' : ''}{lName(layer)}
                       </span>
                       <div className="etl-track-actions">
                         <button className="etl-act-color" title="Цвет клипа" style={{background:lColor(layer)}}
                           onPointerDown={e=>e.stopPropagation()}
                           onClick={e=>{e.stopPropagation(); const r=e.currentTarget.getBoundingClientRect(); setColorMenu(cm=>cm&&cm.id===layer.id?null:{id:layer.id,x:r.left,y:r.bottom+5});}} />
-                        <button className={`etl-act-btn etl-vis${layer.hidden?' etl-vis-off':''}`} title={layer.hidden?'Показать':'Скрыть'}
+                        <button className={`etl-act-btn etl-vis${layer.hidden?' etl-off':''}`} title={layer.hidden?'Показать видео':'Скрыть видео'}
                           onClick={e=>{e.stopPropagation();toggleVis(layer.id);}}>
-                          {layer.hidden
-                            ? <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M3 3l18 18M10.6 5.2A9 9 0 0 1 12 5c7 0 10 7 10 7a17 17 0 0 1-2.4 3.4M6.5 6.7A17 17 0 0 0 2 12s3 7 10 7a9 9 0 0 0 3.6-.75"/></svg>
-                            : <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>}
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                          {layer.hidden && <span className="etl-act-slash" aria-hidden="true" />}
                         </button>
-                        <button className="etl-act-btn" title="Выше" onClick={e=>{e.stopPropagation();moveLayer(layer.id,1);}}>↑</button>
-                        <button className="etl-act-btn" title="Ниже" onClick={e=>{e.stopPropagation();moveLayer(layer.id,-1);}}>↓</button>
+                        {LAYER_HAS_AUDIO(layer.type) && (
+                          <button className={`etl-act-btn etl-snd${layer.muted?' etl-off':''}`} title={layer.muted?'Включить звук':'Выключить звук'}
+                            onClick={e=>{e.stopPropagation();toggleMute(layer.id);}}>
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 6a8 8 0 0 1 0 12"/></svg>
+                            {layer.muted && <span className="etl-act-slash" aria-hidden="true" />}
+                          </button>
+                        )}
                         <button className="etl-act-btn etl-del" onClick={e=>{e.stopPropagation();delLayer(layer.id);}}>×</button>
+                        <div className="etl-act-vstack">
+                          <button className="etl-act-btn etl-act-mini" title="Выше" onClick={e=>{e.stopPropagation();moveLayer(layer.id,1);}}>↑</button>
+                          <button className="etl-act-btn etl-act-mini" title="Ниже" onClick={e=>{e.stopPropagation();moveLayer(layer.id,-1);}}>↓</button>
+                        </div>
                       </div>
                     </div>
-                    <div className="etl-track-area">
+                    <div className={`etl-track-area${isSubExpanded?' etl-track-area-subs':''}`}>
+                      {isSubExpanded ? (
+                        (layer.segments||[]).map(seg => (
+                          <div key={seg.id} className="etl-subseg"
+                            style={{left:pct(seg.startTime),width:`calc(${pct(seg.endTime)} - ${pct(seg.startTime)})`,background:lColor(layer)+'cc',borderColor:lColor(layer)}}
+                            title={`${seg.text}\n(тяни середину — сдвиг тайминга, края — длина)`}
+                            onPointerDown={makeSubSegDrag(layer.id, seg.id)}
+                            onClick={e=>{e.stopPropagation(); setCurrentTime(Math.max(0, Math.min(dur, (seg.startTime||0)+0.02)));}}>
+                            <div className="etl-subseg-handle etl-subseg-s" onPointerDown={makeSubSegResize(layer.id, seg.id, true)} />
+                            <span className="etl-subseg-label">{seg.text}</span>
+                            <div className="etl-subseg-handle etl-subseg-e" onPointerDown={makeSubSegResize(layer.id, seg.id, false)} />
+                          </div>
+                        ))
+                      ) : (
                       <div className={`etl-clip${(layer.type==='image'||layer.type==='videoOverlay')?' etl-clip-img':''}`}
                         style={{left:pct(clStart),width:`calc(${pct(clEnd)} - ${pct(clStart)})`,background:lColor(layer)+(layer.hidden?'55':'bb'),borderColor:lColor(layer),cursor:'grab',opacity:layer.hidden?.5:1}}
                         onPointerDown={makeClipBodyDrag(layer.id)}>
+                        {/* 1:1 type badge pinned to the clip start — instantly tells
+                            you what the layer is (video / image / audio / text…). */}
+                        <span className="etl-clip-typebadge" style={{background:lColor(layer)}} title={lName(layer)}>
+                          {LAYER_ICONS[layer.type]
+                            ? <img src={LAYER_ICONS[layer.type]} alt="" />
+                            : <span>{layer.type==='audio'?'♪':layer.type==='text'?'T':layer.type==='subtitles'?'✦':'▦'}</span>}
+                        </span>
                         {layer.type==='audio' && (
                           <div className="etl-waveform" aria-hidden="true">
                             {Array.from({length:36},(_,i)=><div key={i} className="etl-waveform-bar" style={{height:`${22+Math.sin(i*.9+1.2)*28+Math.cos(i*1.7)*18}%`}} />)}
@@ -4071,6 +5926,7 @@ function Editor({ state, setState }) {
                         )}
                         <div className="etl-clip-handle etl-clip-e" onPointerDown={makeClipHandleDrag(layer.id,false)} />
                       </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -4082,6 +5938,7 @@ function Editor({ state, setState }) {
       )}
 
     </section>
+    {hotkeysOpen && <HotkeysOverlay onClose={() => setHotkeysOpen(false)} />}
   </>;
 }
 
