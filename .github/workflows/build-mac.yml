@@ -43,6 +43,11 @@ jobs:
       - name: Prepare bundled ffmpeg (macOS binary from ffmpeg-static)
         run: npm run prepare-ffmpeg
 
+      - name: Bake Groq API key into the build (from repo secret)
+        run: npm run bake-groq
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
       - name: Build & publish universal .dmg (arm64 + x64 in one bundle)
         run: npx electron-builder --mac --universal --publish always
         env:

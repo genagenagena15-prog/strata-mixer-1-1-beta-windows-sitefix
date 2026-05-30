@@ -277,6 +277,15 @@ if (!dryRun) progress.set('win', { status: 'building', detail: 'vite build', per
 run('npm', ['run', 'build']);
 if (!dryRun) progress.set('win', { status: 'building', detail: 'prepare-ffmpeg', percent: 35 });
 run('npm', ['run', 'prepare-ffmpeg']);
+// Bake the Groq API key into the build so subtitles/transcription work for end
+// users (who have no GROQ_API_KEY env var). Reads process.env.GROQ_API_KEY —
+// the dev's Windows User env supplies it locally.
+if (!process.env.GROQ_API_KEY) {
+  console.warn('\n⚠ GROQ_API_KEY not in env — Windows build will ship WITHOUT a baked key (subtitles disabled).');
+  console.warn('  Run release from PowerShell with:');
+  console.warn("  $env:GROQ_API_KEY = [Environment]::GetEnvironmentVariable('GROQ_API_KEY','User')\n");
+}
+run('npm', ['run', 'bake-groq']);
 if (!dryRun) progress.set('win', { status: 'publishing', detail: 'electron-builder + upload', percent: 55 });
 run('npx', [
   'electron-builder', '--win',

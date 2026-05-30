@@ -2406,8 +2406,24 @@ const GROQ_TRANSCRIBE_URL = 'https://api.groq.com/openai/v1/audio/transcriptions
 const GROQ_MAX_FILE_BYTES = 25 * 1024 * 1024;     // Groq hard limit: 25MB
 const SUBTITLE_MAX_SECONDS = 25 * 60;             // Refuse projects > 25 min
 
+// Read the key baked into the build at package time (electron/groq-key.json,
+// written by scripts/bake-groq-key.cjs). Cached after first read. This is the
+// fallback that makes subtitles/transcription work for end users who don't have
+// a GROQ_API_KEY env var on their machine.
+let _bakedGroqKey = null;
+function bakedGroqKey() {
+  if (_bakedGroqKey !== null) return _bakedGroqKey;
+  _bakedGroqKey = '';
+  try {
+    const p = path.join(__dirname, 'groq-key.json');
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    _bakedGroqKey = String(parsed.key || '').trim();
+  } catch { /* file absent in dev — fine, env var covers it */ }
+  return _bakedGroqKey;
+}
+
 function groqApiKey() {
-  return process.env.GROQ_API_KEY || '';
+  return process.env.GROQ_API_KEY || bakedGroqKey();
 }
 
 // Build a mono 16kHz MP3 of the entire project audio mix. This is what we

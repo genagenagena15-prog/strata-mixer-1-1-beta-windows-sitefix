@@ -21,3 +21,7 @@ Thumbs.db
 _subtest/
 NUL
 NUL.css
+
+# baked Groq API key (generated at build time from env / CI secret — never commit)
+electron/groq-key.json
+.claude/launch.json
