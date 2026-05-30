@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.3.0';
+const APP_VERSION = 'v1.3.1';
 const DONATE_WALLET = 'TGoUEoM6AjG6KjnXJi9hFYRn54c6HsTybE';
 
 // Volume slider taper: piecewise for fine control at both ends.

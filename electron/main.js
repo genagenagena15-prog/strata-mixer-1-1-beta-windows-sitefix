@@ -806,10 +806,30 @@ ipcMain.handle('app:version', () => CURRENT_DISPLAY_VERSION);
 ipcMain.handle('update:getState', () => updateState);
 ipcMain.handle('update:check', () => { checkForUpdatesSafe(); return updateState; });
 ipcMain.handle('update:install', async () => {
-  // Mac: just open the DMG download in the browser (no auto-install possible
-  // without a Developer cert; the user installs it manually).
+  // Mac: no in-place auto-install (DMG is unsigned). But we still mirror the
+  // Windows experience as closely as possible — download the .dmg with a live
+  // progress window, then open it so the user just drags the app into
+  // Applications. Falls back to opening the browser download if anything fails.
   if (process.platform === 'darwin' && updateState.status === 'mac-available' && updateState.downloadUrl) {
-    try { shell.openExternal(updateState.downloadUrl); } catch {}
+    const verText = updateState.version ? `v${updateState.version}` : 'новая версия';
+    const detail = 'Скачиваем обновление. Когда загрузка завершится, откроется установщик — перетащи Strata Mixer в папку «Программы».';
+    try {
+      createUpdateWindow({ displayVersion: verText });
+      setUpdateWindowStatus({ title: `Загрузка ${verText}`, detail, status: 'Подключаемся…', percent: 0 });
+      const dmgPath = await downloadUpdateInstaller(updateState.downloadUrl, (percent, downloaded, total) => {
+        const sizeText = total ? `${formatDownloadSize(downloaded)} / ${formatDownloadSize(total)}` : formatDownloadSize(downloaded);
+        setUpdateWindowStatus({ title: `Загрузка ${verText}`, detail, status: sizeText, percent });
+      });
+      setUpdateWindowStatus({ title: 'Загрузка завершена', detail: 'Открываем установщик (.dmg). Перетащи Strata Mixer в «Программы».', status: 'Готово', percent: 100 });
+      await new Promise((r) => setTimeout(r, 700));
+      updateWindowCanClose = true;
+      try { updateWindow?.close(); } catch {}
+      try { await shell.openPath(dmgPath); } catch { try { shell.openExternal(updateState.downloadUrl); } catch {} }
+    } catch (e) {
+      updateWindowCanClose = true;
+      try { updateWindow?.close(); } catch {}
+      try { shell.openExternal(updateState.downloadUrl); } catch {}
+    }
     return true;
   }
   // Ask to save unsaved work before restarting for the install.
