@@ -2877,52 +2877,56 @@ function parseFontVariant(base) {
     .filter(Boolean).join(' ');
 }
 
+// Prettify a filename family key for display: CamelCase + digit boundaries →
+// spaced, each word capitalised. "AristaPro"→"Arista Pro", "SourceSans3"→
+// "Source Sans 3", "boorsok"→"Boorsok".
+function prettyFamilyName(key) {
+  return key
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([A-Za-z])(\d)/g, '$1 $2')
+    .trim()
+    .split(/\s+/)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+// Order weights light→heavy for the weight picker.
+const VARIANT_ORDER = ['Hairline', 'Thin', 'ExtraLight', 'Light', 'Regular', 'Medium',
+  'SemiBold', 'DemiBold', 'Bold', 'ExtraBold', 'Fat', 'Black', 'Italic', 'Bold Italic'];
+
+// GROUP bundled fonts BY FAMILY (one picker entry per family ≈15, not per weight
+// file). Each family lists its weight variants; the weight is chosen separately.
+// The family KEY comes from the filename (split before the first -/_) so all
+// weights of a family group together regardless of their internal name-table.
 function listBundledFonts() {
   const dir = appPath('assets', 'fonts');
   try {
     if (!fs.existsSync(dir)) return [];
-    // Prefer the REAL family name read from the TTF's `name` table for fontconfig
-    // accuracy, then append the variant parsed from the filename so multiple
-    // weights of one family don't collapse to identical-looking picker entries.
-    return fs.readdirSync(dir)
-      .filter(f => /\.(ttf|otf)$/i.test(f))
-      .map(f => {
-        const fullPath = path.join(dir, f);
-        const base = path.basename(f, path.extname(f));
-        let family = readFontFamilyName(fullPath);
-        if (!family) {
-          family = base.split(/[-_]/)[0].replace(/([a-z])([A-Z])/g, '$1 $2').trim();
-          family = family.charAt(0).toUpperCase() + family.slice(1);
-        }
-        const variant = parseFontVariant(base);
-        const display = variant ? `${family} ${variant}` : family;
-        return { name: '★ ' + display, file: fullPath };
-      })
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const byFamily = new Map();
+    for (const f of fs.readdirSync(dir).filter(f => /\.(ttf|otf)$/i.test(f))) {
+      const fullPath = path.join(dir, f);
+      const base = path.basename(f, path.extname(f));
+      const key = base.split(/[-_]/)[0];
+      const label = parseFontVariant(base) || 'Regular';
+      if (!byFamily.has(key)) byFamily.set(key, []);
+      byFamily.get(key).push({ label, file: fullPath });
+    }
+    const fams = [...byFamily.entries()].map(([key, variants]) => {
+      variants.sort((a, b) => {
+        const ia = VARIANT_ORDER.indexOf(a.label), ib = VARIANT_ORDER.indexOf(b.label);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.label.localeCompare(b.label);
+      });
+      const def = variants.find(v => v.label === 'Regular') || variants[0];
+      return { family: key, name: '★ ' + prettyFamilyName(key), file: def.file, variants };
+    });
+    return fams.sort((a, b) => a.name.localeCompare(b.name));
   } catch { return []; }
 }
 
 ipcMain.handle('fonts:list', async () => {
   if (_fontsCache) return _fontsCache;
-  const bundled = listBundledFonts();
-  let system = [];
-  if (process.platform === 'win32') {
-    const fontsDir = 'C:/Windows/Fonts';
-    try {
-      const files = await fs.promises.readdir(fontsDir);
-      system = files
-        .filter(f => /\.(ttf|otf)$/i.test(f))
-        .map(f => {
-          const n = path.basename(f, path.extname(f))
-            .replace(/[-_]/g, ' ')
-            .replace(/\b\w/g, c => c.toUpperCase())
-            .trim();
-          return { name: n, file: (fontsDir + '/' + f) };
-        })
-        .sort((a, b) => a.name.localeCompare(b.name));
-    } catch {}
-  }
-  _fontsCache = [...bundled, ...system];
+  // Only the curated bundled families — no OS fonts (the picker was drowning in
+  // hundreds of system fonts). Each entry is a family with its weight variants.
+  _fontsCache = listBundledFonts();
   return _fontsCache;
 });
 

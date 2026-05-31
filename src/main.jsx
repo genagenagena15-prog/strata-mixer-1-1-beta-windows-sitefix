@@ -1439,42 +1439,36 @@ function DonateModal({ onClose }) {
 // the family name in a neutral face. The native <select>/<option> can't render
 // each option in its own font face reliably + can't mix font-families inside
 // one row, so this is a custom popover.
-function FontPicker({ value, fonts, onChange }) {
+// Family picker — one entry per font FAMILY (≈15). `value` is the current
+// fontFile; the owning family is highlighted. onPick(family) hands back the
+// whole family object (weight is chosen separately).
+function FontPicker({ value, families, onPick }) {
   const [open, setOpen] = React.useState(false);
   const wrapRef = React.useRef(null);
-  const current = fonts.find(f => f.name === value);
+  const current = families.find(fam => (fam.variants || []).some(v => v.file === value))
+    || families.find(fam => fam.file === value) || null;
   React.useEffect(() => {
     if (!open) return;
     const onDown = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
   }, [open]);
-  // Bundled fonts use the smf_<id> @font-face we registered on mount; system
-  // fonts are referenced by the OS family name directly.
-  const previewFamily = (f) => f.name.startsWith('★ ')
-    ? fontCss({ fontFile: f.file })
-    : `"${f.name.replace(/"/g, '')}", Arial, sans-serif`;
-  const pickItem = (name) => { onChange(name); setOpen(false); };
+  const pick = (fam) => { onPick(fam); setOpen(false); };
   return (
     <div className="font-picker" ref={wrapRef}>
       <button type="button" className="font-picker-btn" onClick={() => setOpen(o => !o)}>
-        <span className="font-picker-sample" style={current ? { fontFamily: previewFamily(current) } : undefined}>Aa</span>
-        <span className="font-picker-name">{current ? current.name : 'По умолчанию'}</span>
+        <span className="font-picker-sample" style={current ? { fontFamily: fontCss({ fontFile: current.file }) } : undefined}>Aa</span>
+        <span className="font-picker-name">{current ? current.name : 'Выбрать шрифт'}</span>
         <span className="font-picker-chev" aria-hidden="true">▾</span>
       </button>
       {open && (
         <div className="font-picker-list" role="listbox">
-          <div className={`font-picker-item${!current ? ' active' : ''}`}
-            onMouseDown={(e) => { e.preventDefault(); pickItem(''); }}>
-            <span className="font-picker-sample">Aa</span>
-            <span className="font-picker-name">По умолчанию</span>
-          </div>
-          {fonts.map(f => (
-            <div key={f.file}
-              className={`font-picker-item${f.name === value ? ' active' : ''}`}
-              onMouseDown={(e) => { e.preventDefault(); pickItem(f.name); }}>
-              <span className="font-picker-sample" style={{ fontFamily: previewFamily(f) }}>Aa</span>
-              <span className="font-picker-name">{f.name}</span>
+          {(families || []).map(fam => (
+            <div key={fam.family}
+              className={`font-picker-item${current && current.family === fam.family ? ' active' : ''}`}
+              onMouseDown={(e) => { e.preventDefault(); pick(fam); }}>
+              <span className="font-picker-sample" style={{ fontFamily: fontCss({ fontFile: fam.file }) }}>Aa</span>
+              <span className="font-picker-name">{fam.name}</span>
             </div>
           ))}
         </div>
@@ -1718,6 +1712,10 @@ function Editor({ state, setState }) {
 
   const [systemFonts, setSystemFonts] = useState([]);
   useEffect(() => { window.strata?.listFonts?.().then(f => setSystemFonts(f || [])).catch(() => {}); }, []);
+  // Default font for new text/subtitle layers — Bangers, else the first family.
+  const defaultFont = React.useMemo(() => systemFonts.find(f => f.family === 'Bangers') || systemFonts[0] || null, [systemFonts]);
+  // Which family owns a given fontFile (for the weight selector).
+  const famOfFile = (file) => systemFonts.find(fam => (fam.variants || []).some(v => v.file === file)) || null;
 
   // Load every text layer's font file into the browser under a deterministic
   // family id (fontIdFor). The preview then renders with the exact same physical
@@ -1755,15 +1753,19 @@ function Editor({ state, setState }) {
   // — the OS already has them registered for CSS font-family lookup.
   useEffect(() => {
     if (!systemFonts.length) return;
-    for (const f of systemFonts) {
-      if (!f.name.startsWith('★ ')) continue;
-      const id = fontIdFor(f.file);
-      if (!id || loadedFontsRef.current.has(id)) continue;
-      loadedFontsRef.current.add(id);
-      const url = `file:///${f.file.replace(/\\/g, '/').replace(/^\/+/, '')}`;
-      new FontFace(id, `url("${url}")`).load()
-        .then(face => { document.fonts.add(face); setFontRevision(r => r + 1); })
-        .catch(() => { loadedFontsRef.current.delete(id); });
+    // Register EVERY weight variant's file so each renders in its own face in the
+    // picker preview and on the canvas (families now carry a `variants` list).
+    for (const fam of systemFonts) {
+      const variants = fam.variants || (fam.file ? [{ file: fam.file }] : []);
+      for (const v of variants) {
+        const id = fontIdFor(v.file);
+        if (!id || loadedFontsRef.current.has(id)) continue;
+        loadedFontsRef.current.add(id);
+        const url = `file:///${v.file.replace(/\\/g, '/').replace(/^\/+/, '')}`;
+        new FontFace(id, `url("${url}")`).load()
+          .then(face => { document.fonts.add(face); setFontRevision(r => r + 1); })
+          .catch(() => { loadedFontsRef.current.delete(id); });
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [systemFonts]);
@@ -2502,7 +2504,7 @@ function Editor({ state, setState }) {
     setSelectedIds(new Set());
   }
   function addTextOverlay() {
-    const sysFont = systemFonts[0];
+    const sysFont = defaultFont;
     addLayer({ id: Date.now(), type: 'text', text: '', color: '#ffffff', size: 48, opacity: 100, align: 'center', x: 50, y: 80, startTime: 0, endTime: dur, fontFamily: sysFont?.name || 'Arial', fontFile: sysFont?.file || '' });
   }
 
@@ -2523,7 +2525,7 @@ function Editor({ state, setState }) {
     } catch {}
     setSubProgress({ phase: 'extract', percent: 0 });
     try {
-      const sysFont = systemFonts[0];
+      const sysFont = defaultFont;
       // Send the exact payload the export pipeline needs — main.js then
       // reuses the same audio-mix logic to bake a 16kHz mono mp3 for Whisper.
       const res = await window.strata.subtitles.generate({
@@ -5876,10 +5878,19 @@ function Editor({ state, setState }) {
               {systemFonts.length > 0 && (
                 <div className="ed-prop-row">
                   <span className="ed-prop-label">Шрифт</span>
-                  <FontPicker value={sel.fontFamily || ''} fonts={systemFonts}
-                    onChange={(fn) => { const ff = systemFonts.find(f => f.name === fn); set('layers', l => l.map(x => x.id === sel.id ? { ...x, fontFamily: fn, fontFile: ff?.file || '' } : x)); }} />
+                  <FontPicker value={sel.fontFile || ''} families={systemFonts}
+                    onPick={(f) => set('layers', l => l.map(x => x.id === sel.id ? { ...x, fontFamily: f.name, fontFile: f.file } : x))} />
                 </div>
               )}
+              {(() => { const fam = famOfFile(sel.fontFile); return fam && fam.variants.length > 1 ? (
+                <div className="ed-prop-row">
+                  <span className="ed-prop-label">Толщина</span>
+                  <select className="ed-font-sel" value={sel.fontFile || fam.file}
+                    onChange={(e) => { const file = e.target.value; const v = fam.variants.find(v => v.file === file); set('layers', l => l.map(x => x.id === sel.id ? { ...x, fontFamily: fam.name + (v && v.label !== 'Regular' ? ' ' + v.label : ''), fontFile: file } : x)); }}>
+                    {fam.variants.map(v => <option key={v.file} value={v.file}>{v.label}</option>)}
+                  </select>
+                </div>
+              ) : null; })()}
               <div className="ed-prop-row">
                 <span className="ed-prop-label">Цвет</span>
                 <input type="color" className="ed-color-inp" value={sel.color||'#ffffff'} onChange={e=>updLayer(sel.id,'color',e.target.value)} />
@@ -6024,10 +6035,19 @@ function Editor({ state, setState }) {
                 {systemFonts.length > 0 && (
                   <div className="ed-prop-row">
                     <span className="ed-prop-label">Шрифт</span>
-                    <FontPicker value={st.fontFamily || ''} fonts={systemFonts}
-                      onChange={(fn) => { const ff = systemFonts.find(f => f.name === fn); set('layers', ls => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), fontFamily: fn, fontFile: ff?.file || '' } } : l)); }} />
+                    <FontPicker value={st.fontFile || ''} families={systemFonts}
+                      onPick={(f) => set('layers', ls => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), fontFamily: f.name, fontFile: f.file } } : l))} />
                   </div>
                 )}
+                {(() => { const fam = famOfFile(st.fontFile); return fam && fam.variants.length > 1 ? (
+                  <div className="ed-prop-row">
+                    <span className="ed-prop-label">Толщина</span>
+                    <select className="ed-font-sel" value={st.fontFile || fam.file}
+                      onChange={(e) => { const file = e.target.value; const v = fam.variants.find(v => v.file === file); set('layers', ls => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), fontFamily: fam.name + (v && v.label !== 'Regular' ? ' ' + v.label : ''), fontFile: file } } : l)); }}>
+                      {fam.variants.map(v => <option key={v.file} value={v.file}>{v.label}</option>)}
+                    </select>
+                  </div>
+                ) : null; })()}
                 <div className="ed-prop-row">
                   <span className="ed-prop-label">Размер группы</span>
                   <div className="sub-wpg-btns">
