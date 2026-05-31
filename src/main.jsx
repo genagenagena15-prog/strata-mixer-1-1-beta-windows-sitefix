@@ -1998,11 +1998,6 @@ function Editor({ state, setState }) {
   // the main thread → no audio dropouts, buttery playback. Flips back to the
   // crisp full-res canvas instantly on pause/scrub/edit/buffer-gap.
   const [proxyPlay, setProxyPlay] = useState(false);
-  // TEMP diagnostic: what the preview is actually showing right now
-  // (canvas vs proxy q0/q1). Surfaced as a small badge over the preview.
-  const [proxyDbg, setProxyDbg] = useState('');
-  const proxyDbgRef = useRef('');
-  const [proxyDbg2, setProxyDbg2] = useState('');   // pipeline status (passes/errors)
   const videoOverlayRefs = useRef({});
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
@@ -3229,7 +3224,6 @@ function Editor({ state, setState }) {
     deactivateProxy();                 // drop back to the live canvas at once
     setBuffered([]);
     setBufferedHd([]);
-    setProxyDbg2('');
     window.strata?.cancelPreview?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layers, totalDuration, outWidth, outHeight, bgColor]);
@@ -3253,7 +3247,6 @@ function Editor({ state, setState }) {
   // browser-fullscreen element only shows its own descendants. Only the one for
   // the current view is ever driven; the other stays paused/hidden.
   const activeProxyVideo = () => (previewFullscreenRef.current ? proxyVideoFsRef.current : proxyVideoRef.current);
-  const setDbg = (s) => { if (proxyDbgRef.current !== s) { proxyDbgRef.current = s; setProxyDbg(s); } };
 
   function findReadyProxyFile(appT) {
     const eps = 0.05, lead = 0.12;   // need a little runway before a file's end
@@ -3274,7 +3267,6 @@ function Editor({ state, setState }) {
     [proxyVideoRef.current, proxyVideoFsRef.current].forEach(pv => { if (pv) { try { pv.pause(); } catch {} } });
     proxyActiveUrlRef.current = null;
     if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
-    setDbg(playingRef.current ? 'canvas (no buffer)' : 'canvas (paused, full-res)');
   }
   function loadProxy(want, seekT) {
     const pv = activeProxyVideo(); if (!pv) return;
@@ -3283,7 +3275,6 @@ function Editor({ state, setState }) {
     // canvas (PREVIEW_SCALE) is itself sharper than the low proxy, so the
     // transition reads as low→sharper→crisp. Initial activation skips this.
     if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
-    console.log('[proxy] load q=' + (want.q || 0) + ' ' + String(want.url).split(/[\\/]/).pop());
     proxyActiveUrlRef.current = want.url;          // claim now so we don't re-enter
     const target = Math.max(0, seekT);
     let done = false;
@@ -3295,7 +3286,6 @@ function Editor({ state, setState }) {
       if (proxyActiveUrlRef.current !== want.url) return;    // superseded mid-load
       try { pv.play().catch(() => {}); } catch {}
       proxyPlayRef.current = true; setProxyPlay(true);
-      console.log('[proxy] PLAYING q=' + (want.q || 0));
     };
     const onLoaded = () => {
       pv.removeEventListener('loadeddata', onLoaded);
@@ -3323,10 +3313,9 @@ function Editor({ state, setState }) {
     const pv = activeProxyVideo(); if (!pv) return;
     const appT = currentTimeRef.current;
     const want = findReadyProxyFile(appT);
-    if (!want) { setDbg('canvas (no buffer @ ' + appT.toFixed(1) + 's)'); if (proxyPlayRef.current) deactivateProxy(); return; }
-    if (proxyActiveUrlRef.current !== want.url) { setDbg('loading q' + (want.q || 0) + '…'); loadProxy(want, appT - want.appStart); return; }
-    if (!proxyPlayRef.current) { setDbg('loading q' + (want.q || 0) + '…'); return; }   // still loading / cutting over
-    setDbg('PROXY q' + (want.q || 0) + (want.q >= 1 ? ' (HD)' : ' (low)'));
+    if (!want) { if (proxyPlayRef.current) deactivateProxy(); return; }
+    if (proxyActiveUrlRef.current !== want.url) { loadProxy(want, appT - want.appStart); return; }
+    if (!proxyPlayRef.current) return;             // still loading / cutting over
     if (pv.paused) { try { pv.play().catch(() => {}); } catch {} }
     // Keep the muted proxy picture aligned to the live playhead. Both run at
     // real time so they stay close; only a real drift forces a tiny reseek.
@@ -4231,7 +4220,6 @@ function Editor({ state, setState }) {
       ? [{ start: T, end: dur }, { start: 0, end: T }]
       : [{ start: 0, end: dur }];
     proxyRunningRef.current = true;
-    let lastFail = '';   // diagnostic: last ffmpeg failure reason (shown on badge)
 
     // Render every segment at (ow×oh), tagging each finished mp4 with quality
     // rank `q` — the player always prefers the highest q available, so when the
@@ -4261,16 +4249,15 @@ function Editor({ state, setState }) {
           payload.previewRange = { start: seg.start, end: seg.end };
           const res = await window.strata?.editVideo?.(payload);
           if (proxyTokenRef.current !== token) { ok = false; break; }
-          if (res && res.ok === false) { lastFail = 'q' + q + ' ' + ow + 'x' + oh + ': ' + (res.error || '').slice(0, 160); console.warn('[proxy] seg FAILED q=' + q + ' i=' + i + ' ' + ow + 'x' + oh, (res.error || '').slice(0, 400)); ok = false; break; }
+          if (res && res.ok === false) { console.warn('[proxy] segment render failed q=' + q + ' ' + ow + 'x' + oh + ':', (res.error || '').slice(0, 400)); ok = false; break; }
           // Complete, playable mp4 (faststart moov written on close) → register.
           proxyFilesRef.current = [
             ...proxyFilesRef.current.filter(f => f.url !== outPath),
             { appStart: seg.start, appEnd: seg.end, url: outPath, q, token },
           ];
           doneAcc.push({ s: seg.start, e: seg.end }); setBar([...doneAcc]);
-          console.log('[proxy] seg done q=' + q + ' i=' + i + ' ' + ow + 'x' + oh + ' [' + seg.start.toFixed(1) + '..' + seg.end.toFixed(1) + ']');
         }
-      } catch (e) { console.warn('[proxy] pass threw q=' + q, e); ok = false; }
+      } catch (e) { console.warn('[proxy] pass error q=' + q, e); ok = false; }
       off?.();
       return ok;
     };
@@ -4278,27 +4265,16 @@ function Editor({ state, setState }) {
     // PASS 1 — LOW res (≈480 long side): smooth playback ASAP + fills the bar.
     const loSc = Math.min(1, 480 / longSide);
     const loW = even(outWidth * loSc), loH = even(outHeight * loSc);
-    console.log('[proxy] pass1 (low) start ' + loW + 'x' + loH + ' segs=' + segs.length);
     const ok1 = await renderPass(loW, loH, 0, 0, setBuffered, []);
-    console.log('[proxy] pass1 (low) ok=' + ok1);
 
     // PASS 2 — FULL export resolution: play-HD then looks IDENTICAL to the
     // paused canvas (which renders at full res) → preview == export during
     // playback too. Swapped in by the player the moment each hi segment
     // finishes. Skipped if pass 1 was already full res (already-small projects).
-    let ranHi = false, ok2 = false, hiDims = '';
     if (ok1 && proxyTokenRef.current === token) {
       const hiW = even(outWidth), hiH = even(outHeight);
-      hiDims = hiW + 'x' + hiH;
-      console.log('[proxy] pass2 (high) ' + hiDims + ' run=' + (hiW > loW));
-      if (hiW > loW) { ranHi = true; setProxyDbg2('p1=ok | p2 RENDERING ' + hiDims + '…'); ok2 = await renderPass(hiW, hiH, 1, 5, setBufferedHd, []); console.log('[proxy] pass2 (high) ok=' + ok2); }
-    } else {
-      console.log('[proxy] pass2 skipped (ok1=' + ok1 + ', tokenSame=' + (proxyTokenRef.current === token) + ')');
+      if (hiW > loW) await renderPass(hiW, hiH, 1, 5, setBufferedHd, []);
     }
-    // Surface the whole pipeline outcome on the diagnostic badge so a silent
-    // hi-res failure (or skip) is visible without DevTools.
-    const cnt = (lo, hi) => proxyFilesRef.current.filter(f => f.token === token && (lo ? (f.q || 0) === 0 : (f.q || 0) >= 1)).length;
-    setProxyDbg2('p1=' + ok1 + ' | p2 ' + (ranHi ? hiDims + '=' + ok2 : 'skip') + ' | files q0:' + cnt(true) + ' q1:' + cnt(false) + (lastFail ? ' | FAIL ' + lastFail : ''));
 
     proxyRunningRef.current = false;
     if (proxyTokenRef.current === token) proxyDoneTokenRef.current = token;  // both passes done
@@ -5488,12 +5464,6 @@ function Editor({ state, setState }) {
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
                   <video ref={proxyVideoRef} muted playsInline preload="auto"
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: (proxyPlay && !previewFullscreen) ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
-                  {/* TEMP diagnostic badge — what the preview is showing now +
-                      proxy pipeline status (passes / file counts / errors). */}
-                  <div style={{ position:'absolute', top:4, left:4, right:4, zIndex:6, font:'10px monospace', fontWeight:700, pointerEvents:'none', letterSpacing:'.2px' }}>
-                    <span style={{ color: proxyDbg.startsWith('PROXY q1') ? '#7CFC6A' : proxyDbg.startsWith('PROXY q0') ? '#ffd24a' : '#9fd0ff', background:'rgba(0,0,0,.66)', padding:'2px 6px', borderRadius:4 }}>{proxyDbg || 'canvas'}</span>
-                    {proxyDbg2 && <div style={{ marginTop:3, color: proxyDbg2.includes('FAIL') ? '#ff6b6b' : '#cfe8ff', background:'rgba(0,0,0,.66)', padding:'2px 6px', borderRadius:4, display:'inline-block', maxWidth:'100%', whiteSpace:'normal', wordBreak:'break-word' }}>{proxyDbg2}</div>}
-                  </div>
                   {/* Subtle frame — the project rect is defined by contrast between
                       the black canvas and the gray preview surround; only a thin
                       hairline on top to make the edge crisp. */}
