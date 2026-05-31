@@ -2013,8 +2013,17 @@ function Editor({ state, setState }) {
     e.preventDefault();
     const startX = e.clientX, startY = e.clientY;
     const startPanX = previewPanRef.current.x, startPanY = previewPanRef.current.y;
-    const onMove = (ev) => setPreviewPan({ x: startPanX + (ev.clientX - startX), y: startPanY + (ev.clientY - startY) });
-    const onUp = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+    let moved = false;
+    const onMove = (ev) => {
+      if (Math.abs(ev.clientX - startX) > 3 || Math.abs(ev.clientY - startY) > 3) moved = true;
+      setPreviewPan({ x: startPanX + (ev.clientX - startX), y: startPanY + (ev.clientY - startY) });
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      // A plain click on empty preview space (no drag) clears the selection.
+      if (!moved) { setSelectedId(null); setSelectedIds(new Set()); }
+    };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
   }
@@ -6561,7 +6570,7 @@ function Editor({ state, setState }) {
                           </div>
                         ))
                       ) : (
-                      <div className={`etl-clip${(layer.type==='image'||layer.type==='videoOverlay')?' etl-clip-img':''}`}
+                      <div className={`etl-clip${(layer.type==='image'||layer.type==='videoOverlay'||layer.type==='maskedVideo')?' etl-clip-img':''}`}
                         style={{left:pct(clStart),width:`calc(${pct(clEnd)} - ${pct(clStart)})`,background:lColor(layer)+(layer.hidden?'55':'bb'),borderColor:lColor(layer),cursor:'grab',opacity:layer.hidden?.5:1}}
                         onPointerDown={makeClipBodyDrag(layer.id)}
                         onDoubleClick={layer.type==='subtitles' ? (e)=>{e.stopPropagation(); openSubSegmentAt(layer.id, currentTime);} : undefined}>
@@ -6580,7 +6589,7 @@ function Editor({ state, setState }) {
                         {layer.type==='image' && layer.file && (
                           <img className="etl-clip-thumb" src={fileUrl(layer.file)} alt="" aria-hidden="true" />
                         )}
-                        {layer.type==='videoOverlay' && layer.file && (() => {
+                        {(layer.type==='videoOverlay' || layer.type==='maskedVideo') && layer.file && (() => {
                           const clipDur = Math.max(0.1, (layer.endTime ?? dur) - (layer.startTime || 0));
                           const srcStart = layer.srcStart || 0;
                           const n = Math.max(1, Math.min(40, Math.round(clipDur)));
