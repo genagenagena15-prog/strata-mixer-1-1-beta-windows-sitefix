@@ -1824,6 +1824,32 @@ function Editor({ state, setState }) {
   // collapsible instead (tucked at the bottom under "Текст и тайминги").
   const [subStyleOpen, setSubStyleOpen] = useState(true);
   const [subSegOpen, setSubSegOpen] = useState(false);
+  // Double-click a subtitle (timeline/preview) → open + scroll to that segment.
+  const subSegRefs = useRef({});
+  const [subHlSegId, setSubHlSegId] = useState(null);
+  function openSubSegmentAt(layerId, time) {
+    const lay = (layers || []).find(l => l.id === layerId && l.type === 'subtitles');
+    if (!lay) return;
+    const seg = (lay.segments || []).find(s => time >= (s.startTime || 0) && time <= (s.endTime ?? totalDuration))
+      || (lay.segments || [])[0];
+    setSelectedId(layerId); setSelectedIds(new Set());
+    setEdPropTab('props');
+    setSubSegOpen(true);
+    if (seg) setSubHlSegId(seg.id);
+  }
+  useEffect(() => {
+    if (!subHlSegId) return;
+    const scroll = () => { const el = subSegRefs.current[subHlSegId]; if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' }); };
+    const t1 = setTimeout(scroll, 70);                              // already-open case
+    const t2 = setTimeout(() => {                                   // after the open animation
+      scroll();
+      const el = subSegRefs.current[subHlSegId];
+      const ta = el && el.querySelector('textarea');
+      if (ta) try { ta.focus({ preventScroll: true }); } catch {}
+    }, 380);
+    const t3 = setTimeout(() => setSubHlSegId(null), 1900);         // drop the flash
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+  }, [subHlSegId]);
   // Lightweight in-app toast for soft errors / hints. Replaces native alert()
   // so notifications match the editor's look — dark card, orange accent.
   const [editorHint, setEditorHint] = useState(null);
@@ -5656,6 +5682,8 @@ function Editor({ state, setState }) {
                   return (
                     <div className="sub-box-overlay"
                       onPointerDown={makePreviewDrag(subSel.id)}
+                      onDoubleClick={() => openSubSegmentAt(subSel.id, currentTime)}
+                      title="Двойной клик → открыть эту фразу в «Текст и тайминги»"
                       style={{ position:'absolute',
                         left:`${cx - boxW/2}%`, top:`${cy - boxHpct/2}%`,
                         width:`${boxW}%`, height:`${boxHpct}%`,
@@ -6131,18 +6159,19 @@ function Editor({ state, setState }) {
 
                 {/* Text + timings — collapsible, tucked at the bottom under the
                     settings (was the always-open list; styling is shown instead). */}
-                <div className={`ed-effects-section sub-seg-acc${subSegOpen ? ' open' : ' collapsed'}`} style={{ marginTop: 12 }}>
+                <div className={`ed-effects-section sub-seg-acc${subSegOpen ? ' open' : ' collapsed'}`}>
                   <button className="ed-effects-title ed-acc-toggle" onClick={() => setSubSegOpen(o => !o)} aria-expanded={subSegOpen}>
                     <span>Текст и тайминги ({segs.length})</span>
                     <span className="ed-acc-chev" aria-hidden="true">▾</span>
                   </button>
-                  {subSegOpen && (
+                  <div className="ed-acc-body"><div className="ed-acc-inner">
                     <div className="sub-seg-list">
                       <div className="sub-seg-hint">Клик по фразе → переход к ней. Двойной клик по тексту → редактирование.</div>
                       {segs.map((s, idx) => {
                         const isActive = currentTime >= s.startTime && currentTime <= s.endTime;
                         return (
-                          <div key={s.id} className={`sub-seg-item${isActive ? ' active' : ''}`}>
+                          <div key={s.id} ref={el => { if (el) subSegRefs.current[s.id] = el; else delete subSegRefs.current[s.id]; }}
+                            className={`sub-seg-item${isActive ? ' active' : ''}${subHlSegId === s.id ? ' just-focused' : ''}`}>
                             <button className="sub-seg-time" onClick={() => jumpTo(s.startTime)} title="Перейти к этой фразе">
                               {fmt(s.startTime)}
                             </button>
@@ -6164,7 +6193,7 @@ function Editor({ state, setState }) {
                         );
                       })}
                     </div>
-                  )}
+                  </div></div>
                 </div>
               </div>
             );
@@ -6465,9 +6494,10 @@ function Editor({ state, setState }) {
                         (layer.segments||[]).map(seg => (
                           <div key={seg.id} className="etl-subseg"
                             style={{left:pct(seg.startTime),width:`calc(${pct(seg.endTime)} - ${pct(seg.startTime)})`,background:lColor(layer)+'cc',borderColor:lColor(layer)}}
-                            title={`${seg.text}\n(тяни середину — сдвиг тайминга, края — длина)`}
+                            title={`${seg.text}\n(клик — перейти, двойной клик — открыть в «Текст и тайминги», тяни середину — сдвиг, края — длина)`}
                             onPointerDown={makeSubSegDrag(layer.id, seg.id)}
-                            onClick={e=>{e.stopPropagation(); setCurrentTime(Math.max(0, Math.min(dur, (seg.startTime||0)+0.02)));}}>
+                            onClick={e=>{e.stopPropagation(); setCurrentTime(Math.max(0, Math.min(dur, (seg.startTime||0)+0.02)));}}
+                            onDoubleClick={e=>{e.stopPropagation(); openSubSegmentAt(layer.id, (seg.startTime||0)+0.02);}}>
                             <div className="etl-subseg-handle etl-subseg-s" onPointerDown={makeSubSegResize(layer.id, seg.id, true)} />
                             <span className="etl-subseg-label">{seg.text}</span>
                             <div className="etl-subseg-handle etl-subseg-e" onPointerDown={makeSubSegResize(layer.id, seg.id, false)} />
@@ -6476,7 +6506,8 @@ function Editor({ state, setState }) {
                       ) : (
                       <div className={`etl-clip${(layer.type==='image'||layer.type==='videoOverlay')?' etl-clip-img':''}`}
                         style={{left:pct(clStart),width:`calc(${pct(clEnd)} - ${pct(clStart)})`,background:lColor(layer)+(layer.hidden?'55':'bb'),borderColor:lColor(layer),cursor:'grab',opacity:layer.hidden?.5:1}}
-                        onPointerDown={makeClipBodyDrag(layer.id)}>
+                        onPointerDown={makeClipBodyDrag(layer.id)}
+                        onDoubleClick={layer.type==='subtitles' ? (e)=>{e.stopPropagation(); openSubSegmentAt(layer.id, currentTime);} : undefined}>
                         {/* 1:1 type badge pinned to the clip start — instantly tells
                             you what the layer is (video / image / audio / text…). */}
                         <span className="etl-clip-typebadge" style={{background:lColor(layer)}} title={lName(layer)}>
