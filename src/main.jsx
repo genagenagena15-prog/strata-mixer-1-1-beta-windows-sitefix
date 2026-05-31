@@ -1989,6 +1989,12 @@ function Editor({ state, setState }) {
   // the user sees where the preview is already prepared. Reset on any edit.
   // (Becomes true instant-replay ranges once the frame-cache lands — Stage 2.)
   const [buffered, setBuffered] = useState([]);
+  // ⏳ Preview-perf Phase 2: PLAY from the background proxy. When a rendered
+  // proxy file already covers the playhead, a hidden <video> takes over the
+  // picture+audio+clock so the canvas (the expensive recomposite) stops — frees
+  // the main thread → no audio dropouts, buttery playback. Flips back to the
+  // crisp full-res canvas instantly on pause/scrub/edit/buffer-gap.
+  const [proxyPlay, setProxyPlay] = useState(false);
   const videoOverlayRefs = useRef({});
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
@@ -2052,6 +2058,16 @@ function Editor({ state, setState }) {
   const proxyRunningRef = useRef(false);
   const proxyTokenRef = useRef(0);
   const proxyDoneTokenRef = useRef(-1);
+  // Phase 2 — play-from-proxy. proxyFilesRef collects each FULLY-rendered proxy
+  // segment as {appStart, appEnd, url, token} (a segment is only playable once
+  // ffmpeg finished it — faststart writes the moov atom at the end). The hidden
+  // <video> (proxyVideoRef) is slaved to the playhead; proxyPlayRef mirrors the
+  // proxyPlay state for use inside RAF/effects without re-subscribing.
+  const proxyVideoRef = useRef(null);
+  const proxyFilesRef = useRef([]);
+  const proxyPlayRef = useRef(false);
+  const proxyActiveUrlRef = useRef(null);
+  const currentTimeRef = useRef(0);
   const measureCanvasRef = useRef(null);
   const blurTmpRef = useRef(null);
   // Holds the full composite (base + overlays) captured at the first clipping
@@ -3139,6 +3155,9 @@ function Editor({ state, setState }) {
   const paintOnce = () => {
     const draw = renderFrameRef.current;
     if (!draw) return;
+    // Phase 2: while the proxy <video> is serving the picture, skip the whole
+    // canvas recomposite — that idle main thread is what keeps audio smooth.
+    if (proxyPlayRef.current) return;
     const canvas = previewCanvasRef.current;
     if (canvas) draw(canvas.getContext('2d'));
     const fs = fsCanvasRef.current;   // fullscreen mirror, when open
@@ -3190,6 +3209,8 @@ function Editor({ state, setState }) {
   useEffect(() => {
     proxyTokenRef.current++;
     proxyDoneTokenRef.current = -1;
+    proxyFilesRef.current = [];        // rendered proxies are now stale
+    deactivateProxy();                 // drop back to the live canvas at once
     setBuffered([]);
     window.strata?.cancelPreview?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3200,6 +3221,76 @@ function Editor({ state, setState }) {
     if (playing) buildPreviewProxy();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing]);
+
+  // ── Phase 2 — PLAY FROM THE PROXY ────────────────────────────────────────
+  // Once a proxy segment has fully rendered, a hidden <video> serves the picture
+  // so the canvas recomposite STOPS (frees the main thread → smooth audio + no
+  // stutter). The proxy is a SLAVE: it's muted and follows the existing playhead
+  // (live <audio> stays the sound, the wall-clock / main-video stays the clock),
+  // so there's no audio cut-over glitch and no clock conflict. Flips back to the
+  // crisp full-res canvas the instant we pause / scrub / edit / hit a gap.
+  useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
+
+  function findReadyProxyFile(appT) {
+    const eps = 0.05, lead = 0.12;   // need a little runway before a file's end
+    let best = null;
+    for (const f of proxyFilesRef.current) {
+      if (f.token !== proxyTokenRef.current) continue;       // stale (edited)
+      if (appT >= f.appStart - eps && appT < f.appEnd - lead) {
+        if (!best || f.appEnd > best.appEnd) best = f;        // longest runway
+      }
+    }
+    return best;
+  }
+  function deactivateProxy() {
+    const pv = proxyVideoRef.current;
+    if (pv) { try { pv.pause(); } catch {} }
+    proxyActiveUrlRef.current = null;
+    if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
+  }
+  function loadProxy(want, seekT) {
+    const pv = proxyVideoRef.current; if (!pv) return;
+    proxyActiveUrlRef.current = want.url;          // claim now so we don't re-enter
+    const target = Math.max(0, seekT);
+    // Cut over only once the right frame is actually presented → no black flash.
+    const cutOver = () => { try { pv.play().catch(() => {}); } catch {} proxyPlayRef.current = true; setProxyPlay(true); };
+    const onLoaded = () => {
+      pv.removeEventListener('loadeddata', onLoaded);
+      if (proxyActiveUrlRef.current !== want.url) return;     // superseded mid-load
+      if (Math.abs(pv.currentTime - target) < 0.04) { cutOver(); return; }
+      const onSeeked = () => { pv.removeEventListener('seeked', onSeeked); cutOver(); };
+      pv.addEventListener('seeked', onSeeked, { once: true });
+      try { pv.currentTime = target; } catch { cutOver(); }
+    };
+    pv.muted = true;                               // audio stays on the live mirrors
+    pv.addEventListener('loadeddata', onLoaded, { once: true });
+    pv.src = fileUrl(want.url);
+    try { pv.load(); } catch {}
+  }
+  function proxyStep() {
+    const pv = proxyVideoRef.current; if (!pv) return;
+    const appT = currentTimeRef.current;
+    const want = findReadyProxyFile(appT);
+    if (!want) { if (proxyPlayRef.current) deactivateProxy(); return; }
+    if (proxyActiveUrlRef.current !== want.url) { loadProxy(want, appT - want.appStart); return; }
+    if (!proxyPlayRef.current) return;             // still loading / cutting over
+    if (pv.paused) { try { pv.play().catch(() => {}); } catch {} }
+    // Keep the muted proxy picture aligned to the live playhead. Both run at
+    // real time so they stay close; only a real drift forces a tiny reseek.
+    const tgt = appT - want.appStart;
+    if (Math.abs(pv.currentTime - tgt) > 0.18) { try { pv.currentTime = Math.max(0, tgt); } catch {} }
+  }
+  // Controller runs only while playing (and not fullscreen — that view keeps the
+  // canvas for now). Re-checks every frame, so it auto-cuts over the moment the
+  // segment covering the playhead finishes rendering (AE-style).
+  useEffect(() => {
+    if (!playing || previewFullscreen) { deactivateProxy(); return; }
+    let raf = 0;
+    const loop = () => { proxyStep(); raf = requestAnimationFrame(loop); };
+    raf = requestAnimationFrame(loop);
+    return () => { cancelAnimationFrame(raf); deactivateProxy(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing, previewFullscreen]);
   // Faint-orange "already rendered" segments drawn behind the bright progress
   // fill on the scrubber (shared by the normal + fullscreen playback bars).
   const renderBuffered = () => buffered.map((iv, i) => (
@@ -4100,9 +4191,17 @@ function Editor({ state, setState }) {
         const payload = buildEditPayload({ outWidth: pw, outHeight: ph, outPath, format: 'mp4', quality: 'fast', custom: {}, preview: true });
         if (!payload) break;
         payload.previewRange = { start: seg.start, end: seg.end };
-        await window.strata?.editVideo?.(payload);
+        const res = await window.strata?.editVideo?.(payload);
+        if (proxyTokenRef.current !== token) break;          // edited mid-render
+        if (res && res.ok === false) break;                  // failed → not playable
         done.push({ s: seg.start, e: seg.end });
-        if (proxyTokenRef.current === token) setBuffered([...done]);
+        // This segment is now a COMPLETE, playable mp4 (ffmpeg wrote the moov
+        // atom on close) → register it so play-from-proxy can take over.
+        proxyFilesRef.current = [
+          ...proxyFilesRef.current.filter(f => f.url !== outPath),
+          { appStart: seg.start, appEnd: seg.end, url: outPath, token },
+        ];
+        setBuffered([...done]);
       }
     } catch {}
     off?.();
@@ -5289,6 +5388,11 @@ function Editor({ state, setState }) {
                 <div className="ed-preview-clip" style={{ position:'absolute', inset:0, overflow:'hidden', background:'#000', borderRadius:'10px' }}>
                   <canvas ref={previewCanvasRef}
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', display:'block', pointerEvents:'none' }} />
+                  {/* Phase 2 play-from-proxy: muted picture source that overlays
+                      the canvas while a rendered proxy segment covers the playhead
+                      (mp4 AR == project AR → objectFit:fill matches the canvas). */}
+                  <video ref={proxyVideoRef} muted playsInline preload="auto"
+                    style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: proxyPlay ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
                   {/* Subtle frame — the project rect is defined by contrast between
                       the black canvas and the gray preview surround; only a thin
                       hairline on top to make the edge crisp. */}
