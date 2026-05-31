@@ -978,11 +978,19 @@ function markCleanExit() {
     fs.writeFileSync(f, JSON.stringify(d));
   } catch {}
 }
-ipcMain.handle('editor:autosave', (_e, state) => {
-  try { fs.writeFileSync(autosaveFile(), JSON.stringify({ clean: false, ts: Date.now(), state })); } catch {}
+ipcMain.handle('editor:autosave', async (_e, state) => {
+  // Async write — never blocks the main process. The state is a LIGHT snapshot
+  // (layer file PATHS + settings, no embedded media), so it's only a few KB.
+  try { await fs.promises.writeFile(autosaveFile(), JSON.stringify({ clean: false, ts: Date.now(), state })); } catch {}
   return true;
 });
 ipcMain.handle('editor:getRecovery', () => pendingRecovery || null);
+// Which of these file paths are missing from disk (for "file not found" marks).
+ipcMain.handle('files:exist', async (_e, paths) => {
+  const out = {};
+  for (const p of (paths || [])) { try { out[p] = !!p && fs.existsSync(p); } catch { out[p] = false; } }
+  return out;
+});
 ipcMain.handle('editor:resolveRecovery', (_e, accepted) => {
   pendingRecovery = null;
   if (!accepted) markCleanExit();   // dismissed → don't offer it again next launch

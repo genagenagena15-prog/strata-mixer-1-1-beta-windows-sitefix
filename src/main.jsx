@@ -38,7 +38,7 @@ const A = {
 const LAYER_ICONS = {
   videoOverlay: new URL('../assets/layer-icons/video.png', import.meta.url).href,
   mainVideo:    new URL('../assets/layer-icons/video.png', import.meta.url).href,
-  maskedVideo:  new URL('../assets/layer-icons/video.png', import.meta.url).href,
+  maskedVideo:  new URL('../assets/layer-icons/mask.png', import.meta.url).href,
   image:        new URL('../assets/layer-icons/image.png', import.meta.url).href,
   audio:        new URL('../assets/layer-icons/audio.png', import.meta.url).href,
   text:         new URL('../assets/layer-icons/text.png', import.meta.url).href,
@@ -517,7 +517,18 @@ function App() {
               Открыть последний проект, над которым ты работал?
             </p>
             <div className="modal-actions">
-              <button className="btn primary" onClick={() => { setEditorState(recovery); setActive('editor'); setRecovery(null); window.strata?.resolveRecovery?.(true); }}>
+              <button className="btn primary" onClick={async () => {
+                let st = recovery;
+                try {
+                  const files = [...new Set((st.layers || []).map(l => l.file).filter(Boolean))];
+                  if (files.length) {
+                    const ex = await window.strata?.filesExist?.(files) || {};
+                    // Mark layers whose source file vanished — the rest still opens.
+                    st = { ...st, layers: (st.layers || []).map(l => (l.file && ex[l.file] === false) ? { ...l, _missing: true } : l) };
+                  }
+                } catch {}
+                setEditorState(st); setActive('editor'); setRecovery(null); window.strata?.resolveRecovery?.(true);
+              }}>
                 Открыть последний проект
               </button>
               <button className="btn" onClick={() => { setRecovery(null); window.strata?.resolveRecovery?.(false); }}>
@@ -4545,7 +4556,7 @@ function Editor({ state, setState }) {
     if (l.type === 'blur') return 'Блюр';
     if (l.type === 'zoom') return 'Зум';
     if (l.type === 'mask') return 'Маска';
-    if (l.type === 'maskedVideo') return 'Вырезка' + rev;
+    if (l.type === 'maskedVideo') return 'Маска' + rev;
     if (l.type === 'transition') {
       const kLbl = { shake: 'Удар', whippan: 'Whip pan', zoom: 'Zoom', blur: 'Blur' }[l.kind || 'shake'] || 'Переход';
       const s = typeof l.strength === 'number'
@@ -5977,7 +5988,7 @@ function Editor({ state, setState }) {
             return (
               <div className="ed-prop-block ed-prop-sel">
                 <div className="ed-prop-head">
-                  <span>{sel.type === 'mask' ? '◐ Маска' : `◐ Вырезка · ${compactName(fileName(sel.file||''), 12)}`}</span>
+                  <span>{sel.type === 'mask' ? '◐ Маска' : `◐ Маска · ${compactName(fileName(sel.file||''), 12)}`}</span>
                   {sel.type === 'mask' && (
                     <button className="ed-mask-apply" onClick={() => applyMask(sel.id)} title="Применить — превратит видео под маской в подвижную вырезку выбранной формы">
                       Применить
@@ -6683,6 +6694,7 @@ function Editor({ state, setState }) {
                           data-onb={(selectedId === layer.id && layer.type === 'videoOverlay') ? 'clipstart' : undefined}
                           onPointerDown={makeClipHandleDrag(layer.id,true)} />
                         <span className="etl-clip-inner-label">{lName(layer)}</span>
+                        {layer._missing && <span className="etl-clip-missing" title="Исходный файл не найден на диске — переместился или удалён">⚠ нет файла</span>}
                         {layer.type==='videoOverlay' && (layer.reversed || (layer.speed!=null&&layer.speed!==100) || (layer.ccB||0)!==0 || (layer.ccC!=null&&layer.ccC!==100) || (layer.ccS!=null&&layer.ccS!==100) || (layer.ccH||0)!==0) && (
                           <span className="etl-clip-fx" title="Применены эффекты">fx</span>
                         )}

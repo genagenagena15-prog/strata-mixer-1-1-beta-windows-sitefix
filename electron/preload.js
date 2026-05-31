@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('strata', {
   autosaveEditor: (state) => ipcRenderer.invoke('editor:autosave', state),
   getRecovery: () => ipcRenderer.invoke('editor:getRecovery'),
   resolveRecovery: (accepted) => ipcRenderer.invoke('editor:resolveRecovery', !!accepted),
+  filesExist: (paths) => ipcRenderer.invoke('files:exist', paths),
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
   previewProxyPath: (n) => ipcRenderer.invoke('editor:previewProxyPath', n),
   cancelPreview: () => ipcRenderer.invoke('editor:cancelPreview'),

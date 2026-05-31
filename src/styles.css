@@ -861,6 +861,7 @@
 .etl-thumbstrip-masked.shape-circle .etl-thumb-mcell{border-radius:50%}
 .etl-thumbstrip-masked.shape-rounded .etl-thumb-mcell{border-radius:26%}
 .etl-thumbstrip-masked.shape-square .etl-thumb-mcell{border-radius:2px}
+.etl-clip-missing{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:4;background:rgba(205,44,44,.94);color:#fff;font-size:10px;font-weight:800;padding:2px 7px;border-radius:6px;white-space:nowrap;pointer-events:none;box-shadow:0 2px 6px rgba(0,0,0,.45)}
 .etl-clip-img .etl-clip-inner-label{left:72px}
 .etl-clip-fx{position:absolute;right:20px;top:3px;display:flex;align-items:center;justify-content:center;height:14px;padding:0 5px;border-radius:4px;font-size:9px;font-weight:900;letter-spacing:.3px;text-transform:uppercase;color:#1a1206;background:linear-gradient(135deg,#ffd24f,#ffa927);box-shadow:0 1px 4px rgba(0,0,0,.5);z-index:3;pointer-events:none;}
 .etl-act-color{flex:0 0 auto;width:22px;height:22px;border-radius:6px;border:1px solid rgba(255,255,255,.3);cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4);padding:0}
