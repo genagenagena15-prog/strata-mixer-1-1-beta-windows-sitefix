@@ -856,6 +856,11 @@
 .etl-thumbstrip-masked.shape-circle .etl-thumb-cell{border-radius:50%}
 .etl-thumbstrip-masked.shape-rounded .etl-thumb-cell{border-radius:26%}
 .etl-thumbstrip-masked.shape-square .etl-thumb-cell{border-radius:2px}
+/* Cropped cell: shows the exact srcCrop fragment inside the cut-out shape. */
+.etl-thumbstrip-masked .etl-thumb-mcell{position:relative;flex:0 0 auto;width:auto;height:100%;aspect-ratio:1;overflow:hidden;background:#000;display:block}
+.etl-thumbstrip-masked.shape-circle .etl-thumb-mcell{border-radius:50%}
+.etl-thumbstrip-masked.shape-rounded .etl-thumb-mcell{border-radius:26%}
+.etl-thumbstrip-masked.shape-square .etl-thumb-mcell{border-radius:2px}
 .etl-clip-img .etl-clip-inner-label{left:72px}
 .etl-clip-fx{position:absolute;right:20px;top:3px;display:flex;align-items:center;justify-content:center;height:14px;padding:0 5px;border-radius:4px;font-size:9px;font-weight:900;letter-spacing:.3px;text-transform:uppercase;color:#1a1206;background:linear-gradient(135deg,#ffd24f,#ffa927);box-shadow:0 1px 4px rgba(0,0,0,.5);z-index:3;pointer-events:none;}
 .etl-act-color{flex:0 0 auto;width:22px;height:22px;border-radius:6px;border:1px solid rgba(255,255,255,.3);cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4);padding:0}

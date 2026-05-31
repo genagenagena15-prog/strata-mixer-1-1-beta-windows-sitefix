@@ -3175,7 +3175,7 @@ function Editor({ state, setState }) {
         try { url = canvas.toDataURL('image/jpeg', 0.55); } catch {}
         thumbs.push({ t, url });
       }
-      thumbsCacheRef.current.set(file, { dur, thumbs, loading: false });
+      thumbsCacheRef.current.set(file, { dur, thumbs, loading: false, vw: video.videoWidth || 0, vh: video.videoHeight || 0 });
       setThumbsRev(r => r + 1);
     } catch {
       thumbsCacheRef.current.delete(file);
@@ -6606,17 +6606,28 @@ function Editor({ state, setState }) {
                           // FAST PATH: cached thumbnails (low-res JPEG <img>).
                           // No video decoders, no seek latency, instant on split.
                           if (cache && cache.thumbs && cache.thumbs.length && !cache.loading) {
+                            // Вырезка: crop each frame to the cut-out region (srcCrop,
+                            // in source px) so the thumbnail shows the EXACT fragment
+                            // that's inside the shape on the preview, not the centre.
+                            const c = layer.type === 'maskedVideo' ? layer.srcCrop : null;
+                            const crop = (c && cache.vw > 0 && cache.vh > 0 && (c.w || 0) > 0 && (c.h || 0) > 0)
+                              ? { fx: c.x / cache.vw, fy: c.y / cache.vh, fw: Math.max(0.02, c.w / cache.vw), fh: Math.max(0.02, c.h / cache.vh) }
+                              : null;
                             return <div className={stripCls} aria-hidden="true">
                               {Array.from({ length: n }, (_, i) => {
                                 const t = srcStart + (i / Math.max(1, n - 1)) * clipDur;
-                                // Pick the closest pre-generated thumb.
                                 let bestIdx = 0, bestDist = Infinity;
                                 for (let j = 0; j < cache.thumbs.length; j++) {
                                   const d = Math.abs(cache.thumbs[j].t - t);
                                   if (d < bestDist) { bestDist = d; bestIdx = j; }
                                 }
-                                return <img key={i} className="etl-thumb-cell"
-                                  src={cache.thumbs[bestIdx].url} alt="" />;
+                                const url = cache.thumbs[bestIdx].url;
+                                if (crop) {
+                                  return <span key={i} className="etl-thumb-mcell">
+                                    <img src={url} alt="" style={{ position:'absolute', maxWidth:'none', width:`${100 / crop.fw}%`, height:`${100 / crop.fh}%`, left:`${-crop.fx / crop.fw * 100}%`, top:`${-crop.fy / crop.fh * 100}%` }} />
+                                  </span>;
+                                }
+                                return <img key={i} className="etl-thumb-cell" src={url} alt="" />;
                               })}
                             </div>;
                           }
