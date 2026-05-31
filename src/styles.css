@@ -955,6 +955,8 @@
 .sub-style-acc .ed-acc-toggle{height:40px}
 .sub-seg-acc{margin-top:12px}
 .sub-seg-acc .ed-acc-toggle{height:40px}
+.sub-style-head{margin:16px 0 8px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#aeb4c6}
+[data-theme="light"] .sub-style-head{border-top-color:rgba(20,24,40,.1);color:#6b7180}
 .sub-wpg-btns{display:flex;gap:3px;flex:1;min-width:0}
 .sub-wpg-btn{flex:1;min-width:0;width:auto;height:26px;border-radius:6px;border:1px solid rgba(140,140,146,.25);background:#161618;color:#95959b;font-size:12px;font-weight:700;cursor:pointer;transition:all .12s;padding:0}
 .sub-wpg-btn:hover{border-color:#ff8a00;color:#ff8a00}

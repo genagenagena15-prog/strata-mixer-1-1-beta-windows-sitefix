@@ -6086,14 +6086,8 @@ function Editor({ state, setState }) {
                 </div>
                 <Slider label="Размер шрифта" value={st.fontSize ?? 56} min="16" max="200" onChange={v => updStyle('fontSize', v)} />
 
-                {/* Collapsible style block — animation, colours, outline, spacing
-                    tucked away so the panel isn't a wall of controls. Collapsed by default. */}
-                <div className={`ed-effects-section sub-style-acc${subStyleOpen ? ' open' : ' collapsed'}`}>
-                  <button className="ed-effects-title ed-acc-toggle" onClick={() => setSubStyleOpen(o => !o)} aria-expanded={subStyleOpen}>
-                    <span>Оформление</span>
-                    <span className="ed-acc-chev" aria-hidden="true">▾</span>
-                  </button>
-                  <div className="ed-acc-body"><div className="ed-acc-inner">
+                {/* Оформление — always visible (no longer an accordion). */}
+                <div className="sub-style-head">Оформление</div>
                     <div className="ed-prop-row">
                       <span className="ed-prop-label">Анимация</span>
                       <select className="ed-font-sel" value={st.anim || 'pop'} onChange={e => updStyle('anim', e.target.value)}>
@@ -6136,8 +6130,6 @@ function Editor({ state, setState }) {
                       <span className="ed-prop-label">Подсветка слова</span>
                       <input type="color" className="ed-color-inp" value={st.highlightColor || '#ff9a1f'} onChange={e => updStyle('highlightColor', e.target.value)} />
                     </div>
-                  </div></div>
-                </div>
 
                 <div className="ed-prop-row" style={{ marginTop: 10 }}>
                   <span className="ed-prop-label">Язык речи</span>
