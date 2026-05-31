@@ -1998,6 +1998,9 @@ function Editor({ state, setState }) {
   // the main thread → no audio dropouts, buttery playback. Flips back to the
   // crisp full-res canvas instantly on pause/scrub/edit/buffer-gap.
   const [proxyPlay, setProxyPlay] = useState(false);
+  // Diagnostic: what the preview is actually showing (canvas / proxy q0 / q1).
+  const [proxyDbg, setProxyDbg] = useState('');
+  const proxyDbgRef = useRef('');
   const videoOverlayRefs = useRef({});
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
@@ -3247,6 +3250,7 @@ function Editor({ state, setState }) {
   // browser-fullscreen element only shows its own descendants. Only the one for
   // the current view is ever driven; the other stays paused/hidden.
   const activeProxyVideo = () => (previewFullscreenRef.current ? proxyVideoFsRef.current : proxyVideoRef.current);
+  const setDbg = (s) => { if (proxyDbgRef.current !== s) { proxyDbgRef.current = s; setProxyDbg(s); } };
 
   function findReadyProxyFile(appT) {
     const eps = 0.05, lead = 0.12;   // need a little runway before a file's end
@@ -3313,9 +3317,10 @@ function Editor({ state, setState }) {
     const pv = activeProxyVideo(); if (!pv) return;
     const appT = currentTimeRef.current;
     const want = findReadyProxyFile(appT);
-    if (!want) { if (proxyPlayRef.current) deactivateProxy(); return; }
-    if (proxyActiveUrlRef.current !== want.url) { loadProxy(want, appT - want.appStart); return; }
-    if (!proxyPlayRef.current) return;             // still loading / cutting over
+    if (!want) { setDbg('canvas (no buffer here)'); if (proxyPlayRef.current) deactivateProxy(); return; }
+    if (proxyActiveUrlRef.current !== want.url) { setDbg('loading q' + (want.q || 0) + '…'); loadProxy(want, appT - want.appStart); return; }
+    if (!proxyPlayRef.current) { setDbg('loading q' + (want.q || 0) + '…'); return; }   // still loading / cutting over
+    setDbg('PROXY q' + (want.q || 0) + (want.q >= 1 ? ' (HD)' : ' (low)'));
     if (pv.paused) { try { pv.play().catch(() => {}); } catch {} }
     // Keep the muted proxy picture aligned to the live playhead. Both run at
     // real time so they stay close; only a real drift forces a tiny reseek.
@@ -4227,12 +4232,16 @@ function Editor({ state, setState }) {
     // drive the matching scrubber bar (low=orange faint, HD=brighter) with live
     // ffmpeg %; `slot` keeps temp paths unique.
     const renderPass = async (ow, oh, q, slot, setBar, doneAcc) => {
-      const off = window.strata?.onPreviewProgress?.((d) => {
+      // Live % only for the LOW pass (q=0) — it renders fast, so "bar≈ready" is
+      // close enough (the YouTube buffering feel). The HD pass updates its bar
+      // ONLY when a segment fully completes (= actually playable), so a bright
+      // HD bar always means "HD plays here", never "HD still rendering".
+      const off = (q === 0) ? window.strata?.onPreviewProgress?.((d) => {
         if (proxyTokenRef.current !== token) return;
         const seg = segs[Math.min(doneAcc.length, segs.length - 1)];
         const pct = d.done ? 100 : (d.percent || 0);
         setBar([...doneAcc, { s: seg.start, e: seg.start + (pct / 100) * (seg.end - seg.start) }]);
-      });
+      }) : null;
       let ok = true;
       try {
         for (let i = 0; i < segs.length; i++) {
@@ -5464,6 +5473,8 @@ function Editor({ state, setState }) {
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
                   <video ref={proxyVideoRef} muted playsInline preload="auto"
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: (proxyPlay && !previewFullscreen) ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
+                  {/* Diagnostic badge — what the preview is showing right now. */}
+                  <div style={{ position:'absolute', top:4, left:4, zIndex:6, font:'11px monospace', fontWeight:700, color: proxyDbg.startsWith('PROXY q1') ? '#7CFC6A' : proxyDbg.startsWith('PROXY q0') ? '#ffd24a' : '#9fd0ff', background:'rgba(0,0,0,.66)', padding:'2px 6px', borderRadius:4, pointerEvents:'none', letterSpacing:'.3px' }}>{proxyDbg || 'canvas'}</div>
                   {/* Subtle frame — the project rect is defined by contrast between
                       the black canvas and the gray preview surround; only a thin
                       hairline on top to make the edge crisp. */}
