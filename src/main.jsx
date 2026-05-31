@@ -1989,6 +1989,9 @@ function Editor({ state, setState }) {
   // the user sees where the preview is already prepared. Reset on any edit.
   // (Becomes true instant-replay ranges once the frame-cache lands — Stage 2.)
   const [buffered, setBuffered] = useState([]);
+  // HD-ready ranges (the 2nd, high-res proxy pass). Drawn brighter over the
+  // faint low-res `buffered` so the user can SEE the quality upgrade land.
+  const [bufferedHd, setBufferedHd] = useState([]);
   // ⏳ Preview-perf Phase 2: PLAY from the background proxy. When a rendered
   // proxy file already covers the playhead, a hidden <video> takes over the
   // picture+audio+clock so the canvas (the expensive recomposite) stops — frees
@@ -3220,6 +3223,7 @@ function Editor({ state, setState }) {
     proxyFilesRef.current = [];        // rendered proxies are now stale
     deactivateProxy();                 // drop back to the live canvas at once
     setBuffered([]);
+    setBufferedHd([]);
     window.strata?.cancelPreview?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layers, totalDuration, outWidth, outHeight, bgColor]);
@@ -3271,6 +3275,7 @@ function Editor({ state, setState }) {
     // canvas (PREVIEW_SCALE) is itself sharper than the low proxy, so the
     // transition reads as low→sharper→crisp. Initial activation skips this.
     if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
+    console.log('[proxy] play q=' + (want.q || 0) + ' ' + String(want.url).split(/[\\/]/).pop());
     proxyActiveUrlRef.current = want.url;          // claim now so we don't re-enter
     const target = Math.max(0, seekT);
     // Cut over only once the right frame is actually presented → no black flash.
@@ -3314,10 +3319,17 @@ function Editor({ state, setState }) {
   }, [playing, previewFullscreen]);
   // Faint-orange "already rendered" segments drawn behind the bright progress
   // fill on the scrubber (shared by the normal + fullscreen playback bars).
-  const renderBuffered = () => buffered.map((iv, i) => (
-    <div key={i} className="ed-scrub-buffered"
-      style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
-  ));
+  const renderBuffered = () => [
+    ...buffered.map((iv, i) => (
+      <div key={'lo' + i} className="ed-scrub-buffered"
+        style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
+    )),
+    // HD (high-res pass) ranges drawn brighter on top of the faint low-res ones.
+    ...bufferedHd.map((iv, i) => (
+      <div key={'hd' + i} className="ed-scrub-buffered ed-scrub-buffered-hd"
+        style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
+    )),
+  ];
 
   // Drive real OS fullscreen from the previewFullscreen state. Entering asks
   // the overlay element to go fullscreen; exiting (button or browser ESC) drops
@@ -4195,15 +4207,15 @@ function Editor({ state, setState }) {
 
     // Render every segment at (ow×oh), tagging each finished mp4 with quality
     // rank `q` — the player always prefers the highest q available, so when the
-    // hi-res pass lands it transparently upgrades the picture. `onBar` (lo pass
-    // only) streams ffmpeg % to the buffered bar; `slot` keeps temp paths unique.
-    const renderPass = async (ow, oh, q, slot, onBar) => {
-      let off = null;
-      if (onBar) off = window.strata?.onPreviewProgress?.((d) => {
+    // hi-res pass lands it transparently upgrades the picture. `setBar`/`doneAcc`
+    // drive the matching scrubber bar (low=orange faint, HD=brighter) with live
+    // ffmpeg %; `slot` keeps temp paths unique.
+    const renderPass = async (ow, oh, q, slot, setBar, doneAcc) => {
+      const off = window.strata?.onPreviewProgress?.((d) => {
         if (proxyTokenRef.current !== token) return;
-        const seg = segs[Math.min(onBar.done.length, segs.length - 1)];
+        const seg = segs[Math.min(doneAcc.length, segs.length - 1)];
         const pct = d.done ? 100 : (d.percent || 0);
-        setBuffered([...onBar.done, { s: seg.start, e: seg.start + (pct / 100) * (seg.end - seg.start) }]);
+        setBar([...doneAcc, { s: seg.start, e: seg.start + (pct / 100) * (seg.end - seg.start) }]);
       });
       let ok = true;
       try {
@@ -4221,15 +4233,16 @@ function Editor({ state, setState }) {
           payload.previewRange = { start: seg.start, end: seg.end };
           const res = await window.strata?.editVideo?.(payload);
           if (proxyTokenRef.current !== token) { ok = false; break; }
-          if (res && res.ok === false) { ok = false; break; }
+          if (res && res.ok === false) { console.warn('[proxy] seg FAILED q=' + q + ' i=' + i + ' ' + ow + 'x' + oh, (res.error || '').slice(0, 240)); ok = false; break; }
           // Complete, playable mp4 (faststart moov written on close) → register.
           proxyFilesRef.current = [
             ...proxyFilesRef.current.filter(f => f.url !== outPath),
             { appStart: seg.start, appEnd: seg.end, url: outPath, q, token },
           ];
-          if (onBar) { onBar.done.push({ s: seg.start, e: seg.end }); setBuffered([...onBar.done]); }
+          doneAcc.push({ s: seg.start, e: seg.end }); setBar([...doneAcc]);
+          console.log('[proxy] seg done q=' + q + ' i=' + i + ' ' + ow + 'x' + oh + ' [' + seg.start.toFixed(1) + '..' + seg.end.toFixed(1) + ']');
         }
-      } catch { ok = false; }
+      } catch (e) { console.warn('[proxy] pass threw q=' + q, e); ok = false; }
       off?.();
       return ok;
     };
@@ -4237,7 +4250,9 @@ function Editor({ state, setState }) {
     // PASS 1 — LOW res (≈480 long side): smooth playback ASAP + fills the bar.
     const loSc = Math.min(1, 480 / longSide);
     const loW = even(outWidth * loSc), loH = even(outHeight * loSc);
-    const ok1 = await renderPass(loW, loH, 0, 0, { done: [] });
+    console.log('[proxy] pass1 (low) start ' + loW + 'x' + loH + ' segs=' + segs.length);
+    const ok1 = await renderPass(loW, loH, 0, 0, setBuffered, []);
+    console.log('[proxy] pass1 (low) ok=' + ok1);
 
     // PASS 2 — HIGH res (≈min(longSide,1080)): crisp upgrade, swapped in by the
     // player the moment each hi segment finishes. Skipped if it would not
@@ -4245,7 +4260,10 @@ function Editor({ state, setState }) {
     if (ok1 && proxyTokenRef.current === token) {
       const hiSc = Math.min(1, 1080 / longSide);
       const hiW = even(outWidth * hiSc), hiH = even(outHeight * hiSc);
-      if (hiW > loW) await renderPass(hiW, hiH, 1, 5, null);
+      console.log('[proxy] pass2 (high) ' + hiW + 'x' + hiH + ' run=' + (hiW > loW));
+      if (hiW > loW) { const ok2 = await renderPass(hiW, hiH, 1, 5, setBufferedHd, []); console.log('[proxy] pass2 (high) ok=' + ok2); }
+    } else {
+      console.log('[proxy] pass2 skipped (ok1=' + ok1 + ', tokenSame=' + (proxyTokenRef.current === token) + ')');
     }
 
     proxyRunningRef.current = false;
