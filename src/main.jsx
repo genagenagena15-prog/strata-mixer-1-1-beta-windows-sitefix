@@ -4250,9 +4250,17 @@ function Editor({ state, setState }) {
     // Buffer AHEAD of the playhead first (the part about to be watched), then
     // fill the start — exactly like YouTube.
     const T = Math.max(0, Math.min(dur, currentTime));
-    const segs = (T > 0.2 && T < dur - 0.2)
-      ? [{ start: T, end: dur }, { start: 0, end: T }]
-      : [{ start: 0, end: dur }];
+    // Chunk the timeline so HD becomes playable PROGRESSIVELY — each chunk is a
+    // standalone mp4 registered the moment it finishes, so the player can switch
+    // to HD on a ready chunk without waiting for the whole render. Ordered
+    // playhead-first: the chunk under the playhead (and forward) renders first,
+    // then it wraps to the start — so what you're watching gets HD soonest.
+    const CHUNK = 8;
+    const chunks = [];
+    for (let s = 0; s < dur - 0.05; s += CHUNK) chunks.push({ start: s, end: Math.min(dur, s + CHUNK) });
+    if (!chunks.length) chunks.push({ start: 0, end: dur });
+    const startIdx = Math.max(0, chunks.findIndex(c => T < c.end - 1e-6));
+    const segs = startIdx <= 0 ? chunks : [...chunks.slice(startIdx), ...chunks.slice(0, startIdx)];
     proxyRunningRef.current = true;
 
     // Render every segment at (ow×oh), tagging each finished mp4 with quality
@@ -4279,7 +4287,7 @@ function Editor({ state, setState }) {
           if (proxyTokenRef.current !== token) { ok = false; break; }
           const seg = segs[i];
           let outPath;
-          try { outPath = await window.strata?.previewProxyPath?.(token * 10 + slot + i); } catch { ok = false; break; }
+          try { outPath = await window.strata?.previewProxyPath?.(token * 1000 + slot * 100 + i); } catch { ok = false; break; }
           if (!outPath) { ok = false; break; }
           // LOW pass: 'fast' (veryfast/crf27) — speed, it's the temporary smooth
           // fallback. HD pass: near-visually-lossless crf16 at the FAST 'veryfast'
