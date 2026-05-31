@@ -5498,6 +5498,9 @@ function Editor({ state, setState }) {
           <div className="ed-preview-wrap" data-onb="preview"
             onPointerDown={startPreviewPan}
             style={{ flex: '0 0 auto', height: previewH, position:'relative', cursor: 'grab' }}>
+            {/* Current preview quality — in the top-left CORNER of the preview
+                area (off the video), subtle transparent-black chip. */}
+            <div style={{ position:'absolute', top:8, left:8, zIndex:7, font:'600 11px system-ui,sans-serif', color: proxyDbg === 'Low' ? '#f0b86a' : '#7fdca0', background:'rgba(0,0,0,.42)', padding:'2px 7px', borderRadius:5, pointerEvents:'none', letterSpacing:'.4px' }}>{proxyDbg || 'HD'}</div>
             <div ref={canvasRef} style={{ position:'relative', height:'100%', width:'auto', maxWidth:'100%', aspectRatio:`${outWidth}/${outHeight}`, transform:`translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`, transformOrigin:'center center', transition:'transform .08s linear' }}>
                 {/* Clip layer: only the rendered canvas + orange frame get clipped
                     to the project rect. The interactive bounding boxes/handles
@@ -5512,9 +5515,6 @@ function Editor({ state, setState }) {
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
                   <video ref={proxyVideoRef} muted playsInline preload="auto"
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: (proxyPlay && !previewFullscreen) ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
-                  {/* Current preview quality (HD = full res / proxy; Low = the
-                      half-res canvas while a heavy project plays un-buffered). */}
-                  <div style={{ position:'absolute', top:6, left:6, zIndex:6, font:'700 11px system-ui,sans-serif', color:'#fff', background: proxyDbg === 'Low' ? 'rgba(190,120,30,.92)' : 'rgba(34,170,90,.92)', padding:'2px 8px', borderRadius:5, pointerEvents:'none', letterSpacing:'.5px', boxShadow:'0 1px 4px rgba(0,0,0,.4)' }}>{proxyDbg || 'HD'}</div>
                   {/* Subtle frame — the project rect is defined by contrast between
                       the black canvas and the gray preview surround; only a thin
                       hairline on top to make the edge crisp. */}
