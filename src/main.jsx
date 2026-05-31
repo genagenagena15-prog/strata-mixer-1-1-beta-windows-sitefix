@@ -2060,6 +2060,10 @@ function Editor({ state, setState }) {
   const loopRunningRef = useRef(false);
   const playingRef = useRef(false);
   const drawScaleRef = useRef(1);   // current preview backing scale (1 = full / paused)
+  // Adaptive playback quality: play full-res; only drop to low if the canvas
+  // can't sustain it (heavy project → slow frames → stutter/audio-drop risk).
+  const paintMsRef = useRef(0);     // EMA of a full-res canvas paint (ms)
+  const lowResRef = useRef(false);  // dropped to low-res for THIS playback?
   // Background preview-proxy (YouTube-style buffer): a low-res render of the
   // whole timeline via the export pipeline. exportingRef pauses it during a real
   // export; token bumps on every edit to invalidate a stale render.
@@ -3185,8 +3189,11 @@ function Editor({ state, setState }) {
     loopRunningRef.current = true;
     let last = 0;
     const tick = (ts) => {
-      // Low-res while playing (smooth), full-res otherwise (crisp scrub/pause).
-      drawScaleRef.current = playingRef.current ? PREVIEW_SCALE : 1;
+      // ADAPTIVE quality: play at FULL res and only drop to low if the canvas
+      // can't keep up (heavy project → slow frames → stutter/audio-drop risk).
+      // Light projects stay crisp the whole time — no needless HD→low→HD dip.
+      // Always full-res when paused/scrubbing, and never while the proxy paints.
+      drawScaleRef.current = (playingRef.current && lowResRef.current) ? PREVIEW_SCALE : 1;
       // Keep going while playing OR within the post-change burst window.
       if (!playingRef.current && nowMs() > renderUntilRef.current) {
         paintOnce();                  // one last settle paint (full res), then stop
@@ -3196,7 +3203,18 @@ function Editor({ state, setState }) {
       rafRef.current = requestAnimationFrame(tick);
       if (ts - last < 33) return;
       last = ts;
+      const fullRes = drawScaleRef.current === 1;
+      const t0 = nowMs();
       paintOnce();
+      // Measure real full-res canvas paints during playback only (skip proxy /
+      // idle / already-low frames). If a full frame is too slow to hold ~30fps
+      // with audio headroom, drop to low for the rest of this play; the proxy
+      // then restores HD. ~26ms ≈ 78% of the 33ms budget.
+      if (playingRef.current && !proxyPlayRef.current && fullRes) {
+        const dt = nowMs() - t0;
+        paintMsRef.current = paintMsRef.current ? paintMsRef.current * 0.8 + dt * 0.2 : dt;
+        if (paintMsRef.current > 26) lowResRef.current = true;
+      }
     };
     rafRef.current = requestAnimationFrame(tick);
   };
@@ -3214,6 +3232,8 @@ function Editor({ state, setState }) {
   // settle paint, then stops).
   useEffect(() => {
     playingRef.current = playing;
+    // Each fresh play retries FULL-res first; adaptive drop re-decides per play.
+    if (playing) { lowResRef.current = false; paintMsRef.current = 0; }
     kickRender();
     return () => { /* loop self-stops; nothing to cancel here */ };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3322,6 +3342,10 @@ function Editor({ state, setState }) {
     const appT = currentTimeRef.current;
     const want = findReadyProxyFile(appT);
     if (!want) { setDbg('canvas (no buffer here)'); if (proxyPlayRef.current) deactivateProxy(); return; }
+    // Never downgrade a smooth full-res canvas to the LOW proxy — only the HD
+    // proxy (full quality) may take over. If the canvas already had to drop to
+    // low (heavy project), the low proxy IS an upgrade (it frees the main thread).
+    if ((want.q || 0) < 1 && !lowResRef.current) { setDbg('canvas full-res (HD rendering…)'); if (proxyPlayRef.current) deactivateProxy(); return; }
     if (proxyActiveUrlRef.current !== want.url) { setDbg('loading q' + (want.q || 0) + '…'); loadProxy(want, appT - want.appStart); return; }
     if (!proxyPlayRef.current) { setDbg('loading q' + (want.q || 0) + '…'); return; }   // still loading / cutting over
     setDbg('PROXY q' + (want.q || 0) + (want.q >= 1 ? ' (HD)' : ' (low)'));
