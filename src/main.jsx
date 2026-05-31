@@ -6593,11 +6593,14 @@ function Editor({ state, setState }) {
                           const clipDur = Math.max(0.1, (layer.endTime ?? dur) - (layer.startTime || 0));
                           const srcStart = layer.srcStart || 0;
                           const n = Math.max(1, Math.min(40, Math.round(clipDur)));
+                          // Вырезка: render each frame in the cut-out SHAPE (circle/
+                          // rounded/square) on black, so the strip reads as the cut.
+                          const stripCls = `etl-clip-thumbstrip${layer.type==='maskedVideo' ? ` etl-thumbstrip-masked shape-${layer.shape || 'circle'}` : ''}`;
                           const cache = thumbsCacheRef.current.get(layer.file);
                           // FAST PATH: cached thumbnails (low-res JPEG <img>).
                           // No video decoders, no seek latency, instant on split.
                           if (cache && cache.thumbs && cache.thumbs.length && !cache.loading) {
-                            return <div className="etl-clip-thumbstrip" aria-hidden="true">
+                            return <div className={stripCls} aria-hidden="true">
                               {Array.from({ length: n }, (_, i) => {
                                 const t = srcStart + (i / Math.max(1, n - 1)) * clipDur;
                                 // Pick the closest pre-generated thumb.
@@ -6615,7 +6618,7 @@ function Editor({ state, setState }) {
                           // use a small number of <video> elements so the
                           // user sees SOMETHING right away.
                           const nFb = Math.min(8, n);
-                          return <div className="etl-clip-thumbstrip" aria-hidden="true">
+                          return <div className={stripCls} aria-hidden="true">
                             {Array.from({ length: nFb }, (_, i) => {
                               const t = srcStart + (i / Math.max(1, nFb - 1)) * clipDur;
                               return <video key={i}
