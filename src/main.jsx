@@ -3368,15 +3368,14 @@ function Editor({ state, setState }) {
   }, [playing, previewFullscreen]);
   // Faint-orange "already rendered" segments drawn behind the bright progress
   // fill on the scrubber (shared by the normal + fullscreen playback bars).
-  // One unified buffer bar (HD only — no low pass). Faint striped = HD rendering
-  // here (progress); solid = HD ready/playable. Both in the app's orange theme.
+  // One simple buffer bar (HD only) — a faint fill, slightly brighter than the
+  // empty track, that grows as HD renders and just stays once filled. The live
+  // render frontier and the completed ranges share the same plain style.
   const renderBuffered = () => [
-    // HD render FRONTIER (faint striped = "rendering here, in progress").
     ...(bufferedHdLive ? [(
-      <div key="hdlive" className="ed-scrub-buffered ed-scrub-buffered-hd-live"
+      <div key="hdlive" className="ed-scrub-buffered ed-scrub-buffered-hd"
         style={{ left: pct(bufferedHdLive.s), width: `${Math.max(0, Math.min(100, ((bufferedHdLive.e - bufferedHdLive.s) / dur) * 100))}%` }} />
     )] : []),
-    // HD READY ranges (solid) drawn on top — "HD plays here".
     ...bufferedHd.map((iv, i) => (
       <div key={'hd' + i} className="ed-scrub-buffered ed-scrub-buffered-hd"
         style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
