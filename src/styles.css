@@ -708,7 +708,7 @@
 
 /* multi-track timeline */
 .etl-wrap{display:flex;flex-direction:column;border-radius:14px;background:#0a0a0c;border:1px solid rgba(140,140,146,.15);overflow:hidden}
-.etl-header{display:flex;height:24px;border-bottom:1px solid rgba(140,140,146,.12);position:sticky;top:0;z-index:6;background:#0a0a0c}
+.etl-header{display:flex;height:24px;border-bottom:1px solid rgba(255,138,0,.4);position:sticky;top:0;z-index:6;background:linear-gradient(180deg,rgba(255,138,0,.20),rgba(255,138,0,.08)),#0a0a0c}
 .etl-label-col{width:152px;min-width:152px;flex-shrink:0;display:flex;align-items:center;gap:4px;padding:0 6px;border-right:1px solid rgba(140,140,146,.12)}
 .etl-time-ruler{position:relative;flex:1;height:24px;cursor:pointer;overflow:hidden}
 .etl-time-ruler span{position:absolute;top:4px;font-size:10px;color:#63636a;transform:translateX(-50%);pointer-events:none;white-space:nowrap}
@@ -1361,8 +1361,12 @@
 
 /* — Editor surfaces — */
 [data-theme="light"] .editor-page,[data-theme="light"] .ed-tl-section,[data-theme="light"] .etl-wrap,
-[data-theme="light"] .etl-header,[data-theme="light"] .etl-track-area,[data-theme="light"] .etl-track{
+[data-theme="light"] .etl-track-area,[data-theme="light"] .etl-track{
   background:rgba(255,255,255,.55)!important;
+}
+[data-theme="light"] .etl-header{
+  background:linear-gradient(180deg,rgba(255,138,0,.24),rgba(255,138,0,.11)),rgba(255,255,255,.55)!important;
+  border-bottom-color:rgba(255,138,0,.5);
 }
 [data-theme="light"] .ed-tl-bar,[data-theme="light"] .etl-add-row,[data-theme="light"] .ed-playback{
   background:rgba(255,255,255,.7)!important;border-color:rgba(30,36,56,.12)!important;
