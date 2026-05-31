@@ -112,8 +112,20 @@ function resourcePath(...parts) {
 }
 
 function appPath(...parts) {
-  if (app.isPackaged) return path.join(process.resourcesPath, 'app', ...parts);
-  return path.join(__dirname, '..', ...parts);
+  if (!app.isPackaged) return path.join(__dirname, '..', ...parts);
+  // Packaged builds use different layouts depending on the packager:
+  //   electron-packager (no asar):                 resources/app/<...>
+  //   electron-builder (asar) + file UNPACKED:      resources/app.asar.unpacked/<...>
+  //   electron-builder (asar), file in the archive: resources/app.asar/<...>
+  // Prefer a REAL on-disk copy — fs reads it AND the renderer can load it via
+  // file:// (which can't see inside an .asar). This is why bundled fonts were
+  // missing on the asar (electron-builder) Mac/Win release builds.
+  const rp = process.resourcesPath;
+  const plain = path.join(rp, 'app', ...parts);
+  if (fs.existsSync(plain)) return plain;
+  const unpacked = path.join(rp, 'app.asar.unpacked', ...parts);
+  if (fs.existsSync(unpacked)) return unpacked;
+  return path.join(rp, 'app.asar', ...parts);
 }
 
 // Any path that points INSIDE app.asar must be rewritten to app.asar.unpacked
@@ -693,6 +705,15 @@ function createWindow() {
       mainWindow.hide();
     }
   });
+
+  // Tell the renderer whether the window is maximized/fullscreen, so the editor
+  // can auto-collapse its sidebar (full-window editor) and restore it otherwise.
+  const sendMaxState = () => { try { mainWindow?.webContents.send('window:maxstate', !!(mainWindow.isMaximized() || mainWindow.isFullScreen())); } catch {} };
+  mainWindow.on('maximize', sendMaxState);
+  mainWindow.on('unmaximize', sendMaxState);
+  mainWindow.on('enter-full-screen', sendMaxState);
+  mainWindow.on('leave-full-screen', sendMaxState);
+  mainWindow.webContents.on('did-finish-load', sendMaxState);
 
   if (!app.isPackaged && process.env.STRATA_SKIP_UPDATE_CHECK === '1') {
     const devPort = process.env.VITE_DEV_PORT || 5173;
@@ -2922,11 +2943,37 @@ function listBundledFonts() {
   } catch { return []; }
 }
 
+// Safety net only: if the bundled fonts can't be located in a packaged build,
+// list the OS fonts (Windows AND macOS dirs) so the picker is never EMPTY — a
+// long list beats no font control at all. Each file becomes a 1-weight family.
+async function listSystemFontsFallback() {
+  const dirs = process.platform === 'win32'
+    ? ['C:/Windows/Fonts']
+    : process.platform === 'darwin'
+      ? ['/System/Library/Fonts', '/System/Library/Fonts/Supplemental', '/Library/Fonts', path.join(os.homedir(), 'Library', 'Fonts')]
+      : ['/usr/share/fonts', path.join(os.homedir(), '.fonts')];
+  const out = [];
+  for (const dir of dirs) {
+    let files = [];
+    try { files = await fs.promises.readdir(dir); } catch { continue; }
+    for (const f of files) {
+      if (!/\.(ttf|otf)$/i.test(f)) continue;
+      const base = path.basename(f, path.extname(f));
+      const name = base.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+      const file = path.join(dir, f);
+      out.push({ family: base, name, file, variants: [{ label: 'Regular', file }] });
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
 ipcMain.handle('fonts:list', async () => {
   if (_fontsCache) return _fontsCache;
-  // Only the curated bundled families — no OS fonts (the picker was drowning in
-  // hundreds of system fonts). Each entry is a family with its weight variants.
-  _fontsCache = listBundledFonts();
+  // The curated bundled families (≈15), each with its weight variants.
+  let fams = listBundledFonts();
+  if (!fams.length) fams = await listSystemFontsFallback();   // never leave it empty
+  _fontsCache = fams;
   return _fontsCache;
 });
 

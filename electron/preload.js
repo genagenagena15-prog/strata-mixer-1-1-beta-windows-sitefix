@@ -75,6 +75,11 @@ contextBridge.exposeInMainWorld('strata', {
   minimize: () => ipcRenderer.invoke('window:minimize'),
   maximize: () => ipcRenderer.invoke('window:maximize'),
   close: () => ipcRenderer.invoke('window:close'),
+  onWindowMaxState: (callback) => {
+    const handler = (_e, v) => callback(!!v);
+    ipcRenderer.on('window:maxstate', handler);
+    return () => ipcRenderer.removeListener('window:maxstate', handler);
+  },
   saveTheme: (theme) => ipcRenderer.invoke('theme:save', theme),
   getPathForFile: (file) => {
     try { return webUtils.getPathForFile(file); } catch { return file?.path || ''; }
