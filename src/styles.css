@@ -845,7 +845,11 @@
 }
 /* Cells stretch to fill the strip exactly — no gaps, no empty right margin.
    object-fit:cover keeps the underlying frame visually correct. */
-.etl-clip-thumbstrip .etl-thumb-cell{flex:1 1 0;min-width:0;height:100%;object-fit:cover;display:block;background:#0d0e10}
+/* Fixed small SQUARE frames (≈track-height px) — not stretched to fill the clip
+   width. As many as fit are shown; the rest is clipped. Quality loss is fine —
+   it's just "what frame is this". */
+.etl-clip-thumbstrip{justify-content:flex-start}
+.etl-clip-thumbstrip .etl-thumb-cell{flex:0 0 auto;width:auto;height:100%;aspect-ratio:1;object-fit:cover;display:block;background:#0d0e10}
 /* Вырезка (maskedVideo): each frame in the cut-out shape on a black strip. */
 .etl-thumbstrip-masked{background:#000;gap:3px;overflow:hidden;align-items:center}
 .etl-thumbstrip-masked .etl-thumb-cell{flex:0 0 auto;width:auto;height:100%;aspect-ratio:1;object-fit:cover;background:#000}
