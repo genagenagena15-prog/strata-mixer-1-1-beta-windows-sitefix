@@ -2063,11 +2063,13 @@ function Editor({ state, setState }) {
   // ffmpeg finished it — faststart writes the moov atom at the end). The hidden
   // <video> (proxyVideoRef) is slaved to the playhead; proxyPlayRef mirrors the
   // proxyPlay state for use inside RAF/effects without re-subscribing.
-  const proxyVideoRef = useRef(null);
+  const proxyVideoRef = useRef(null);     // inline preview proxy <video>
+  const proxyVideoFsRef = useRef(null);   // fullscreen-overlay proxy <video>
   const proxyFilesRef = useRef([]);
   const proxyPlayRef = useRef(false);
   const proxyActiveUrlRef = useRef(null);
   const currentTimeRef = useRef(0);
+  const previewFullscreenRef = useRef(false);
   const measureCanvasRef = useRef(null);
   const blurTmpRef = useRef(null);
   // Holds the full composite (base + overlays) captured at the first clipping
@@ -3090,14 +3092,19 @@ function Editor({ state, setState }) {
         const inRange = currentTime >= (l.startTime || 0) && currentTime <= (l.endTime ?? dur);
         const tightSync = !playing;
         const driftLimit = tightSync ? 0.08 : 0.3;
-        if (Math.abs(el.currentTime - t) > driftLimit) {
+        // While the proxy owns the picture, don't reseek these decoders either —
+        // they're paused and off-screen; a single resync runs on hand-back.
+        if (!proxyPlayRef.current && Math.abs(el.currentTime - t) > driftLimit) {
           try { el.currentTime = t; } catch {}
         }
         try { el.playbackRate = spd; } catch {}
         // Actually play the hidden <video> so frames decode smoothly — the
         // canvas renderer copies the live frames to its cache each RAF tick.
         // Reverse can't be played natively; that case still uses scrubbing.
-        if (playing && inRange && !l.reversed) {
+        // While the proxy serves the picture the canvas isn't copying these
+        // frames, so pause the decoders too (the <audio> mirror below keeps the
+        // sound) — saves N video decodes on heavy projects.
+        if (playing && inRange && !l.reversed && !proxyPlayRef.current) {
           if (el.paused) el.play().catch(() => {});
         } else if (!el.paused) {
           try { el.pause(); } catch {}
@@ -3137,8 +3144,9 @@ function Editor({ state, setState }) {
     // Also depend on layers — when the user trims a clip start, srcStart
     // changes mid-render; without re-running this sync the underlying
     // <video> stays seeked to the old position and preview keeps showing
-    // the un-trimmed frame.
-  }, [currentTime, playing, layers]);
+    // the un-trimmed frame. proxyPlay → re-run to pause/resume the decoders
+    // when the proxy takes over / hands the picture back.
+  }, [currentTime, playing, layers, proxyPlay]);
 
   // ⏳ WIP — PREVIEW PERF REWRITE (Stage 1a of N). Stage 1b = LOW-RES preview
   // while moving is NOT done yet (full plan + constraints in memory
@@ -3230,6 +3238,11 @@ function Editor({ state, setState }) {
   // so there's no audio cut-over glitch and no clock conflict. Flips back to the
   // crisp full-res canvas the instant we pause / scrub / edit / hit a gap.
   useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
+  useEffect(() => { previewFullscreenRef.current = previewFullscreen; }, [previewFullscreen]);
+  // The proxy <video> lives in TWO places (inline + fullscreen overlay) because a
+  // browser-fullscreen element only shows its own descendants. Only the one for
+  // the current view is ever driven; the other stays paused/hidden.
+  const activeProxyVideo = () => (previewFullscreenRef.current ? proxyVideoFsRef.current : proxyVideoRef.current);
 
   function findReadyProxyFile(appT) {
     const eps = 0.05, lead = 0.12;   // need a little runway before a file's end
@@ -3243,13 +3256,14 @@ function Editor({ state, setState }) {
     return best;
   }
   function deactivateProxy() {
-    const pv = proxyVideoRef.current;
-    if (pv) { try { pv.pause(); } catch {} }
+    // Pause BOTH elements — on a fullscreen toggle the active one switches, and
+    // we don't want the old element to keep decoding in the background.
+    [proxyVideoRef.current, proxyVideoFsRef.current].forEach(pv => { if (pv) { try { pv.pause(); } catch {} } });
     proxyActiveUrlRef.current = null;
     if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
   }
   function loadProxy(want, seekT) {
-    const pv = proxyVideoRef.current; if (!pv) return;
+    const pv = activeProxyVideo(); if (!pv) return;
     proxyActiveUrlRef.current = want.url;          // claim now so we don't re-enter
     const target = Math.max(0, seekT);
     // Cut over only once the right frame is actually presented → no black flash.
@@ -3268,7 +3282,7 @@ function Editor({ state, setState }) {
     try { pv.load(); } catch {}
   }
   function proxyStep() {
-    const pv = proxyVideoRef.current; if (!pv) return;
+    const pv = activeProxyVideo(); if (!pv) return;
     const appT = currentTimeRef.current;
     const want = findReadyProxyFile(appT);
     if (!want) { if (proxyPlayRef.current) deactivateProxy(); return; }
@@ -3280,11 +3294,11 @@ function Editor({ state, setState }) {
     const tgt = appT - want.appStart;
     if (Math.abs(pv.currentTime - tgt) > 0.18) { try { pv.currentTime = Math.max(0, tgt); } catch {} }
   }
-  // Controller runs only while playing (and not fullscreen — that view keeps the
-  // canvas for now). Re-checks every frame, so it auto-cuts over the moment the
-  // segment covering the playhead finishes rendering (AE-style).
+  // Controller runs while playing (inline OR fullscreen — re-runs on the toggle
+  // to swap which <video> it drives). Re-checks every frame, so it auto-cuts over
+  // the moment the segment covering the playhead finishes rendering (AE-style).
   useEffect(() => {
-    if (!playing || previewFullscreen) { deactivateProxy(); return; }
+    if (!playing) { deactivateProxy(); return; }
     let raf = 0;
     const loop = () => { proxyStep(); raf = requestAnimationFrame(loop); };
     raf = requestAnimationFrame(loop);
@@ -5392,7 +5406,7 @@ function Editor({ state, setState }) {
                       the canvas while a rendered proxy segment covers the playhead
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
                   <video ref={proxyVideoRef} muted playsInline preload="auto"
-                    style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: proxyPlay ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
+                    style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: (proxyPlay && !previewFullscreen) ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
                   {/* Subtle frame — the project rect is defined by contrast between
                       the black canvas and the gray preview surround; only a thin
                       hairline on top to make the edge crisp. */}
@@ -5559,9 +5573,12 @@ function Editor({ state, setState }) {
           {previewFullscreen && (
             <div ref={fsOverlayRef} className="ed-fs-overlay"
               style={{ position:'fixed', inset:0, zIndex:9999, background:'#000', display:'flex', flexDirection:'column' }}>
-              <div style={{ flex:'1 1 auto', display:'flex', alignItems:'center', justifyContent:'center', minHeight:0, overflow:'hidden' }}>
+              <div style={{ position:'relative', flex:'1 1 auto', display:'flex', alignItems:'center', justifyContent:'center', minHeight:0, overflow:'hidden' }}>
                 <canvas ref={fsCanvasRef}
                   style={{ width:'100%', height:'100%', objectFit:'contain', display:'block' }} />
+                {/* Phase 2b: fullscreen proxy picture (same slave model as inline). */}
+                <video ref={proxyVideoFsRef} muted playsInline preload="auto"
+                  style={{ position:'absolute', inset:0, width:'100%', height:'100%', objectFit:'contain', display: (proxyPlay && previewFullscreen) ? 'block' : 'none', pointerEvents:'none', background:'#000' }} />
               </div>
               <div className="ed-playback ed-playback-fs"
                 style={{ flex:'0 0 auto', display:'flex', alignItems:'center', gap:'10px', padding:'10px 16px', background:'rgba(20,20,22,.92)' }}>
