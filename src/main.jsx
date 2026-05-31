@@ -1850,6 +1850,24 @@ function Editor({ state, setState }) {
     const t3 = setTimeout(() => setSubHlSegId(null), 1900);         // drop the flash
     return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
   }, [subHlSegId]);
+  // Inline subtitle editing on the preview: double-click a sub → type right there.
+  const [subEdit, setSubEdit] = useState(null);       // { layerId, segId } | null
+  const [subEditText, setSubEditText] = useState('');
+  function setSegmentText(layerId, segId, newText) {
+    set('layers', (ls) => ls.map(l => {
+      if (l.id !== layerId) return l;
+      const news = (l.segments || []).map(s => {
+        if (s.id !== segId) return s;
+        const parts = (newText || '').split(/\s+/).filter(Boolean);
+        if (parts.length === 0) return { ...s, text: '', words: [] };
+        const dur = Math.max(0.01, (s.endTime ?? 0) - (s.startTime ?? 0));
+        const each = dur / parts.length;
+        const words = parts.map((w, i) => ({ text: w, start: (s.startTime || 0) + i * each, end: (s.startTime || 0) + (i + 1) * each }));
+        return { ...s, text: parts.join(' '), words };
+      });
+      return { ...l, segments: news };
+    }));
+  }
   // Lightweight in-app toast for soft errors / hints. Replaces native alert()
   // so notifications match the editor's look — dark card, orange accent.
   const [editorHint, setEditorHint] = useState(null);
@@ -5601,7 +5619,7 @@ function Editor({ state, setState }) {
 
           <div className="ed-preview-wrap" data-onb="preview"
             onPointerDown={startPreviewPan}
-            onPointerDownCapture={() => { const a = document.activeElement; if (a && a !== document.body && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || '') || a.isContentEditable)) { try { a.blur(); } catch {} } }}
+            onPointerDownCapture={(e) => { if (e.target && e.target.closest && e.target.closest('.sub-inline-edit')) return; const a = document.activeElement; if (a && a !== document.body && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || '') || a.isContentEditable)) { try { a.blur(); } catch {} } }}
             style={{ flex: '0 0 auto', height: previewH, position:'relative', cursor: 'grab' }}>
             {/* Current preview quality — in the top-left CORNER of the preview
                 area (off the video), subtle transparent-black chip. */}
@@ -5682,16 +5700,29 @@ function Editor({ state, setState }) {
                   }
                   return (
                     <div className="sub-box-overlay"
-                      onPointerDown={makePreviewDrag(subSel.id)}
-                      onDoubleClick={() => openSubSegmentAt(subSel.id, currentTime)}
-                      title="Двойной клик → открыть эту фразу в «Текст и тайминги»"
+                      onPointerDown={subEdit ? undefined : makePreviewDrag(subSel.id)}
+                      onDoubleClick={() => {
+                        const seg = (subSel.segments || []).find(s => currentTime >= (s.startTime || 0) && currentTime <= (s.endTime ?? totalDuration)) || (subSel.segments || [])[0];
+                        if (seg) { pushUndo(); setSubEdit({ layerId: subSel.id, segId: seg.id }); setSubEditText(seg.text || ''); }
+                      }}
+                      title="Двойной клик → редактировать текст прямо здесь"
                       style={{ position:'absolute',
                         left:`${cx - boxW/2}%`, top:`${cy - boxHpct/2}%`,
                         width:`${boxW}%`, height:`${boxHpct}%`,
-                        cursor:'move', touchAction:'none', userSelect:'none' }}>
-                      {['e','w'].map(h =>
+                        cursor: subEdit ? 'text' : 'move', touchAction:'none', userSelect:'none' }}>
+                      {!subEdit && ['e','w'].map(h =>
                         <div key={h} className={`preview-rh preview-rh-${h}`}
                           onPointerDown={makeSubBoxResize(subSel.id, h)} />)}
+                      {subEdit && subEdit.layerId === subSel.id && (
+                        <textarea className="sub-inline-edit" autoFocus value={subEditText}
+                          onPointerDown={e => e.stopPropagation()}
+                          onChange={e => setSubEditText(e.target.value)}
+                          onBlur={() => { setSegmentText(subEdit.layerId, subEdit.segId, subEditText); setSubEdit(null); }}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); }
+                            else if (e.key === 'Escape') { e.preventDefault(); setSubEdit(null); }
+                          }} />
+                      )}
                     </div>
                   );
                 })()}
