@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.3.3';
+const APP_VERSION = 'v1.3.4';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
 // crisp still). 0.5 → ¼ the pixels → ~4× cheaper compositing, no audio glitch.
 const PREVIEW_SCALE = 0.5;
