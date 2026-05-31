@@ -443,11 +443,12 @@ function App() {
         {active === 'editor' && (
           <button className={`sidebar-toggle${sidebarCollapsed ? ' collapsed' : ''}`}
             onClick={() => setSidebarCollapsed(c => !c)}
-            title={sidebarCollapsed ? 'Показать панель' : 'Скрыть панель'}
-            aria-label={sidebarCollapsed ? 'Показать панель' : 'Скрыть панель'}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            title={sidebarCollapsed ? 'Показать меню' : 'Скрыть меню — редактор на весь экран'}
+            aria-label={sidebarCollapsed ? 'Показать меню' : 'Скрыть меню'}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="15 18 9 12 15 6" />
             </svg>
+            <span className="sidebar-toggle-label">{sidebarCollapsed ? 'Меню' : 'На весь экран'}</span>
           </button>
         )}
         <main className="main">

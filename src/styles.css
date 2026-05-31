@@ -1912,15 +1912,17 @@ html[data-theme="light"] .save-fmt-dialog{
 
 .sidebar-toggle{
   position:absolute;top:50%;left:238px;z-index:35;
-  width:26px;height:26px;
-  display:flex;align-items:center;justify-content:center;
-  border:0;border-radius:50%;
+  height:30px;
+  display:flex;align-items:center;gap:5px;
+  border:0;border-radius:16px;
   background:linear-gradient(135deg,#ff9a1f,#ff4b1f);
-  color:#fff;padding:0;cursor:pointer;
+  color:#fff;padding:0 12px 0 9px;cursor:pointer;white-space:nowrap;
+  font-weight:800;font-size:12px;
   box-shadow:0 4px 14px rgba(255,138,0,.45),0 2px 5px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.22);
   transform:translateY(-50%);
   transition:left .32s cubic-bezier(.4,0,.2,1),transform .2s cubic-bezier(.4,0,.2,1),box-shadow .2s,filter .15s;
 }
+.sidebar-toggle-label{line-height:1}
 .sidebar-toggle:hover{filter:brightness(1.08);transform:translateY(-50%) scale(1.08);box-shadow:0 6px 20px rgba(255,138,0,.6),0 2px 6px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.28)}
 .sidebar-toggle:active{transform:translateY(-50%) scale(.96)}
 .sidebar-toggle.collapsed svg{transform:rotate(180deg)}
