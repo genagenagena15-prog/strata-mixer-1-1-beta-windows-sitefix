@@ -3250,7 +3250,9 @@ function Editor({ state, setState }) {
     for (const f of proxyFilesRef.current) {
       if (f.token !== proxyTokenRef.current) continue;       // stale (edited)
       if (appT >= f.appStart - eps && appT < f.appEnd - lead) {
-        if (!best || f.appEnd > best.appEnd) best = f;        // longest runway
+        // Prefer the highest quality, then the longest runway before a switch.
+        const fq = f.q || 0, bq = best ? (best.q || 0) : -1;
+        if (!best || fq > bq || (fq === bq && f.appEnd > best.appEnd)) best = f;
       }
     }
     return best;
@@ -3264,6 +3266,11 @@ function Editor({ state, setState }) {
   }
   function loadProxy(want, seekT) {
     const pv = activeProxyVideo(); if (!pv) return;
+    // Mid-play file switch (esp. the low→high quality upgrade): drop to the
+    // canvas for the brief reload so the swap doesn't flash black. The playing
+    // canvas (PREVIEW_SCALE) is itself sharper than the low proxy, so the
+    // transition reads as low→sharper→crisp. Initial activation skips this.
+    if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
     proxyActiveUrlRef.current = want.url;          // claim now so we don't re-enter
     const target = Math.max(0, seekT);
     // Cut over only once the right frame is actually presented → no black flash.
@@ -4173,13 +4180,11 @@ function Editor({ state, setState }) {
   async function buildPreviewProxy() {
     if (proxyRunningRef.current || exportingRef.current) return;
     const token = proxyTokenRef.current;
-    if (proxyDoneTokenRef.current === token) return;   // this exact state already buffered
+    if (proxyDoneTokenRef.current === token) return;   // both passes already done
     const { baseFile } = computeExportBase();
     if (!baseFile) return;
     const longSide = Math.max(outWidth, outHeight) || 1;
-    const sc = Math.min(1, 480 / longSide);            // cap long side ≈480px
-    const pw = Math.max(2, Math.round(outWidth * sc / 2) * 2);
-    const ph = Math.max(2, Math.round(outHeight * sc / 2) * 2);
+    const even = (n) => Math.max(2, Math.round(n / 2) * 2);
     // Buffer AHEAD of the playhead first (the part about to be watched), then
     // fill the start — exactly like YouTube.
     const T = Math.max(0, Math.min(dur, currentTime));
@@ -4187,40 +4192,64 @@ function Editor({ state, setState }) {
       ? [{ start: T, end: dur }, { start: 0, end: T }]
       : [{ start: 0, end: dur }];
     proxyRunningRef.current = true;
-    const done = [];   // intervals fully rendered so far
-    const off = window.strata?.onPreviewProgress?.((d) => {
-      if (proxyTokenRef.current !== token) return;     // stale — user edited
-      const seg = segs[Math.min(done.length, segs.length - 1)];
-      const pct = d.done ? 100 : (d.percent || 0);
-      const e = seg.start + (pct / 100) * (seg.end - seg.start);
-      setBuffered([...done, { s: seg.start, e }]);
-    });
-    try {
-      for (let i = 0; i < segs.length; i++) {
-        if (proxyTokenRef.current !== token) break;
-        const seg = segs[i];
-        let outPath;
-        try { outPath = await window.strata?.previewProxyPath?.(token * 4 + i); } catch { break; }
-        if (!outPath) break;
-        const payload = buildEditPayload({ outWidth: pw, outHeight: ph, outPath, format: 'mp4', quality: 'fast', custom: {}, preview: true });
-        if (!payload) break;
-        payload.previewRange = { start: seg.start, end: seg.end };
-        const res = await window.strata?.editVideo?.(payload);
-        if (proxyTokenRef.current !== token) break;          // edited mid-render
-        if (res && res.ok === false) break;                  // failed → not playable
-        done.push({ s: seg.start, e: seg.end });
-        // This segment is now a COMPLETE, playable mp4 (ffmpeg wrote the moov
-        // atom on close) → register it so play-from-proxy can take over.
-        proxyFilesRef.current = [
-          ...proxyFilesRef.current.filter(f => f.url !== outPath),
-          { appStart: seg.start, appEnd: seg.end, url: outPath, token },
-        ];
-        setBuffered([...done]);
-      }
-    } catch {}
-    off?.();
+
+    // Render every segment at (ow×oh), tagging each finished mp4 with quality
+    // rank `q` — the player always prefers the highest q available, so when the
+    // hi-res pass lands it transparently upgrades the picture. `onBar` (lo pass
+    // only) streams ffmpeg % to the buffered bar; `slot` keeps temp paths unique.
+    const renderPass = async (ow, oh, q, slot, onBar) => {
+      let off = null;
+      if (onBar) off = window.strata?.onPreviewProgress?.((d) => {
+        if (proxyTokenRef.current !== token) return;
+        const seg = segs[Math.min(onBar.done.length, segs.length - 1)];
+        const pct = d.done ? 100 : (d.percent || 0);
+        setBuffered([...onBar.done, { s: seg.start, e: seg.start + (pct / 100) * (seg.end - seg.start) }]);
+      });
+      let ok = true;
+      try {
+        for (let i = 0; i < segs.length; i++) {
+          if (proxyTokenRef.current !== token) { ok = false; break; }
+          const seg = segs[i];
+          let outPath;
+          try { outPath = await window.strata?.previewProxyPath?.(token * 10 + slot + i); } catch { ok = false; break; }
+          if (!outPath) { ok = false; break; }
+          // Both passes use 'fast' (veryfast/crf27) — the ladder is purely a
+          // RESOLUTION upgrade (≈480 → ≈1080), which is exactly what reads as
+          // "soft/pixelated"; full res at 'fast' renders quickly and looks crisp.
+          const payload = buildEditPayload({ outWidth: ow, outHeight: oh, outPath, format: 'mp4', quality: 'fast', custom: {}, preview: true });
+          if (!payload) { ok = false; break; }
+          payload.previewRange = { start: seg.start, end: seg.end };
+          const res = await window.strata?.editVideo?.(payload);
+          if (proxyTokenRef.current !== token) { ok = false; break; }
+          if (res && res.ok === false) { ok = false; break; }
+          // Complete, playable mp4 (faststart moov written on close) → register.
+          proxyFilesRef.current = [
+            ...proxyFilesRef.current.filter(f => f.url !== outPath),
+            { appStart: seg.start, appEnd: seg.end, url: outPath, q, token },
+          ];
+          if (onBar) { onBar.done.push({ s: seg.start, e: seg.end }); setBuffered([...onBar.done]); }
+        }
+      } catch { ok = false; }
+      off?.();
+      return ok;
+    };
+
+    // PASS 1 — LOW res (≈480 long side): smooth playback ASAP + fills the bar.
+    const loSc = Math.min(1, 480 / longSide);
+    const loW = even(outWidth * loSc), loH = even(outHeight * loSc);
+    const ok1 = await renderPass(loW, loH, 0, 0, { done: [] });
+
+    // PASS 2 — HIGH res (≈min(longSide,1080)): crisp upgrade, swapped in by the
+    // player the moment each hi segment finishes. Skipped if it would not
+    // actually be sharper than pass 1 (already-small projects).
+    if (ok1 && proxyTokenRef.current === token) {
+      const hiSc = Math.min(1, 1080 / longSide);
+      const hiW = even(outWidth * hiSc), hiH = even(outHeight * hiSc);
+      if (hiW > loW) await renderPass(hiW, hiH, 1, 5, null);
+    }
+
     proxyRunningRef.current = false;
-    if (proxyTokenRef.current === token) proxyDoneTokenRef.current = token;  // fully buffered
+    if (proxyTokenRef.current === token) proxyDoneTokenRef.current = token;  // both passes done
   }
 
   const sel = selectedId ? layers.find(l => l.id === selectedId) : null;
