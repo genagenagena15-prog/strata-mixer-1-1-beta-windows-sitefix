@@ -1439,6 +1439,42 @@ function DonateModal({ onClose }) {
 // the family name in a neutral face. The native <select>/<option> can't render
 // each option in its own font face reliably + can't mix font-families inside
 // one row, so this is a custom popover.
+// Re-chunk subtitle segments into ~n-word groups (CapCut-style: pack words by a
+// character budget, always break on sentence-ending punctuation). Pure — used
+// for the INITIAL grouping and the "Размер группы" buttons.
+function chunkSegmentsByN(segments, n) {
+  const all = [];
+  for (const s of (segments || [])) {
+    const ss = Number(s.startTime) || 0;
+    const se = Math.max(ss + 0.05, Number(s.endTime) || ss);
+    let ws = Array.isArray(s.words) && s.words.length ? s.words : null;
+    if (!ws) {
+      const parts = String(s.text || '').split(/\s+/).filter(Boolean);
+      const each = parts.length ? (se - ss) / parts.length : 0;
+      ws = parts.map((t, i) => ({ text: t, start: ss + i * each, end: ss + (i + 1) * each }));
+    }
+    for (const w of ws) all.push({ text: w.text, start: Number(w.start) || ss, end: Number(w.end) || se });
+  }
+  if (!all.length) return Array.isArray(segments) ? segments : [];
+  const budget = n * 7, maxW = n + 2;
+  const groups = [];
+  let cur = [], curChars = 0;
+  for (const w of all) {
+    const wl = (w.text || '').length;
+    const add = cur.length ? wl + 1 : wl;
+    if (cur.length && (curChars + add > budget || cur.length >= maxW)) { groups.push(cur); cur = []; curChars = 0; }
+    cur.push(w);
+    curChars += cur.length === 1 ? wl : add;
+    if (/[.!?…]$/.test((w.text || '').trim())) { groups.push(cur); cur = []; curChars = 0; }
+  }
+  if (cur.length) groups.push(cur);
+  return groups.map((g, gi) => {
+    const start = Number(g[0].start) || 0;
+    const nextG = groups[gi + 1];
+    const end = nextG ? Math.max(start + 0.05, Number(nextG[0].start) || start) : Math.max(start + 0.05, Number(g[g.length - 1].end) || start);
+    return { id: 'seg_' + gi + '_' + Date.now().toString(36), startTime: start, endTime: end, text: g.map(w => w.text).join(' '), words: g.map(w => ({ ...w })) };
+  });
+}
 // Family picker — one entry per font FAMILY (≈15). `value` is the current
 // fontFile; the owning family is highlighted. onPick(family) hands back the
 // whole family object (weight is chosen separately).
@@ -2544,7 +2580,8 @@ function Editor({ state, setState }) {
         setSubProgress({ phase: 'error', error: res?.error || 'Неизвестная ошибка распознавания' });
         return;
       }
-      const segs = Array.isArray(res.segments) ? res.segments : [];
+      // Default to ~4-word groups (matches the "Размер группы" 4 button).
+      const segs = chunkSegmentsByN(Array.isArray(res.segments) ? res.segments : [], 4);
       if (segs.length === 0) {
         setSubProgress({ phase: 'error', error: 'В аудио не нашлось речи. Проверь что в проекте есть голос.' });
         return;
@@ -2561,7 +2598,7 @@ function Editor({ state, setState }) {
       // text from the start, instead of always opening at 88 %×100 % of the
       // canvas (which made the frame look bigger than the subs themselves).
       // Padding: +6 % width and +2 % height per line so the frame breathes.
-      const fsDefault = 56;
+      const fsDefault = 90;
       const fontFam = sysFont?.name || 'Arial';
       const mc = measureCtx();
       mc.font = `${fsDefault}px "${fontFam}", Arial, sans-serif`;
@@ -2578,7 +2615,7 @@ function Editor({ state, setState }) {
       }
       const outW = state.outWidth || 1080;
       const outH = state.outHeight || 1920;
-      const initBoxW = Math.max(20, Math.min(120, Math.round((maxTextW / outW) * 100) + 6));
+      const initBoxW = 100;   // full preview width by default
       const initBoxH = Math.max(8,  Math.min(60,  Math.round((maxLines * fsDefault * 1.3 / outH) * 100) + 2));
       addLayer({
         id: 'sub_' + Date.now().toString(36),
@@ -2586,6 +2623,7 @@ function Editor({ state, setState }) {
         startTime: 0,
         endTime: state.totalDuration || segs[segs.length - 1].endTime,
         segments: segs,
+        wordsPerGroup: 4,
         style: {
           fontFamily: fontFam,
           fontFile: sysFont?.file || '',
@@ -5983,51 +6021,8 @@ function Editor({ state, setState }) {
               pushUndo();
               set('layers', (ls) => ls.map(l => {
                 if (l.id !== sel.id || l.type !== 'subtitles') return l;
-                const all = [];
-                for (const s of (l.segments || [])) {
-                  const ss = Number(s.startTime) || 0;
-                  const se = Math.max(ss + 0.05, Number(s.endTime) || ss);
-                  let ws = Array.isArray(s.words) && s.words.length ? s.words : null;
-                  if (!ws) {
-                    const parts = String(s.text || '').split(/\s+/).filter(Boolean);
-                    const each = parts.length ? (se - ss) / parts.length : 0;
-                    ws = parts.map((t, i) => ({ text: t, start: ss + i * each, end: ss + (i + 1) * each }));
-                  }
-                  for (const w of ws) all.push({ text: w.text, start: Number(w.start) || ss, end: Number(w.end) || se });
-                }
-                if (!all.length) return l;
-                const budget = n * 7;      // characters per group (soft)
-                const maxW = n + 2;        // word ceiling so tiny-word runs don't blow up
-                const groups = [];
-                let cur = [], curChars = 0;
-                for (const w of all) {
-                  const wl = (w.text || '').length;
-                  const add = cur.length ? wl + 1 : wl;   // +1 for the space
-                  if (cur.length && (curChars + add > budget || cur.length >= maxW)) {
-                    groups.push(cur); cur = []; curChars = 0;
-                  }
-                  cur.push(w);
-                  curChars += cur.length === 1 ? wl : add;
-                  // Sentence end → always break after (keeps phrases whole).
-                  if (/[.!?…]$/.test((w.text || '').trim())) { groups.push(cur); cur = []; curChars = 0; }
-                }
-                if (cur.length) groups.push(cur);
-                const news = groups.map((g, gi) => {
-                  const start = Number(g[0].start) || 0;
-                  const nextG = groups[gi + 1];
-                  // Hold each group until the next begins (no flicker on pauses).
-                  const end = nextG
-                    ? Math.max(start + 0.05, Number(nextG[0].start) || start)
-                    : Math.max(start + 0.05, Number(g[g.length - 1].end) || start);
-                  return {
-                    id: 'seg_' + gi + '_' + Date.now().toString(36),
-                    startTime: start,
-                    endTime: end,
-                    text: g.map(w => w.text).join(' '),
-                    words: g.map(w => ({ ...w })),
-                  };
-                });
-                return { ...l, segments: news, wordsPerGroup: n };
+                const news = chunkSegmentsByN(l.segments, n);
+                return news.length ? { ...l, segments: news, wordsPerGroup: n } : l;
               }));
             };
             const jumpTo = (t) => setCurrentTime(Math.max(0, Math.min(totalDuration, t)));
