@@ -1992,6 +1992,9 @@ function Editor({ state, setState }) {
   // HD-ready ranges (the 2nd, high-res proxy pass). Drawn brighter over the
   // faint low-res `buffered` so the user can SEE the quality upgrade land.
   const [bufferedHd, setBufferedHd] = useState([]);
+  // Live HD render frontier {s,e} (striped) — shows the HD pass PROGRESSING,
+  // distinct from the solid `bufferedHd` (= actually playable). Null when idle.
+  const [bufferedHdLive, setBufferedHdLive] = useState(null);
   // ⏳ Preview-perf Phase 2: PLAY from the background proxy. When a rendered
   // proxy file already covers the playhead, a hidden <video> takes over the
   // picture+audio+clock so the canvas (the expensive recomposite) stops — frees
@@ -3227,6 +3230,7 @@ function Editor({ state, setState }) {
     deactivateProxy();                 // drop back to the live canvas at once
     setBuffered([]);
     setBufferedHd([]);
+    setBufferedHdLive(null);
     window.strata?.cancelPreview?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layers, totalDuration, outWidth, outHeight, bgColor]);
@@ -3345,7 +3349,12 @@ function Editor({ state, setState }) {
       <div key={'lo' + i} className="ed-scrub-buffered"
         style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
     )),
-    // HD (high-res pass) ranges drawn brighter on top of the faint low-res ones.
+    // HD render FRONTIER (striped green = "rendering here, in progress").
+    ...(bufferedHdLive ? [(
+      <div key="hdlive" className="ed-scrub-buffered ed-scrub-buffered-hd-live"
+        style={{ left: pct(bufferedHdLive.s), width: `${Math.max(0, Math.min(100, ((bufferedHdLive.e - bufferedHdLive.s) / dur) * 100))}%` }} />
+    )] : []),
+    // HD READY ranges (solid green) drawn on top — "HD plays here".
     ...bufferedHd.map((iv, i) => (
       <div key={'hd' + i} className="ed-scrub-buffered ed-scrub-buffered-hd"
         style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
@@ -4232,16 +4241,18 @@ function Editor({ state, setState }) {
     // drive the matching scrubber bar (low=orange faint, HD=brighter) with live
     // ffmpeg %; `slot` keeps temp paths unique.
     const renderPass = async (ow, oh, q, slot, setBar, doneAcc) => {
-      // Live % only for the LOW pass (q=0) — it renders fast, so "bar≈ready" is
-      // close enough (the YouTube buffering feel). The HD pass updates its bar
-      // ONLY when a segment fully completes (= actually playable), so a bright
-      // HD bar always means "HD plays here", never "HD still rendering".
-      const off = (q === 0) ? window.strata?.onPreviewProgress?.((d) => {
+      const lo = (q === 0);
+      // Live ffmpeg % → the render frontier. LOW merges it into its own (orange)
+      // bar — the YouTube buffering feel. HD routes it to the SEPARATE striped
+      // `bufferedHdLive` so it shows "rendering here", while the solid green
+      // `bufferedHd` stays an HONEST "playable here" (set only on full completion).
+      const off = window.strata?.onPreviewProgress?.((d) => {
         if (proxyTokenRef.current !== token) return;
         const seg = segs[Math.min(doneAcc.length, segs.length - 1)];
         const pct = d.done ? 100 : (d.percent || 0);
-        setBar([...doneAcc, { s: seg.start, e: seg.start + (pct / 100) * (seg.end - seg.start) }]);
-      }) : null;
+        const frontier = { s: seg.start, e: seg.start + (pct / 100) * (seg.end - seg.start) };
+        if (lo) setBar([...doneAcc, frontier]); else setBufferedHdLive(frontier);
+      });
       let ok = true;
       try {
         for (let i = 0; i < segs.length; i++) {
@@ -4268,9 +4279,11 @@ function Editor({ state, setState }) {
             { appStart: seg.start, appEnd: seg.end, url: outPath, q, token },
           ];
           doneAcc.push({ s: seg.start, e: seg.end }); setBar([...doneAcc]);
+          if (!lo) setBufferedHdLive(null);   // segment fully done → frontier resets
         }
       } catch (e) { console.warn('[proxy] pass error q=' + q, e); ok = false; }
       off?.();
+      if (!lo) setBufferedHdLive(null);        // HD pass ended → clear the frontier
       return ok;
     };
 
