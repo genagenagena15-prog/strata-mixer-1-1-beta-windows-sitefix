@@ -6592,7 +6592,13 @@ function Editor({ state, setState }) {
                         {(layer.type==='videoOverlay' || layer.type==='maskedVideo') && layer.file && (() => {
                           const clipDur = Math.max(0.1, (layer.endTime ?? dur) - (layer.startTime || 0));
                           const srcStart = layer.srcStart || 0;
-                          const n = Math.max(1, Math.min(40, Math.round(clipDur)));
+                          // Fill the whole clip width with fixed ~42px square frames:
+                          // count = clip width in px / cell size. Clip px width =
+                          // (scroll width × zoom − label col) × (clipDur / total).
+                          const cellPx = 42;
+                          const trackW = ((tlScrollRef.current?.clientWidth || 900) * (zoom || 1)) - 152;
+                          const clipW = Math.max(cellPx, trackW * (clipDur / Math.max(0.1, dur)));
+                          const n = Math.max(1, Math.min(200, Math.ceil(clipW / cellPx)));
                           // Вырезка: render each frame in the cut-out SHAPE (circle/
                           // rounded/square) on black, so the strip reads as the cut.
                           const stripCls = `etl-clip-thumbstrip${layer.type==='maskedVideo' ? ` etl-thumbstrip-masked shape-${layer.shape || 'circle'}` : ''}`;
