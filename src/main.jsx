@@ -5601,6 +5601,7 @@ function Editor({ state, setState }) {
 
           <div className="ed-preview-wrap" data-onb="preview"
             onPointerDown={startPreviewPan}
+            onPointerDownCapture={() => { const a = document.activeElement; if (a && a !== document.body && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || '') || a.isContentEditable)) { try { a.blur(); } catch {} } }}
             style={{ flex: '0 0 auto', height: previewH, position:'relative', cursor: 'grab' }}>
             {/* Current preview quality — in the top-left CORNER of the preview
                 area (off the video), subtle transparent-black chip. */}
