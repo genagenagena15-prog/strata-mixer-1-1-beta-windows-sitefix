@@ -3281,23 +3281,41 @@ function Editor({ state, setState }) {
     // canvas (PREVIEW_SCALE) is itself sharper than the low proxy, so the
     // transition reads as low→sharper→crisp. Initial activation skips this.
     if (proxyPlayRef.current) { proxyPlayRef.current = false; setProxyPlay(false); kickRender(); }
-    console.log('[proxy] play q=' + (want.q || 0) + ' ' + String(want.url).split(/[\\/]/).pop());
+    console.log('[proxy] load q=' + (want.q || 0) + ' ' + String(want.url).split(/[\\/]/).pop());
     proxyActiveUrlRef.current = want.url;          // claim now so we don't re-enter
     const target = Math.max(0, seekT);
-    // Cut over only once the right frame is actually presented → no black flash.
-    const cutOver = () => { try { pv.play().catch(() => {}); } catch {} proxyPlayRef.current = true; setProxyPlay(true); };
+    let done = false;
+    // Cut over once the right frame is presented (no black flash). Guarded so a
+    // watchdog + the real `seeked` can't both fire, and so a superseded load is
+    // dropped.
+    const cutOver = () => {
+      if (done) return; done = true;
+      if (proxyActiveUrlRef.current !== want.url) return;    // superseded mid-load
+      try { pv.play().catch(() => {}); } catch {}
+      proxyPlayRef.current = true; setProxyPlay(true);
+      console.log('[proxy] PLAYING q=' + (want.q || 0));
+    };
     const onLoaded = () => {
       pv.removeEventListener('loadeddata', onLoaded);
-      if (proxyActiveUrlRef.current !== want.url) return;     // superseded mid-load
-      if (Math.abs(pv.currentTime - target) < 0.04) { cutOver(); return; }
+      if (proxyActiveUrlRef.current !== want.url) return;
+      if (Math.abs(pv.currentTime - target) < 0.05) { cutOver(); return; }
       const onSeeked = () => { pv.removeEventListener('seeked', onSeeked); cutOver(); };
       pv.addEventListener('seeked', onSeeked, { once: true });
       try { pv.currentTime = target; } catch { cutOver(); }
+      setTimeout(cutOver, 600);                     // watchdog: seek didn't fire
     };
-    pv.muted = true;                               // audio stays on the live mirrors
+    try { pv.pause(); } catch {}                    // don't swap src on a playing el
+    pv.muted = true;                                // audio stays on the live mirrors
     pv.addEventListener('loadeddata', onLoaded, { once: true });
     pv.src = fileUrl(want.url);
     try { pv.load(); } catch {}
+    // watchdog: loadeddata never arrived → force the seek+cutover anyway, so the
+    // picture can never get stuck on the canvas mid-swap.
+    setTimeout(() => {
+      if (done || proxyActiveUrlRef.current !== want.url) return;
+      try { pv.currentTime = target; } catch {}
+      cutOver();
+    }, 1300);
   }
   function proxyStep() {
     const pv = activeProxyVideo(); if (!pv) return;
@@ -4261,12 +4279,12 @@ function Editor({ state, setState }) {
     const ok1 = await renderPass(loW, loH, 0, 0, setBuffered, []);
     console.log('[proxy] pass1 (low) ok=' + ok1);
 
-    // PASS 2 — HIGH res (≈min(longSide,1080)): crisp upgrade, swapped in by the
-    // player the moment each hi segment finishes. Skipped if it would not
-    // actually be sharper than pass 1 (already-small projects).
+    // PASS 2 — FULL export resolution: play-HD then looks IDENTICAL to the
+    // paused canvas (which renders at full res) → preview == export during
+    // playback too. Swapped in by the player the moment each hi segment
+    // finishes. Skipped if pass 1 was already full res (already-small projects).
     if (ok1 && proxyTokenRef.current === token) {
-      const hiSc = Math.min(1, 1080 / longSide);
-      const hiW = even(outWidth * hiSc), hiH = even(outHeight * hiSc);
+      const hiW = even(outWidth), hiH = even(outHeight);
       console.log('[proxy] pass2 (high) ' + hiW + 'x' + hiH + ' run=' + (hiW > loW));
       if (hiW > loW) { const ok2 = await renderPass(hiW, hiH, 1, 5, setBufferedHd, []); console.log('[proxy] pass2 (high) ok=' + ok2); }
     } else {
