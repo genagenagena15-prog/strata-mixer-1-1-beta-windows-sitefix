@@ -3194,6 +3194,10 @@ function Editor({ state, setState }) {
       // Light projects stay crisp the whole time — no needless HD→low→HD dip.
       // Always full-res when paused/scrubbing, and never while the proxy paints.
       drawScaleRef.current = (playingRef.current && lowResRef.current) ? PREVIEW_SCALE : 1;
+      // Drive the on-screen HD/Low quality badge. "Low" only while a heavy
+      // project is playing the half-res canvas; HD proxy & full-res canvas = HD.
+      const q = (playingRef.current && lowResRef.current && !proxyPlayRef.current) ? 'Low' : 'HD';
+      if (proxyDbgRef.current !== q) { proxyDbgRef.current = q; setProxyDbg(q); }
       // Keep going while playing OR within the post-change burst window.
       if (!playingRef.current && nowMs() > renderUntilRef.current) {
         paintOnce();                  // one last settle paint (full res), then stop
@@ -3274,7 +3278,6 @@ function Editor({ state, setState }) {
   // browser-fullscreen element only shows its own descendants. Only the one for
   // the current view is ever driven; the other stays paused/hidden.
   const activeProxyVideo = () => (previewFullscreenRef.current ? proxyVideoFsRef.current : proxyVideoRef.current);
-  const setDbg = (s) => { if (proxyDbgRef.current !== s) { proxyDbgRef.current = s; setProxyDbg(s); } };
 
   function findReadyProxyFile(appT) {
     const eps = 0.05, lead = 0.12;   // need a little runway before a file's end
@@ -3341,14 +3344,13 @@ function Editor({ state, setState }) {
     const pv = activeProxyVideo(); if (!pv) return;
     const appT = currentTimeRef.current;
     const want = findReadyProxyFile(appT);
-    if (!want) { setDbg('canvas (no buffer here)'); if (proxyPlayRef.current) deactivateProxy(); return; }
+    if (!want) { if (proxyPlayRef.current) deactivateProxy(); return; }
     // Never downgrade a smooth full-res canvas to the LOW proxy — only the HD
     // proxy (full quality) may take over. If the canvas already had to drop to
     // low (heavy project), the low proxy IS an upgrade (it frees the main thread).
-    if ((want.q || 0) < 1 && !lowResRef.current) { setDbg('canvas full-res (HD rendering…)'); if (proxyPlayRef.current) deactivateProxy(); return; }
-    if (proxyActiveUrlRef.current !== want.url) { setDbg('loading q' + (want.q || 0) + '…'); loadProxy(want, appT - want.appStart); return; }
-    if (!proxyPlayRef.current) { setDbg('loading q' + (want.q || 0) + '…'); return; }   // still loading / cutting over
-    setDbg('PROXY q' + (want.q || 0) + (want.q >= 1 ? ' (HD)' : ' (low)'));
+    if ((want.q || 0) < 1 && !lowResRef.current) { if (proxyPlayRef.current) deactivateProxy(); return; }
+    if (proxyActiveUrlRef.current !== want.url) { loadProxy(want, appT - want.appStart); return; }
+    if (!proxyPlayRef.current) return;             // still loading / cutting over
     if (pv.paused) { try { pv.play().catch(() => {}); } catch {} }
     // Keep the muted proxy picture aligned to the live playhead. Both run at
     // real time so they stay close; only a real drift forces a tiny reseek.
@@ -4257,10 +4259,10 @@ function Editor({ state, setState }) {
     // then it wraps to the start — so what you're watching gets HD soonest.
     const CHUNK = 8;
     const chunks = [];
-    for (let s = 0; s < dur - 0.05; s += CHUNK) chunks.push({ start: s, end: Math.min(dur, s + CHUNK) });
+    for (let s = T; s < dur - 0.05; s += CHUNK) chunks.push({ start: s, end: Math.min(dur, s + CHUNK) });  // playhead → end
+    for (let s = 0; s < T - 0.05; s += CHUNK) chunks.push({ start: s, end: Math.min(T, s + CHUNK) });       // then the head [0,T]
     if (!chunks.length) chunks.push({ start: 0, end: dur });
-    const startIdx = Math.max(0, chunks.findIndex(c => T < c.end - 1e-6));
-    const segs = startIdx <= 0 ? chunks : [...chunks.slice(startIdx), ...chunks.slice(0, startIdx)];
+    const segs = chunks;
     proxyRunningRef.current = true;
 
     // Render every segment at (ow×oh), tagging each finished mp4 with quality
@@ -5510,8 +5512,9 @@ function Editor({ state, setState }) {
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
                   <video ref={proxyVideoRef} muted playsInline preload="auto"
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', objectFit:'fill', display: (proxyPlay && !previewFullscreen) ? 'block' : 'none', pointerEvents:'none', zIndex:2, background:'#000' }} />
-                  {/* Diagnostic badge — what the preview is showing right now. */}
-                  <div style={{ position:'absolute', top:4, left:4, zIndex:6, font:'11px monospace', fontWeight:700, color: proxyDbg.startsWith('PROXY q1') ? '#7CFC6A' : proxyDbg.startsWith('PROXY q0') ? '#ffd24a' : '#9fd0ff', background:'rgba(0,0,0,.66)', padding:'2px 6px', borderRadius:4, pointerEvents:'none', letterSpacing:'.3px' }}>{proxyDbg || 'canvas'}</div>
+                  {/* Current preview quality (HD = full res / proxy; Low = the
+                      half-res canvas while a heavy project plays un-buffered). */}
+                  <div style={{ position:'absolute', top:6, left:6, zIndex:6, font:'700 11px system-ui,sans-serif', color:'#fff', background: proxyDbg === 'Low' ? 'rgba(190,120,30,.92)' : 'rgba(34,170,90,.92)', padding:'2px 8px', borderRadius:5, pointerEvents:'none', letterSpacing:'.5px', boxShadow:'0 1px 4px rgba(0,0,0,.4)' }}>{proxyDbg || 'HD'}</div>
                   {/* Subtle frame — the project rect is defined by contrast between
                       the black canvas and the gray preview surround; only a thin
                       hairline on top to make the edge crisp. */}
