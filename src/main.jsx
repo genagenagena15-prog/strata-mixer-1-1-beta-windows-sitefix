@@ -3368,17 +3368,15 @@ function Editor({ state, setState }) {
   }, [playing, previewFullscreen]);
   // Faint-orange "already rendered" segments drawn behind the bright progress
   // fill on the scrubber (shared by the normal + fullscreen playback bars).
+  // One unified buffer bar (HD only — no low pass). Faint striped = HD rendering
+  // here (progress); solid = HD ready/playable. Both in the app's orange theme.
   const renderBuffered = () => [
-    ...buffered.map((iv, i) => (
-      <div key={'lo' + i} className="ed-scrub-buffered"
-        style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
-    )),
-    // HD render FRONTIER (striped green = "rendering here, in progress").
+    // HD render FRONTIER (faint striped = "rendering here, in progress").
     ...(bufferedHdLive ? [(
       <div key="hdlive" className="ed-scrub-buffered ed-scrub-buffered-hd-live"
         style={{ left: pct(bufferedHdLive.s), width: `${Math.max(0, Math.min(100, ((bufferedHdLive.e - bufferedHdLive.s) / dur) * 100))}%` }} />
     )] : []),
-    // HD READY ranges (solid green) drawn on top — "HD plays here".
+    // HD READY ranges (solid) drawn on top — "HD plays here".
     ...bufferedHd.map((iv, i) => (
       <div key={'hd' + i} className="ed-scrub-buffered ed-scrub-buffered-hd"
         style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
@@ -4249,7 +4247,6 @@ function Editor({ state, setState }) {
     if (proxyDoneTokenRef.current === token) return;   // both passes already done
     const { baseFile } = computeExportBase();
     if (!baseFile) return;
-    const longSide = Math.max(outWidth, outHeight) || 1;
     const even = (n) => Math.max(2, Math.round(n / 2) * 2);
     // Buffer AHEAD of the playhead first (the part about to be watched), then
     // fill the start — exactly like YouTube.
@@ -4311,22 +4308,15 @@ function Editor({ state, setState }) {
       return ok;
     };
 
-    // PASS 1 — LOW res (≈480 long side): smooth playback ASAP + fills the bar.
-    const loSc = Math.min(1, 480 / longSide);
-    const loW = even(outWidth * loSc), loH = even(outHeight * loSc);
-    const ok1 = await renderPass(loW, loH, 0, 0, setBuffered, []);
-
-    // PASS 2 — FULL export resolution: play-HD then looks IDENTICAL to the
-    // paused canvas (which renders at full res) → preview == export during
-    // playback too. Swapped in by the player the moment each hi segment
-    // finishes. Skipped if pass 1 was already full res (already-small projects).
-    if (ok1 && proxyTokenRef.current === token) {
-      const hiW = even(outWidth), hiH = even(outHeight);
-      if (hiW > loW) await renderPass(hiW, hiH, 1, 5, setBufferedHd, []);
-    }
+    // SINGLE pass — FULL export resolution HD (crf16 / veryfast). No low pass:
+    // the live canvas (adaptive full/low res) covers playback until HD is ready,
+    // then the HD proxy swaps in. The bar shows the HD render frontier (faint,
+    // striped) advancing → solid once a segment is actually playable.
+    const hiW = even(outWidth), hiH = even(outHeight);
+    await renderPass(hiW, hiH, 1, 0, setBufferedHd, []);
 
     proxyRunningRef.current = false;
-    if (proxyTokenRef.current === token) proxyDoneTokenRef.current = token;  // both passes done
+    if (proxyTokenRef.current === token) proxyDoneTokenRef.current = token;  // HD fully done
   }
 
   const sel = selectedId ? layers.find(l => l.id === selectedId) : null;

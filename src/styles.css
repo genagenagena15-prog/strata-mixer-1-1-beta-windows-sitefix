@@ -992,8 +992,8 @@
 /* Faint "already rendered / buffered" segments behind the bright progress fill
    (YouTube-style — shows where the preview has played through). */
 .ed-scrub-buffered{position:absolute;top:0;height:100%;background:rgba(255,138,0,.32);border-radius:inherit;pointer-events:none}
-.ed-scrub-buffered-hd{background:rgba(60,214,122,.85)}
-.ed-scrub-buffered-hd-live{background:repeating-linear-gradient(45deg,rgba(60,214,122,.5) 0 7px,rgba(60,214,122,.16) 7px 14px);background-size:20px 100%;animation:ed-hd-stripe .7s linear infinite}
+.ed-scrub-buffered-hd{background:rgba(255,138,0,.62)}
+.ed-scrub-buffered-hd-live{background:repeating-linear-gradient(45deg,rgba(255,138,0,.34) 0 7px,rgba(255,138,0,.11) 7px 14px);background-size:20px 100%;animation:ed-hd-stripe .7s linear infinite}
 @keyframes ed-hd-stripe{from{background-position:0 0}to{background-position:20px 0}}
 .ed-scrub-fill{position:absolute;left:0;top:0;height:100%;background:linear-gradient(90deg,#ff8a00,#ff5c22);border-radius:inherit;pointer-events:none;z-index:1}
 .ed-scrub-head{position:absolute;top:50%;transform:translate(-50%,-50%);width:12px;height:12px;background:#ff8a00;border-radius:50%;box-shadow:0 0 8px rgba(255,138,0,.5);pointer-events:none}
