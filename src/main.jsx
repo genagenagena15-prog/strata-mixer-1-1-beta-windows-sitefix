@@ -1860,6 +1860,10 @@ function Editor({ state, setState }) {
   // Inline subtitle editing on the preview: double-click a sub → type right there.
   const [subEdit, setSubEdit] = useState(null);       // { layerId, segId } | null
   const [subEditText, setSubEditText] = useState('');
+  const subEditRef = useRef(null);
+  // Mirror to a ref + repaint, so the canvas can hide the sub being edited (the
+  // styled HTML field shows it instead — no double text).
+  useEffect(() => { subEditRef.current = subEdit; kickRender(); }, [subEdit]);
   function setSegmentText(layerId, segId, newText) {
     set('layers', (ls) => ls.map(l => {
       if (l.id !== layerId) return l;
@@ -4815,6 +4819,9 @@ function Editor({ state, setState }) {
         ctx.restore();
       } else if (layer.type === 'subtitles') {
         const st = layer.style || {};
+        // While inline-editing this subtitle, the styled HTML field renders the
+        // text instead — skip the canvas draw so they don't double up.
+        if (subEditRef.current && subEditRef.current.layerId === layer.id) continue;
         // Box-area visualization moved to an HTML overlay (see preview layout
         // below) — that one is interactive: drag the dashed outline to move,
         // grab the corners/edges to resize. Drawing on canvas + HTML at the
@@ -5705,6 +5712,11 @@ function Editor({ state, setState }) {
                       boxHpct = (blockPx / outHeight) * 100 + 3;
                     }
                   }
+                  // Inline editor styling = the subtitle's own look. fontSize is
+                  // in canvas px → scale to the preview's displayed px.
+                  const subScale = (canvasRef.current?.offsetWidth || outWidth) / outWidth;
+                  const editFontPx = Math.max(8, (subLayout?.fontSize || Number(st.fontSize) || 56) * subScale);
+                  const editStrokePx = (st.outline === false ? 0 : (Number(st.outlineWidth) || Math.max(2, Math.round((Number(st.fontSize) || 56) * 0.04)))) * subScale;
                   return (
                     <div className="sub-box-overlay"
                       onPointerDown={subEdit ? undefined : makePreviewDrag(subSel.id)}
@@ -5721,13 +5733,27 @@ function Editor({ state, setState }) {
                         <div key={h} className={`preview-rh preview-rh-${h}`}
                           onPointerDown={makeSubBoxResize(subSel.id, h)} />)}
                       {subEdit && subEdit.layerId === subSel.id && (
-                        <textarea className="sub-inline-edit" autoFocus value={subEditText}
+                        <div className="sub-inline-edit" contentEditable suppressContentEditableWarning
+                          ref={el => {
+                            if (!el || el._inited) return;
+                            el._inited = true;
+                            el.textContent = subEditText;
+                            setTimeout(() => { try { el.focus(); const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); } catch {} }, 0);
+                          }}
                           onPointerDown={e => e.stopPropagation()}
-                          onChange={e => setSubEditText(e.target.value)}
+                          onInput={e => setSubEditText(e.currentTarget.textContent || '')}
                           onBlur={() => { setSegmentText(subEdit.layerId, subEdit.segId, subEditText); setSubEdit(null); }}
                           onKeyDown={e => {
                             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); }
                             else if (e.key === 'Escape') { e.preventDefault(); setSubEdit(null); }
+                          }}
+                          style={{
+                            fontFamily: fontCss({ fontFamily: st.fontFamily, fontFile: st.fontFile }),
+                            fontSize: `${editFontPx}px`,
+                            lineHeight: `${(st.lineHeight ?? 125) / 100}`,
+                            color: st.color || '#ffffff',
+                            WebkitTextStroke: editStrokePx > 0 ? `${editStrokePx}px ${st.outlineColor || '#000000'}` : undefined,
+                            caretColor: st.color || '#ffffff',
                           }} />
                       )}
                     </div>
