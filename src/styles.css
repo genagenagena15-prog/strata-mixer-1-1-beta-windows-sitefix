@@ -989,7 +989,10 @@
 .ed-pb-btn:hover{border-color:rgba(255,138,0,.5);color:#ff9d22}
 .ed-pb-play{background:linear-gradient(135deg,#ff8a00,#ff4e1e);border:0;box-shadow:0 0 14px rgba(255,138,0,.25)}
 .ed-scrub{flex:1;height:6px;background:#19191c;border-radius:99px;position:relative;cursor:pointer;overflow:visible}
-.ed-scrub-fill{position:absolute;left:0;top:0;height:100%;background:linear-gradient(90deg,#ff8a00,#ff5c22);border-radius:inherit;pointer-events:none}
+/* Faint "already rendered / buffered" segments behind the bright progress fill
+   (YouTube-style — shows where the preview has played through). */
+.ed-scrub-buffered{position:absolute;top:0;height:100%;background:rgba(255,138,0,.32);border-radius:inherit;pointer-events:none}
+.ed-scrub-fill{position:absolute;left:0;top:0;height:100%;background:linear-gradient(90deg,#ff8a00,#ff5c22);border-radius:inherit;pointer-events:none;z-index:1}
 .ed-scrub-head{position:absolute;top:50%;transform:translate(-50%,-50%);width:12px;height:12px;background:#ff8a00;border-radius:50%;box-shadow:0 0 8px rgba(255,138,0,.5);pointer-events:none}
 .ed-time{font-size:12px;font-weight:700;color:#d2d2d6;font-family:ui-monospace,monospace;white-space:nowrap}
 .ed-time-sep{color:#63636a;font-size:12px}
@@ -1108,6 +1111,23 @@
 .ed-zoom-btn{width:22px;height:22px;border:1px solid rgba(140,140,146,.2);background:#161618;border-radius:6px;color:#95959b;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0}
 .ed-zoom-btn:hover{border-color:rgba(255,138,0,.5);color:#ff9d22}
 .ed-zoom-val{font-size:11px;color:#b0b0b6;font-weight:700;min-width:24px;text-align:center}
+/* Timeline zoom value doubles as a scrubber (hold + drag / wheel), mirroring
+   the preview zoom control. The pop-up track flips DOWNWARD here because the
+   timeline section clips overflow at its top edge. */
+.ed-zoom-val.zoom-pct-scrub{position:relative;cursor:ns-resize;user-select:none}
+.ed-zoom-val.zoom-pct-scrub:hover{color:#ff9d22}
+.ed-zoom-val.zoom-pct-scrub.active{color:#ff8a00}
+.ed-zoom .zoom-scrub-track{bottom:auto;top:calc(100% + 10px);animation:zoomScrubDown .14s ease-out;z-index:20}
+@keyframes zoomScrubDown{from{opacity:0;transform:translateX(-50%) translateY(-6px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+/* Top horizontal scrollbar (custom) — only rendered when the timeline overflows
+   (zoomed in). Drag the thumb to scroll; the native bottom bar still works too. */
+.ed-tl-hscroll{position:relative;height:10px;margin:5px 10px 2px;background:rgba(255,255,255,.06);border-radius:99px;flex:0 0 auto}
+.ed-tl-hscroll-thumb{position:absolute;top:1px;height:8px;min-width:28px;background:#585860;border-radius:99px;cursor:grab;transition:background .12s}
+.ed-tl-hscroll-thumb:hover{background:#6f6f78}
+.ed-tl-hscroll-thumb:active{cursor:grabbing;background:#ff9d22}
+[data-theme="light"] .ed-tl-hscroll{background:rgba(30,36,56,.10)}
+[data-theme="light"] .ed-tl-hscroll-thumb{background:#aeb2be}
+[data-theme="light"] .ed-tl-hscroll-thumb:hover{background:#9a9fad}
 .ed-tl-scroll{overflow:auto;scrollbar-color:#585860 transparent;scrollbar-width:thin}
 .ed-tl-scroll::-webkit-scrollbar{height:6px;width:6px}
 .ed-tl-scroll::-webkit-scrollbar-thumb{background:#585860;border-radius:99px}

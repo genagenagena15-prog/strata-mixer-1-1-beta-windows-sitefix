@@ -399,7 +399,14 @@ async function downloadUpdateInstaller(url, onProgress) {
   fs.rmSync(outPath, { force: true });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10 * 60 * 1000);
+  // INACTIVITY timeout, reset on every received chunk — NOT an absolute cap.
+  // The old `setTimeout(abort, 10min)` was a hard wall: a big (.dmg ≈300MB)
+  // download on a slow/VPN link reached only ~60-70% by the 10-min mark, got
+  // aborted, and fell back to the browser. Now only a genuine stall (no bytes
+  // for IDLE_MS) aborts; a slow-but-steady download runs to completion.
+  const IDLE_MS = 90 * 1000;
+  let idleTimer = setTimeout(() => controller.abort(), IDLE_MS);
+  const kickIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => controller.abort(), IDLE_MS); };
 
   try {
     const response = await fetch(url, {
@@ -431,6 +438,7 @@ async function downloadUpdateInstaller(url, onProgress) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        kickIdle();   // got data → push the stall deadline forward
         const chunk = Buffer.from(value);
         downloaded += chunk.length;
         if (!file.write(chunk)) {
@@ -447,7 +455,7 @@ async function downloadUpdateInstaller(url, onProgress) {
     onProgress?.(100, downloaded, total || downloaded);
     return outPath;
   } finally {
-    clearTimeout(timer);
+    clearTimeout(idleTimer);
   }
 }
 
@@ -1650,6 +1658,12 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     const clipLen = Math.max(0.1, videoEnd - videoStart);
     const padAfter = Math.max(0, totalDuration - videoEnd);
     const totalDur = Math.max(0.1, totalDuration);
+    // Preview-proxy partial render: only output the [start,end] window of the
+    // composition (used to buffer AHEAD of the playhead first). Output -ss/-t.
+    const _pr = (payload.previewRange && Number(payload.previewRange.end) > Number(payload.previewRange.start))
+      ? { start: Math.max(0, Number(payload.previewRange.start)), end: Math.min(totalDur, Number(payload.previewRange.end)) }
+      : null;
+    const renderDur = _pr ? Math.max(0.1, _pr.end - _pr.start) : totalDur;
     const bgHex = (bgColor || '#000000').replace('#', '0x');
     const isAudioOnly = format === 'mp3';
     // Declared at executor scope so the audio-mixing block below can read it
@@ -1725,25 +1739,21 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       }
       videoStream = '[vscaled]';
 
-      // If there are mask layers, pre-split [vscaled] so each mask can fill
-      // its outside-shape area with the pristine mainVideo (instead of a flat
-      // bgColor). Without this, during the mask's enable window the canvas
-      // outside the shape was always bgColor — even where the mainVideo
-      // (or any earlier non-overlay content) should have kept playing.
-      // Hidden masks are skipped visually below, so they must NOT be counted
-      // here — otherwise `split=N` produces an unconsumed [vbaseMask] pad and
-      // ffmpeg fails with "Output pad not connected".
-      const totalMaskCount = (layers || []).filter(l => l.type === 'mask' && !l.hidden).length;
-      const baseMaskLabels = [];
+      // Multiple clipping masks must UNION (each is its own cookie-cutter hole),
+      // not chain destructively. The old per-mask approach gave each mask the
+      // pristine base for its "outside shape" region, so the 2nd mask's outside
+      // area overwrote the 1st mask's hole with base → the 1st mask vanished on
+      // render (intersection instead of union). We now build ONE combined alpha
+      // from every mask's shape (each gated by its own time window) and cut
+      // once. Pre-split off a single pristine-base copy here; the heavy lifting
+      // happens at the first mask in the forEach below.
+      const maskLayersAll = (layers || []).filter(l => l.type === 'mask' && !l.hidden);
+      const totalMaskCount = maskLayersAll.length;
+      let vmaskBaseLbl = null;
       if (totalMaskCount > 0) {
-        const labels = ['[vscaledSeq]'];
-        for (let mi = 0; mi < totalMaskCount; mi++) {
-          const lbl = `[vbaseMask${mi}]`;
-          labels.push(lbl);
-          baseMaskLabels.push(lbl);
-        }
-        filterParts.push(`${videoStream}split=${totalMaskCount + 1}${labels.join('')}`);
+        filterParts.push(`${videoStream}split=2[vscaledSeq][vmaskBase]`);
         videoStream = '[vscaledSeq]';
+        vmaskBaseLbl = '[vmaskBase]';
       }
 
       let blurCount = 0, imgCount = 0, vidovCount = 0, txtCount = 0, zoomCount = 0, maskCount = 0, transCount = 0;
@@ -1857,59 +1867,58 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         } else if (layer.type === 'mask') {
           // Hidden layer → no audio for masks, so skip its visual entirely.
           if (layer.hidden) return;
-          // Clipping mask: inside its time window, the canvas shows bgColor
-          // everywhere OUTSIDE the chosen shape and the previous composition
-          // INSIDE the shape. Outside the time window, the previous composition
-          // passes through unchanged.
-          //
-          // The old version used [mbg] (bgColor canvas) as the overlay BASE,
-          // which made the entire timeline turn bgColor whenever the mask's
-          // enable was false (overlay returns its base when enable=false). That
-          // was a huge bug — adding a 5-sec mask blacked out the other 95% of
-          // the video. Now we split the previous stream and use it as the base
-          // so outside the enable window everything renders normally.
-          const i = maskCount++;
-          const mw = Math.max(2, Math.round((layer.width / 100) * evenW));
-          const mh = Math.max(2, Math.round((layer.height / 100) * evenH));
-          const cxPx = Math.round((layer.x / 100) * evenW);
-          const cyPx = Math.round((layer.y / 100) * evenH);
-          const x0 = cxPx - mw / 2, y0 = cyPx - mh / 2;
-          const x1 = cxPx + mw / 2, y1 = cyPx + mh / 2;
-          // Same rule as maskedVideo: no \, escaping inside single-quoted expr.
-          let alphaExpr;
-          if (layer.shape === 'circle') {
-            const rx = mw / 2, ry = mh / 2;
-            alphaExpr = `if(lte(pow((X-${cxPx})/${rx},2)+pow((Y-${cyPx})/${ry},2),1),255,0)`;
-          } else {
-            const rPct = layer.shape === 'rounded' ? Math.max(0, layer.radius || 0) : 0;
-            const R = Math.min(mw, mh) / 2 * (rPct / 100);
-            const ix0 = x0 + R, iy0 = y0 + R, ix1 = x1 - R, iy1 = y1 - R;
-            alphaExpr = `if(lte(pow(X-clip(X,${ix0},${ix1}),2)+pow(Y-clip(Y,${iy0},${iy1}),2),${R * R}),255,0)`;
-          }
-          const enable = `enable='between(t,${layer.startTime},${layer.endTime})'`;
-          // Split the previous stream: one copy is the unchanged pass-through
-          // (used as base outside the enable window), the other gets clipped.
-          filterParts.push(`${videoStream}split=2[morig${i}][mtoclip${i}]`);
-          // Base for the "masked look" inside the enable window: prefer the
-          // pristine mainVideo (split off earlier) so during the mask window
-          // we see "mainVideo outside shape + previous-composite inside shape"
-          // — i.e. the topmost overlay appears to be cookie-cutter clipped.
-          // Falls back to bgColor only when there's no mainVideo at all.
-          const baseLbl = baseMaskLabels[i] || null;
-          // Grayscale alpha mask: 255 inside shape, 0 outside.
-          filterParts.push(`color=c=black:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)},format=gray,geq=lum='${alphaExpr}'[mma${i}]`);
-          // Apply alpha → previous content visible only inside shape (transparent outside).
-          filterParts.push(`[mtoclip${i}][mma${i}]alphamerge[mclip${i}]`);
-          // Compose the "masked" look: base (mainVideo or bgColor) outside shape + clipped previous content inside shape.
-          if (baseLbl) {
-            filterParts.push(`${baseLbl}[mclip${i}]overlay=0:0[mmasked${i}]`);
-          } else {
-            filterParts.push(`color=c=${bgHex}:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)}[mbg${i}]`);
-            filterParts.push(`[mbg${i}][mclip${i}]overlay=0:0[mmasked${i}]`);
-          }
-          // Final: outside enable window → pass-through (morig); inside window → masked look.
-          filterParts.push(`[morig${i}][mmasked${i}]overlay=0:0:${enable}[vmask${i}]`);
-          videoStream = `[vmask${i}]`;
+          // ALL clipping masks are composited together at the FIRST mask layer
+          // so they UNION (each cuts its own hole) instead of chaining (where
+          // the 2nd mask's pristine-base "outside" region erased the 1st mask's
+          // hole). Subsequent mask layers are handled here → no-op.
+          if (maskCount > 0) { maskCount++; return; }
+          maskCount++;
+          // vfull = the composite below the masks (base + overlays). Split into
+          // two: [vfullUncut] is shown OUTSIDE every mask's time window (overlays
+          // uncut); [vfullClip] gets clipped to the union of active shapes.
+          filterParts.push(`${videoStream}split=2[vfullUncut][vfullClip]`);
+          // Build the combined alpha: start fully black (rgba), then overlay each
+          // mask's white shape gated by its own enable window. Result is white
+          // inside ANY currently-active shape, black elsewhere — the union.
+          filterParts.push(`color=c=black:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)},format=rgba[mcomb0]`);
+          let accAlpha = '[mcomb0]';
+          maskLayersAll.forEach((m, k) => {
+            const mw = Math.max(2, Math.round((m.width / 100) * evenW));
+            const mh = Math.max(2, Math.round((m.height / 100) * evenH));
+            const cxPx = Math.round((m.x / 100) * evenW);
+            const cyPx = Math.round((m.y / 100) * evenH);
+            const x0 = cxPx - mw / 2, y0 = cyPx - mh / 2;
+            const x1 = cxPx + mw / 2, y1 = cyPx + mh / 2;
+            // no \, escaping inside the single-quoted geq expr.
+            let alphaExpr;
+            if (m.shape === 'circle') {
+              const rx = mw / 2, ry = mh / 2;
+              alphaExpr = `if(lte(pow((X-${cxPx})/${rx},2)+pow((Y-${cyPx})/${ry},2),1),255,0)`;
+            } else {
+              const rPct = m.shape === 'rounded' ? Math.max(0, m.radius || 0) : 0;
+              const R = Math.min(mw, mh) / 2 * (rPct / 100);
+              const ix0 = x0 + R, iy0 = y0 + R, ix1 = x1 - R, iy1 = y1 - R;
+              alphaExpr = `if(lte(pow(X-clip(X,${ix0},${ix1}),2)+pow(Y-clip(Y,${iy0},${iy1}),2),${R * R}),255,0)`;
+            }
+            const en = `enable='between(t,${m.startTime},${m.endTime})'`;
+            // White shape with alpha = shape (transparent outside) so overlaying
+            // it onto the accumulator only paints inside the shape.
+            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)},format=rgba[mwhite${k}]`);
+            filterParts.push(`color=c=black:s=${evenW}x${evenH}:r=30:d=${totalDur.toFixed(3)},format=gray,geq=lum='${alphaExpr}'[mae${k}]`);
+            filterParts.push(`[mwhite${k}][mae${k}]alphamerge[mshape${k}]`);
+            filterParts.push(`${accAlpha}[mshape${k}]overlay=0:0:${en}[mcomb${k + 1}]`);
+            accAlpha = `[mcomb${k + 1}]`;
+          });
+          // Combined alpha as grayscale (white=255 inside union, black=0 outside).
+          filterParts.push(`${accAlpha}format=gray[mcombGray]`);
+          // Reveal overlays only inside the union of active shapes.
+          filterParts.push(`[vfullClip][mcombGray]alphamerge[mrevealed]`);
+          // Cut look = pristine base outside the shapes + revealed overlays inside.
+          filterParts.push(`${vmaskBaseLbl}[mrevealed]overlay=0:0[mcut]`);
+          // Outside EVERY mask's time window → uncut composite; inside any window → cut look.
+          const enUnion = `enable='gt(${maskLayersAll.map(m => `between(t,${m.startTime},${m.endTime})`).join('+')},0)'`;
+          filterParts.push(`[vfullUncut][mcut]overlay=0:0:${enUnion}[vmaskFinal]`);
+          videoStream = '[vmaskFinal]';
         } else if (layer.type === 'blur') {
           // Hidden layer → blur has no audio, skip its visual entirely.
           if (layer.hidden) return;
@@ -2003,10 +2012,15 @@ ipcMain.handle('video:edit', async (_event, payload) => {
             let ch = Math.max(1, Math.min(inH - cy, Math.round(c.h)));
             // If srcCrop coords were computed against fake dimensions, scale
             // them back into real input space proportionally (best-effort).
-            // We detect this by checking if the requested crop exceeds the
-            // file's bounds — if so, treat the original c.x..c.x+c.w as a
-            // fraction of an assumed 1920×1080 / 1080×1920 frame and remap.
-            const reqExceeds = (c.x + c.w > inW * 1.05) || (c.y + c.h > inH * 1.05) || (c.x < 0) || (c.y < 0);
+            // We detect this by checking if the requested crop GROSSLY exceeds
+            // the file's bounds — only then was it likely measured against an
+            // assumed 1920×1080 / 1080×1920 frame. A few px of negative/overflow
+            // is just float rounding from the editor and must be CLAMPED, not
+            // remapped. (The old check fired on a -0.4 px x — which full-width
+            // bottom-bar cut-outs hit constantly — and remapped a perfectly good
+            // crop to a wrong/black region, so the cut-out looked gone on render
+            // while the preview, which clamps the raw srcCrop, showed it fine.)
+            const reqExceeds = (c.x + c.w > inW * 1.5) || (c.y + c.h > inH * 1.5) || (c.x < -2) || (c.y < -2);
             if (reqExceeds) {
               // Renderer probably defaulted to 1920x1080. Rescale srcCrop
               // proportionally to actual dims.
@@ -2359,26 +2373,34 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         args.push('-c:a', 'aac', '-b:a', `${audioKbps}k`, '-movflags', '+faststart');
       }
     }
-    args.push('-t', String(totalDur), '-y', outPath);
+    if (_pr) args.push('-ss', String(_pr.start), '-t', String(renderDur), '-y', outPath);
+    else args.push('-t', String(totalDur), '-y', outPath);
 
     // Make sure every drawtext temp file is on disk BEFORE ffmpeg starts.
     // Otherwise the textfile= references would fail with "no such file".
     Promise.all(pendingTextWrites).then(() => spawnFfmpeg()).catch(() => spawnFfmpeg());
 
     function spawnFfmpeg() {
+    // Background preview-proxy renders (the buffer) emit on a SEPARATE channel
+    // so they never collide with the real export's progress UI. Tracked so a
+    // stale proxy can be killed (editor:cancelPreview) when the user edits.
+    const isPreview = !!(payload && payload.preview);
+    const PROG_CH = isPreview ? 'preview-progress' : 'edit-progress';
     const proc = spawn(ffmpeg, args, { windowsHide: true });
+    if (isPreview) previewRenderProc = proc;
     let errLog = '';
     proc.stderr?.on('data', (d) => {
       const s = d.toString(); errLog += s;
       const m = s.match(/time=(\d+):(\d+):(\d+\.\d+)/);
       if (m && mainWindow) {
         const secs = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
-        mainWindow.webContents.send('edit-progress', { percent: Math.min(99, Math.round((secs / totalDur) * 100)) });
+        mainWindow.webContents.send(PROG_CH, { percent: Math.min(99, Math.round((secs / renderDur) * 100)) });
       }
     });
     proc.on('close', (code) => {
+      if (isPreview && previewRenderProc === proc) previewRenderProc = null;
       cleanupTmps();
-      if (mainWindow) mainWindow.webContents.send('edit-progress', { percent: 100, done: true });
+      if (mainWindow) mainWindow.webContents.send(PROG_CH, { percent: 100, done: true });
       resolve({ ok: code === 0, error: code !== 0 ? errLog.slice(-1600) : '' });
     });
     proc.on('error', (err) => {
@@ -2442,7 +2464,11 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
   const probeFiles = new Set();
   if (mainFile) probeFiles.add(mainFile);
   for (const l of layers) {
-    if (l && l.file && (l.type === 'videoOverlay' || l.type === 'audio')) probeFiles.add(l.file);
+    // maskedVideo (Вырезка) carries audio too — the export mixes it in, so the
+    // transcription MUST as well, or speech inside a cut-out clip never reaches
+    // Whisper and that clip gets no subtitles (was the "subs missing in the
+    // middle / on some videos" bug).
+    if (l && l.file && (l.type === 'videoOverlay' || l.type === 'maskedVideo' || l.type === 'audio')) probeFiles.add(l.file);
   }
   await Promise.all([...probeFiles].map(async (f) => {
     try { const p = await probeMediaInfo(ffmpeg, f); audioProbeMap.set(f, !!p.hasAudio); }
@@ -2484,8 +2510,11 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     mixInputs.push('[auMain]');
   }
 
-  // Video overlay audio.
-  const vovLayers = (layers || []).filter(l => l && l.type === 'videoOverlay' && l.file);
+  // Video-overlay AND cut-out (maskedVideo) audio — mirror the export mix, which
+  // routes both through videoOverlayInputs. Skip `muted` clips: their audio is
+  // dropped from the final video, so subtitling their speech would caption sound
+  // the viewer never hears.
+  const vovLayers = (layers || []).filter(l => l && (l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file && !l.muted);
   vovLayers.forEach((l, i) => {
     if (!audioProbeMap.get(l.file)) return;  // silent overlay — skip
     inputArgs.push('-i', l.file);
@@ -2505,8 +2534,8 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     mixInputs.push(`[auV${i}]`);
   });
 
-  // Pure audio layers.
-  const audLayers = (layers || []).filter(l => l && l.type === 'audio' && l.file);
+  // Pure audio layers (skip muted — matches the export mix).
+  const audLayers = (layers || []).filter(l => l && l.type === 'audio' && l.file && !l.muted);
   audLayers.forEach((l, i) => {
     if (!audioProbeMap.get(l.file)) return;
     inputArgs.push('-i', l.file);
@@ -2898,6 +2927,22 @@ ipcMain.handle('folder:pick', async () => {
   const result = await dialog.showOpenDialog(mainWindow, { title: 'Выбери папку', properties: ['openDirectory'] });
   if (result.canceled) return '';
   return result.filePaths[0];
+});
+
+// Stable temp path for the background preview-proxy render (the YouTube-style
+// buffer). The renderer hands this to video:edit as a low-res output; ffmpeg's
+// progress drives the "buffered" bar. `n` lets us avoid clobbering a file that's
+// still being read while a fresh render starts.
+ipcMain.handle('editor:previewProxyPath', (_e, n) => {
+  return path.join(os.tmpdir(), `strata_preview_proxy_${Number(n) || 0}.mp4`);
+});
+// Tracks the currently-running background preview-proxy ffmpeg so an edit can
+// kill it (the timeline changed → the half-rendered buffer is stale).
+let previewRenderProc = null;
+ipcMain.handle('editor:cancelPreview', () => {
+  try { previewRenderProc?.kill('SIGKILL'); } catch {}
+  previewRenderProc = null;
+  return true;
 });
 
 ipcMain.handle('folder:open', async (_event, folder) => {
@@ -3445,8 +3490,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const sy = layout.H ? outHeight / layout.H : 1;
     for (const seg of layout.segments) {
       const segStartNum = Number(seg.start) || 0;
+      const segEndNum = Math.max(segStartNum + 0.05, Number(seg.end) || 0);
       const segStart = _assTime(segStartNum);
-      const segEnd = _assTime(Math.max(segStartNum + 0.05, Number(seg.end) || 0));
+      const segEnd = _assTime(segEndNum);
       const segWords = seg.words || [];
       for (let wi = 0; wi < segWords.length; wi++) {
         const w = segWords[wi];
@@ -3462,14 +3508,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         // the base event start time, per animation. All curves are linear \t /
         // \move / \fad so they reproduce the canvas preview's math.
         let baseStart = segStart;
+        let baseStartNum = segStartNum;
         let baseOv = `{\\an5\\pos(${cx},${cy})\\c${base}}`;
         let highOv = `{\\an5\\pos(${cx},${cy})\\c${high}}`;
         if (anim === 'pop') {
           highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx${A.POP_SCALE}\\fscy${fy(A.POP_SCALE)}\\t(0,${A.POP_MS},\\fscx100\\fscy${yScale})}`;
         } else if (anim === 'type') {
-          baseStart = wStart;  // reveal the word at its own time
+          baseStart = wStart; baseStartNum = wStartNum;  // reveal the word at its own time
         } else if (anim === 'rise') {
-          baseStart = wStart;
+          baseStart = wStart; baseStartNum = wStartNum;
           const mv = `\\move(${cx},${cy + A.RISE_OFFSET},${cx},${cy},0,${A.RISE_MS})\\fad(${A.RISE_FADE_MS},0)`;
           baseOv = `{\\an5${mv}\\c${base}}`;
           highOv = `{\\an5${mv}\\c${high}}`;
@@ -3551,7 +3598,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
           highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\3c${neonOutlineAss}\\bord${neonBord}${flick}}`;
         } else if (anim === 'typewriter') {
           // Identical to 'type' for the words — reveal each at its own start time.
-          baseStart = wStart;
+          baseStart = wStart; baseStartNum = wStartNum;
         } else if (anim === 'shake') {
           // 5-stage rotation jitter via chained \t \frz. Each \t interpolates
           // linearly from the prior \frz value to the new one.
@@ -3570,13 +3617,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             `\\t(${D},${D + S},\\fscx${A.BOUNCE_HIT_FSCX}\\fscy${fy(A.BOUNCE_HIT_FSCY)})`,
             `\\t(${D + S},${D + S + T},\\fscx100\\fscy${yScale})`,
           ].join('');
-          baseStart = wStart;
+          baseStart = wStart; baseStartNum = wStartNum;
           baseOv = `{\\an5${mv}\\fscx${A.BOUNCE_FROM_FSCX}\\fscy${fy(A.BOUNCE_FROM_FSCY)}\\fad(80,0)${scales}\\c${base}}`;
           highOv = `{\\an5${mv}\\fscx${A.BOUNCE_FROM_FSCX}\\fscy${fy(A.BOUNCE_FROM_FSCY)}\\fad(80,0)${scales}\\c${high}}`;
         }
 
-        lines.push(`Dialogue: 0,${baseStart},${segEnd},Default,,0,0,0,,${baseOv}${txt}`);
+        // The base (Layer 0) must NOT overlap this word's highlight window — else
+        // the static base shows THROUGH the animated highlight whenever the anim
+        // scales it below 100% (bam), rotates it (shake), blurs it (blurfocus) or
+        // flickers its alpha (neon), looking like a 2nd static subtitle underneath
+        // (the preview draws each word once, so it never doubled). So we emit the
+        // base only BEFORE the highlight (carrying any entrance animation) and a
+        // STATIC rest-base AFTER it — the highlight alone owns [wStart, wEnd].
+        const wEndNum = Math.max(wStartNum + 0.02, Number(w.end) || 0);
+        if (wStartNum > baseStartNum + 0.001) {
+          lines.push(`Dialogue: 0,${baseStart},${wStart},Default,,0,0,0,,${baseOv}${txt}`);
+        }
         lines.push(`Dialogue: 1,${wStart},${wEnd},Default,,0,0,0,,${highOv}${txt}`);
+        if (segEndNum > wEndNum + 0.001) {
+          lines.push(`Dialogue: 0,${wEnd},${segEnd},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})\\c${base}}${txt}`);
+        }
 
         // Typewriter cursor: blinking | sits after each word from word.end until
         // the next word begins (or seg.end for last). Blinks 250 on / 250 off.

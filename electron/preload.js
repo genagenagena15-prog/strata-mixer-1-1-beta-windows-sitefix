@@ -41,6 +41,13 @@ contextBridge.exposeInMainWorld('strata', {
   },
   savePromptResponse: (choice) => ipcRenderer.send('project:save-prompt-response', choice),
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
+  previewProxyPath: (n) => ipcRenderer.invoke('editor:previewProxyPath', n),
+  cancelPreview: () => ipcRenderer.invoke('editor:cancelPreview'),
+  onPreviewProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on('preview-progress', handler);
+    return () => ipcRenderer.removeListener('preview-progress', handler);
+  },
   mergeClips: (payload) => ipcRenderer.invoke('editor:concatClips', payload),
   onMergeProgress: (callback) => {
     const handler = (_event, data) => callback(data);

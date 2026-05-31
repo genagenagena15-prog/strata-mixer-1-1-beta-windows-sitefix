@@ -4,6 +4,9 @@ import { createPortal } from 'react-dom';
 import './styles.css';
 
 const APP_VERSION = 'v1.3.2';
+// Preview backing-resolution scale while PLAYING (full res when paused for a
+// crisp still). 0.5 → ¼ the pixels → ~4× cheaper compositing, no audio glitch.
+const PREVIEW_SCALE = 0.5;
 const DONATE_WALLET = 'TGoUEoM6AjG6KjnXJi9hFYRn54c6HsTybE';
 
 // Volume slider taper: piecewise for fine control at both ends.
@@ -1874,6 +1877,9 @@ function Editor({ state, setState }) {
   // visually without touching the canvas's internal resolution.
   const [previewZoom, setPreviewZoom] = useState(1);
   const [zoomScrubActive, setZoomScrubActive] = useState(false);
+  // Timeline horizontal-zoom scrubber active flag (mirrors the preview's zoom
+  // scrubber UX: hold + drag the value up/down, or wheel over it).
+  const [tlZoomScrubActive, setTlZoomScrubActive] = useState(false);
   // Preview pan: when zoomed past 1×, the user can click-and-drag empty space
   // on the preview to pan around. Layer hit-area pointerDown handlers call
   // stopPropagation, so this only fires on empty preview clicks.
@@ -1932,6 +1938,44 @@ function Editor({ state, setState }) {
   const videoRef = useRef(null);
   const timelineRef = useRef(null);
   const tlScrollRef = useRef(null);
+  // Custom horizontal scrollbar shown ABOVE the tracks (under the toolbar) only
+  // when the timeline is wider than the viewport — i.e. when zoomed in. Native
+  // bottom scrollbar stays; this one is just easier to reach at the top.
+  const [tlBar, setTlBar] = useState({ show: false, w: 100, l: 0 });
+  const updateTlBar = () => {
+    const el = tlScrollRef.current;
+    if (!el) return;
+    const { scrollLeft, scrollWidth, clientWidth } = el;
+    if (scrollWidth <= clientWidth + 1) { setTlBar(b => (b.show ? { show: false, w: 100, l: 0 } : b)); return; }
+    setTlBar({ show: true, w: (clientWidth / scrollWidth) * 100, l: (scrollLeft / scrollWidth) * 100 });
+  };
+  // Drag the thumb → scroll the timeline (the scroll event syncs the thumb back).
+  const onTlBarThumbDown = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const el = tlScrollRef.current; if (!el) return;
+    const track = e.currentTarget.parentElement;
+    const trackW = track ? track.clientWidth : el.clientWidth;
+    const startX = e.clientX;
+    const startScroll = el.scrollLeft;
+    const maxScroll = el.scrollWidth - el.clientWidth;
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      const next = startScroll + (dx / trackW) * el.scrollWidth;
+      el.scrollLeft = Math.max(0, Math.min(maxScroll, next));
+    };
+    const onUp = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+  // Recompute the top scrollbar when the zoom changes (inner width = zoom×100%)
+  // or the window resizes (viewport width changes). The onScroll handler keeps
+  // it in sync during normal scrolling.
+  useEffect(() => {
+    const id = requestAnimationFrame(updateTlBar);
+    window.addEventListener('resize', updateTlBar);
+    return () => { cancelAnimationFrame(id); window.removeEventListener('resize', updateTlBar); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoom]);
   const canvasRef = useRef(null);
   const previewCanvasRef = useRef(null);
   // Fullscreen preview: a second canvas painted by the same render loop, shown
@@ -1940,6 +1984,11 @@ function Editor({ state, setState }) {
   const fsCanvasRef = useRef(null);
   const fsOverlayRef = useRef(null);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
+  // "Buffered" ranges (YouTube-style): time spans that have actually PLAYED /
+  // rendered since the last edit. Shown as a faint orange bar on the scrubber so
+  // the user sees where the preview is already prepared. Reset on any edit.
+  // (Becomes true instant-replay ranges once the frame-cache lands — Stage 2.)
+  const [buffered, setBuffered] = useState([]);
   const videoOverlayRefs = useRef({});
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
@@ -1990,8 +2039,24 @@ function Editor({ state, setState }) {
   const renderFrameRef = useRef(null);
   const subtitleLayoutsRef = useRef(new Map());
   const rafRef = useRef(null);
+  // Render-on-demand state: the canvas loop runs ONLY while playing or for a
+  // short burst after a change, then stops — no constant idle/editing redraw.
+  const renderUntilRef = useRef(0);
+  const loopRunningRef = useRef(false);
+  const playingRef = useRef(false);
+  const drawScaleRef = useRef(1);   // current preview backing scale (1 = full / paused)
+  // Background preview-proxy (YouTube-style buffer): a low-res render of the
+  // whole timeline via the export pipeline. exportingRef pauses it during a real
+  // export; token bumps on every edit to invalidate a stale render.
+  const exportingRef = useRef(false);
+  const proxyRunningRef = useRef(false);
+  const proxyTokenRef = useRef(0);
+  const proxyDoneTokenRef = useRef(-1);
   const measureCanvasRef = useRef(null);
   const blurTmpRef = useRef(null);
+  // Holds the full composite (base + overlays) captured at the first clipping
+  // mask each frame, so every mask reveals it inside its shape (union of holes).
+  const maskFullRef = useRef(null);
   const selAnchorRef = useRef(null);
   const layerDragRef = useRef(null);
   // Timestamp (ms) of the last clip drag that actually moved, so the click event
@@ -2206,7 +2271,7 @@ function Editor({ state, setState }) {
 
   async function addImageOverlay() {
     const f = await window.strata?.pickImage?.();
-    if (f) addLayer({ id: Date.now(), type: 'image', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 30, opacity: 100 });
+    if (f) addLayer({ id: Date.now(), type: 'image', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 100, opacity: 100, fitCover: true });
   }
   function addBlurRegion() {
     addLayer({ id: Date.now(), type: 'blur', startTime: 0, endTime: Math.min(3, dur), x: 25, y: 25, width: 50, height: 30, strength: 15 });
@@ -2511,7 +2576,7 @@ function Editor({ state, setState }) {
     const probed = await probeMediaDuration(f);
     const dur0 = probed > 0.1 ? probed : dur;
     if (probed > totalDuration) set('totalDuration', probed);
-    addLayer({ id, type: 'videoOverlay', file: f, startTime: 0, endTime: dur0, srcDuration: probed > 0 ? probed : undefined, x: 50, y: 50, size: 40 });
+    addLayer({ id, type: 'videoOverlay', file: f, startTime: 0, endTime: dur0, srcDuration: probed > 0 ? probed : undefined, x: 50, y: 50, size: 100 });
     ensureProxy(id, f);
   }
   async function addAudioFile() {
@@ -2568,10 +2633,12 @@ function Editor({ state, setState }) {
       const s = skeletons[i];
       const realDur = probed[i] > 0.1 ? probed[i] : newTotal;
       if (s.kind === 'video') {
-        const hasVid = layers.some((l) => l.type === 'videoOverlay') || added.some((l) => l.type === 'videoOverlay');
-        added.push({ id: uid(), type: 'videoOverlay', file: s.path, startTime: 0, endTime: realDur, srcDuration: probed[i] || undefined, x: 50, y: 50, size: hasVid ? 40 : 100 });
+        // Every imported video fills the project frame by default (size 100 =
+        // full canvas width), just like the very first/main video — not a small
+        // 40% picture-in-picture. The user resizes down if they want an overlay.
+        added.push({ id: uid(), type: 'videoOverlay', file: s.path, startTime: 0, endTime: realDur, srcDuration: probed[i] || undefined, x: 50, y: 50, size: 100, fitCover: true });
       } else if (s.kind === 'image') {
-        added.push({ id: uid(), type: 'image', file: s.path, startTime: 0, endTime: newTotal, x: 50, y: 50, size: 30, opacity: 100 });
+        added.push({ id: uid(), type: 'image', file: s.path, startTime: 0, endTime: newTotal, x: 50, y: 50, size: 100, opacity: 100, fitCover: true });
       } else if (s.kind === 'audio') {
         added.push({ id: uid(), type: 'audio', file: s.path, startTime: 0, endTime: realDur, srcDuration: probed[i] || undefined, volume: 100 });
       }
@@ -2956,6 +3023,19 @@ function Editor({ state, setState }) {
     layers.forEach(l => {
       if (l.type !== 'image' || !l.file || imgCacheRef.current.has(l.file)) return;
       const img = new Image();
+      // When freshly imported, scale the image to COVER the whole preview frame
+      // (touch all four borders, crop the overflow) — like "fill screen" in
+      // other editors. Runs once: clears fitCover so later user resizes stick.
+      img.onload = () => {
+        const nAR = (img.naturalWidth && img.naturalHeight) ? img.naturalWidth / img.naturalHeight : null;
+        if (!nAR) return;
+        setState((s) => ({ ...s, layers: s.layers.map(x => {
+          if (x.id !== l.id || !x.fitCover) return x;
+          const frameAR = s.outWidth / s.outHeight;
+          const coverSize = 100 * Math.max(1, nAR / frameAR);
+          return { ...x, aspect: nAR, size: coverSize, x: 50, y: 50, fitCover: false };
+        }) }));
+      };
       img.src = fileUrl(l.file);
       imgCacheRef.current.set(l.file, img);
     });
@@ -3044,29 +3124,88 @@ function Editor({ state, setState }) {
     // the un-trimmed frame.
   }, [currentTime, playing, layers]);
 
-  // RAF loop for canvas preview — runs always. We can't stop it on pause
-  // because <video>.currentTime is set asynchronously (seek), and the new
-  // frame is decoded slightly later. Painting only once at state-change time
-  // captures the OLD frame; the loop keeps repainting so the new frame shows
-  // as soon as the decoder lands it.
-  useEffect(() => {
-    let running = true, last = 0;
+  // ⏳ WIP — PREVIEW PERF REWRITE (Stage 1a of N). Stage 1b = LOW-RES preview
+  // while moving is NOT done yet (full plan + constraints in memory
+  // project_strata_codemap.md → "ACTIVE WORK"). Hard rule: NO draft mode, preview
+  // must equal export, crisp full-res frame on pause.
+  //
+  // RENDER ON DEMAND. The old loop repainted the full-res canvas ~30×/sec
+  // FOREVER (even idle/paused) — that constant recomposite of every layer was
+  // the main source of lag + audio dropouts on heavy projects. Now the loop runs
+  // ONLY while playing, or for a short BURST after any change (so the async-
+  // decoded <video> frame after a seek/edit still lands on the canvas), then it
+  // STOPS. Idle = zero work.
+  const nowMs = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+  const paintOnce = () => {
+    const draw = renderFrameRef.current;
+    if (!draw) return;
+    const canvas = previewCanvasRef.current;
+    if (canvas) draw(canvas.getContext('2d'));
+    const fs = fsCanvasRef.current;   // fullscreen mirror, when open
+    if (fs) draw(fs.getContext('2d'));
+  };
+  const ensureRenderLoop = () => {
+    if (loopRunningRef.current) return;
+    loopRunningRef.current = true;
+    let last = 0;
     const tick = (ts) => {
-      if (!running) return;
+      // Low-res while playing (smooth), full-res otherwise (crisp scrub/pause).
+      drawScaleRef.current = playingRef.current ? PREVIEW_SCALE : 1;
+      // Keep going while playing OR within the post-change burst window.
+      if (!playingRef.current && nowMs() > renderUntilRef.current) {
+        paintOnce();                  // one last settle paint (full res), then stop
+        loopRunningRef.current = false;
+        return;
+      }
       rafRef.current = requestAnimationFrame(tick);
       if (ts - last < 33) return;
       last = ts;
-      const draw = renderFrameRef.current;
-      if (!draw) return;
-      const canvas = previewCanvasRef.current;
-      if (canvas) draw(canvas.getContext('2d'));
-      // Paint the fullscreen mirror with the same frame when it's open.
-      const fs = fsCanvasRef.current;
-      if (fs) draw(fs.getContext('2d'));
+      paintOnce();
     };
     rafRef.current = requestAnimationFrame(tick);
-    return () => { running = false; cancelAnimationFrame(rafRef.current); };
-  }, []);
+  };
+  const kickRender = (ms = 650) => {
+    renderUntilRef.current = Math.max(renderUntilRef.current, nowMs() + ms);
+    ensureRenderLoop();
+  };
+  // Repaint whenever the visible frame can change (scrub, edit, bg, canvas size,
+  // font load). During playback the loop self-sustains via playingRef.
+  useEffect(() => {
+    kickRender();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime, layers, bgColor, outWidth, outHeight, videoStart, videoEnd, fontRevision, previewFullscreen]);
+  // Play/pause: start the loop (play → runs continuously; pause → one final
+  // settle paint, then stops).
+  useEffect(() => {
+    playingRef.current = playing;
+    kickRender();
+    return () => { /* loop self-stops; nothing to cancel here */ };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing]);
+  // Stop the loop on unmount.
+  useEffect(() => () => { loopRunningRef.current = false; cancelAnimationFrame(rafRef.current); }, []);
+
+  // An edit invalidates the prepared buffer: bump the token (so a stale render's
+  // progress stops touching the bar), clear the bar, and kill the running proxy.
+  useEffect(() => {
+    proxyTokenRef.current++;
+    proxyDoneTokenRef.current = -1;
+    setBuffered([]);
+    window.strata?.cancelPreview?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layers, totalDuration, outWidth, outHeight, bgColor]);
+  // Pressing Play kicks the background buffer render. It runs to completion even
+  // if the user pauses → the bar keeps filling ahead (YouTube-style).
+  useEffect(() => {
+    if (playing) buildPreviewProxy();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing]);
+  // Faint-orange "already rendered" segments drawn behind the bright progress
+  // fill on the scrubber (shared by the normal + fullscreen playback bars).
+  const renderBuffered = () => buffered.map((iv, i) => (
+    <div key={i} className="ed-scrub-buffered"
+      style={{ left: pct(iv.s), width: `${Math.max(0, Math.min(100, ((iv.e - iv.s) / dur) * 100))}%` }} />
+  ));
 
   // Drive real OS fullscreen from the previewFullscreen state. Entering asks
   // the overlay element to go fullscreen; exiting (button or browser ESC) drops
@@ -3395,14 +3534,22 @@ function Editor({ state, setState }) {
       // the opposite edge mirrors (Δ subtracted) — so total dimension changes
       // by 2Δ and the centre stays put.
       const startCx = (L.x / 100) * W, startCy = (L.y / 100) * H;
+      // Start edges of the box — the OPPOSITE edge stays anchored while the
+      // dragged handle moves, like every other editor. (Only the grabbed
+      // corner/side travels; the far corner is pinned.)
+      const boxL = box.x, boxR = box.x + box.w, boxT = box.y, boxB = box.y + box.h;
+      // Given a final size, place the centre so the anchored (opposite) edge
+      // stays put. No horizontal/vertical handle → that axis stays centred.
+      const anchorCx = (nw) => hsign > 0 ? boxL + nw / 2 : hsign < 0 ? boxR - nw / 2 : startCx;
+      const anchorCy = (nh) => vsign > 0 ? boxT + nh / 2 : vsign < 0 ? boxB - nh / 2 : startCy;
       const move = (ev) => {
         const dxPx = ((ev.clientX - sx) / r.width) * W;
         const dyPx = ((ev.clientY - sy) / r.height) * H;
         const keepAspect = ev.shiftKey;
         if (L.type === 'blur' || L.type === 'mask' || L.type === 'maskedVideo') {
           let nw = startW, nh = startH;
-          if (hsign) nw = Math.max(0.05 * W, startW + dxPx * hsign * 2);
-          if (vsign) nh = Math.max(0.05 * H, startH + dyPx * vsign * 2);
+          if (hsign) nw = Math.max(0.05 * W, startW + dxPx * hsign);
+          if (vsign) nh = Math.max(0.05 * H, startH + dyPx * vsign);
           if (keepAspect && isCorner) {
             const ratio = startW / startH;
             if (Math.abs(nw / startW - 1) > Math.abs(nh / startH - 1)) nh = nw / ratio;
@@ -3412,10 +3559,11 @@ function Editor({ state, setState }) {
           // can extend past the frame for big-cropout effects). Blur stays
           // capped at canvas size.
           const maxPct = L.type === 'blur' ? 100 : 300;
+          const cx = anchorCx(nw), cy = anchorCy(nh);
           set('layers', (ls) => ls.map(x => x.id === id ? { ...x,
             width: Math.max(5, Math.min(maxPct, nw / W * 100)),
             height: Math.max(5, Math.min(maxPct, nh / H * 100)),
-            x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
+            x: clamp(cx / W * 100, 0, 100), y: clamp(cy / H * 100, 0, 100) } : x));
           return;
         }
         if (L.type === 'text') {
@@ -3428,26 +3576,52 @@ function Editor({ state, setState }) {
             x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
           return;
         }
-        // media layers: image / mainVideo / videoOverlay
+        // media layers: image / mainVideo / videoOverlay.
+        // Only the grabbed handle travels — the opposite corner/side is pinned.
         let nw, nh;
         if (isCorner) {
-          nw = Math.max(0.03 * W, startW + dxPx * hsign * 2);
-          nh = Math.max(0.03 * H, startH + dyPx * vsign * 2);
+          nw = Math.max(0.03 * W, startW + dxPx * hsign);
+          nh = Math.max(0.03 * H, startH + dyPx * vsign);
           if (keepAspect) {
             const s = Math.max(nw / startW, nh / startH);
             nw = startW * s; nh = startH * s;
           }
         } else if (hsign) {
-          nw = Math.max(0.03 * W, startW + dxPx * hsign * 2);
+          nw = Math.max(0.03 * W, startW + dxPx * hsign);
           nh = nw * (startH / startW);
         } else {
-          nh = Math.max(0.03 * H, startH + dyPx * vsign * 2);
+          nh = Math.max(0.03 * H, startH + dyPx * vsign);
           nw = nh * (startW / startH);
+        }
+        const lockAspect = keepAspect || !isCorner;
+        // Edge-snap: when the dragged edge lands near a frame border (0 / W / H),
+        // stick to it flush — like Premiere/Photoshop. Threshold ≈ 3% of canvas.
+        // Since the opposite edge is pinned, we snap the size that lands the
+        // moving edge exactly on the border. With aspect locked we apply the
+        // closer of the two snaps as a uniform scale.
+        const TW = 0.03 * W, THh = 0.03 * H;
+        let snapW = null, snapH = null;
+        if (hsign > 0)      { if (Math.abs(boxL + nw - W) < TW) snapW = W - boxL; }
+        else if (hsign < 0) { if (Math.abs(boxR - nw) < TW)     snapW = boxR; }
+        if (vsign > 0)      { if (Math.abs(boxT + nh - H) < THh) snapH = H - boxT; }
+        else if (vsign < 0) { if (Math.abs(boxB - nh) < THh)     snapH = boxB; }
+        if (lockAspect) {
+          const cands = [];
+          if (snapW != null) cands.push(snapW / nw);
+          if (snapH != null) cands.push(snapH / nh);
+          if (cands.length) {
+            const s = cands.reduce((a, b) => Math.abs(b - 1) < Math.abs(a - 1) ? b : a);
+            nw *= s; nh *= s;
+          }
+        } else {
+          if (snapW != null) nw = snapW;
+          if (snapH != null) nh = snapH;
         }
         const nsize = Math.max(3, Math.min(400, nw / W * 100));
         const naspect = nw / nh;
+        const cx = anchorCx(nw), cy = anchorCy(nh);
         set('layers', (ls) => ls.map(x => x.id === id ? { ...x, size: nsize, aspect: naspect,
-          x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
+          x: clamp(cx / W * 100, 0, 100), y: clamp(cy / H * 100, 0, 100) } : x));
       };
       const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
       window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
@@ -3816,33 +3990,60 @@ function Editor({ state, setState }) {
     window.addEventListener('pointerup', up);
   }
 
-  async function saveAs(fmt, qual) {
-    const ext = fmt === 'mp3' ? 'mp3' : fmt === 'webm' ? 'webm' : 'mp4';
-    // The bottom-most video layer is the export base; every other layer is an overlay.
-    // For audio-only projects (no video at all), fall back to the first audio
-    // layer as input 0 so ffmpeg has a real source to read from.
+  // Determine the export "base" (input 0) the same way for export AND the
+  // background preview-proxy, so the proxy renders the EXACT same composition.
+  function computeExportBase() {
     const vids = layers.filter(l => l.type === 'videoOverlay' && !l.hidden);
     const auds = layers.filter(l => l.type === 'audio' && !l.hidden);
-    // Promote the bottom-most videoOverlay to "base" ONLY when it is actually
-    // the bottom-most VISIBLE layer in z-order. If something else (e.g., an
-    // image background) sits lower in the stack, EVERY visual layer must go
-    // through the overlay chain — otherwise the lower image would get
-    // composited ON TOP of the video, ignoring z-order.
     const visibleVisuals = layers.filter(l => !l.hidden && (l.type === 'videoOverlay' || l.type === 'image' || l.type === 'maskedVideo'));
     const bottomVisual = visibleVisuals[0];
     const baseVid = (bottomVisual && bottomVisual.type === 'videoOverlay') ? bottomVisual : null;
     const baseAud = (!baseVid && !bottomVisual && auds.length > 0) ? auds[0] : null;
-    // Still need SOME file at input [0] for ffmpeg. When the bottom-most layer
-    // is an image, fall back to the bottom-most video file (its [0:v]/[0:a]
-    // are ignored by the renderer since mainVideo is null — the file is also
-    // listed in `layers`, so its frames and audio still play in correct order).
     const baseFile = baseVid?.file || baseAud?.file || vids[0]?.file || file || null;
+    return { vids, auds, baseVid, baseAud, baseFile };
+  }
+  // Build the exact payload video:edit consumes. Overrides let the preview-proxy
+  // reuse it at low res / temp path / preview channel — guaranteeing preview=output.
+  function buildEditPayload({ outWidth: ow, outHeight: oh, outPath, format, quality, custom, preview }) {
+    const { baseVid, baseAud, baseFile } = computeExportBase();
+    if (!baseFile) return null;
+    const baseAudioPayload = baseAud ? {
+      srcStart: baseAud.srcStart || 0,
+      length: Math.max(0.01, (baseAud.endTime ?? totalDuration) - (baseAud.startTime || 0)),
+      startTime: baseAud.startTime || 0,
+      volume: baseAud.volume ?? 100,
+      muted: !!baseAud.muted,
+    } : null;
+    const hasAudioType = (l) => l.type === 'videoOverlay' || l.type === 'maskedVideo' || l.type === 'audio';
+    return {
+      file: baseFile,
+      videoStart: baseVid ? (baseVid.startTime || 0) : baseAud ? (baseAud.startTime || 0) : (videoStart || 0),
+      videoEnd: baseVid ? (baseVid.endTime ?? totalDuration) : baseAud ? (baseAud.endTime ?? totalDuration) : (videoEnd || totalDuration),
+      totalDuration,
+      mainVideo: baseVid ? { ...baseVid, type: 'mainVideo' } : (layers.find(l => l.type === 'mainVideo') || null),
+      baseAudio: baseAudioPayload,
+      baseAudioMuted: !!(baseAud && baseAud.muted),
+      layers: layers
+        .filter(l => l !== baseVid && l !== baseAud && l.type !== 'mainVideo' && !(l.hidden && !hasAudioType(l)))
+        .map(l => l.type === 'subtitles'
+          ? { ...l, _layout: subtitleLayoutsRef.current.get(l.id) || buildSubtitleLayout(l) }
+          : l),
+      outWidth: ow, outHeight: oh, bgColor, fadeIn, fadeOut, outPath,
+      format, quality, custom, preview: !!preview,
+    };
+  }
+  async function saveAs(fmt, qual) {
+    const ext = fmt === 'mp3' ? 'mp3' : fmt === 'webm' ? 'webm' : 'mp4';
+    const { baseFile } = computeExportBase();
     if (!baseFile) { alert('Нет ни одного видео или аудио для сохранения.'); return; }
     const outPath = await window.strata?.pickSaveAs?.(fileName(baseFile || '').replace(/\.[^.]+$/, '') + `_edit.${ext}`, fmt);
     if (!outPath) return;
     setSaveDialogOpen(false);
     setSaveFinishing(false);
     setSaveProgress(0);
+    exportingRef.current = true;   // pause the preview-proxy buffer during export
+    proxyTokenRef.current++;       // invalidate + kill any running proxy first
+    try { window.strata?.cancelPreview?.(); } catch {}
     const off = window.strata?.onEditProgress?.((d) => {
       if (d.done) {
         // Render finished — keep the modal open to play the «finish» clip once.
@@ -3852,45 +4053,61 @@ function Editor({ state, setState }) {
         setSaveProgress(Math.round(d.percent || 0));
       }
     });
-    // When the base file IS an audio layer (audio-only project), give the
-    // backend the real source/timeline split so trimming works — otherwise it
-    // dumps the whole original file ignoring atrim.
-    const baseAudioPayload = baseAud ? {
-      srcStart: baseAud.srcStart || 0,
-      length: Math.max(0.01, (baseAud.endTime ?? totalDuration) - (baseAud.startTime || 0)),
-      startTime: baseAud.startTime || 0,
-      volume: baseAud.volume ?? 100,
-      muted: !!baseAud.muted,
-    } : null;
-    // Independent visual/audio: a layer hidden by the eye still contributes
-    // AUDIO; a layer muted by the speaker still contributes VIDEO. main.js is the
-    // authority (skips hidden visuals, drops muted audio). So we must SEND hidden
-    // layers that have audio (video/audio types) — only hidden layers with NO
-    // audio (image/text/subtitle/blur/mask) are dropped here to keep the graph lean.
-    const hasAudioType = (l) => l.type === 'videoOverlay' || l.type === 'maskedVideo' || l.type === 'audio';
-    const result = await window.strata?.editVideo?.({
-      file: baseFile,
-      videoStart: baseVid ? (baseVid.startTime || 0) : baseAud ? (baseAud.startTime || 0) : (videoStart || 0),
-      videoEnd: baseVid ? (baseVid.endTime ?? totalDuration) : baseAud ? (baseAud.endTime ?? totalDuration) : (videoEnd || totalDuration),
-      totalDuration,
-      mainVideo: baseVid ? { ...baseVid, type: 'mainVideo' } : (layers.find(l => l.type === 'mainVideo') || null),
-      baseAudio: baseAudioPayload,
-      baseAudioMuted: !!(baseAud && baseAud.muted),
-      // Exclude whichever layer became input 0 so it isn't doubled. Attach the
-      // pre-computed absolute layout to subtitle layers so the export burns them
-      // in at the exact preview positions.
-      layers: layers
-        .filter(l => l !== baseVid && l !== baseAud && l.type !== 'mainVideo' && !(l.hidden && !hasAudioType(l)))
-        // Reuse the EXACT layout the preview drew from (single source of truth) —
-        // recompute only as a fallback if the cache somehow missed this layer.
-        .map(l => l.type === 'subtitles'
-          ? { ...l, _layout: subtitleLayoutsRef.current.get(l.id) || buildSubtitleLayout(l) }
-          : l),
-      outWidth, outHeight, bgColor, fadeIn, fadeOut, outPath,
-      format: fmt, quality: qual, custom: saveCustom
-    });
+    const result = await window.strata?.editVideo?.(
+      buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
+    );
+    exportingRef.current = false;
     if (result && !result.ok) { setSaveProgress(null); setSaveFinishing(false); alert('Ошибка: ' + result.error); }
     else if (result?.ok) window.strata?.revealFile?.(outPath);
+  }
+
+  // Background "buffer": render the whole timeline to a LOW-RES temp mp4 via the
+  // SAME export pipeline (so it equals the output), streaming ffmpeg progress to
+  // the buffered bar. Runs to completion regardless of play/pause → the bar fills
+  // ahead while paused (YouTube-style). Invalidated (token bump) on any edit.
+  async function buildPreviewProxy() {
+    if (proxyRunningRef.current || exportingRef.current) return;
+    const token = proxyTokenRef.current;
+    if (proxyDoneTokenRef.current === token) return;   // this exact state already buffered
+    const { baseFile } = computeExportBase();
+    if (!baseFile) return;
+    const longSide = Math.max(outWidth, outHeight) || 1;
+    const sc = Math.min(1, 480 / longSide);            // cap long side ≈480px
+    const pw = Math.max(2, Math.round(outWidth * sc / 2) * 2);
+    const ph = Math.max(2, Math.round(outHeight * sc / 2) * 2);
+    // Buffer AHEAD of the playhead first (the part about to be watched), then
+    // fill the start — exactly like YouTube.
+    const T = Math.max(0, Math.min(dur, currentTime));
+    const segs = (T > 0.2 && T < dur - 0.2)
+      ? [{ start: T, end: dur }, { start: 0, end: T }]
+      : [{ start: 0, end: dur }];
+    proxyRunningRef.current = true;
+    const done = [];   // intervals fully rendered so far
+    const off = window.strata?.onPreviewProgress?.((d) => {
+      if (proxyTokenRef.current !== token) return;     // stale — user edited
+      const seg = segs[Math.min(done.length, segs.length - 1)];
+      const pct = d.done ? 100 : (d.percent || 0);
+      const e = seg.start + (pct / 100) * (seg.end - seg.start);
+      setBuffered([...done, { s: seg.start, e }]);
+    });
+    try {
+      for (let i = 0; i < segs.length; i++) {
+        if (proxyTokenRef.current !== token) break;
+        const seg = segs[i];
+        let outPath;
+        try { outPath = await window.strata?.previewProxyPath?.(token * 4 + i); } catch { break; }
+        if (!outPath) break;
+        const payload = buildEditPayload({ outWidth: pw, outHeight: ph, outPath, format: 'mp4', quality: 'fast', custom: {}, preview: true });
+        if (!payload) break;
+        payload.previewRange = { start: seg.start, end: seg.end };
+        await window.strata?.editVideo?.(payload);
+        done.push({ s: seg.start, e: seg.end });
+        if (proxyTokenRef.current === token) setBuffered([...done]);
+      }
+    } catch {}
+    off?.();
+    proxyRunningRef.current = false;
+    if (proxyTokenRef.current === token) proxyDoneTokenRef.current = token;  // fully buffered
   }
 
   const sel = selectedId ? layers.find(l => l.id === selectedId) : null;
@@ -3947,6 +4164,15 @@ function Editor({ state, setState }) {
       return `Субтитры (${n})`;
     }
     return compactName(fileName(l.file || ''), 9) + rev;
+  }
+  // Full, untruncated label for the hover tooltip on the timeline. File-based
+  // layers show the complete file name; the rest reuse the short descriptive
+  // label (it isn't truncated anyway).
+  function lFull(l) {
+    const rev = l.reversed ? ' ↺' : '';
+    if (l.file) return fileName(l.file) + rev;
+    if (l.type === 'text') return l.text || 'Текст';
+    return lName(l);
   }
 
   function measureCtx() {
@@ -4101,12 +4327,28 @@ function Editor({ state, setState }) {
   }, [subtitleLayoutSig]);
   useEffect(() => { subtitleLayoutsRef.current = subtitleLayouts; }, [subtitleLayouts]);
 
+  // Keep the render loop's playing flag current synchronously (effects run after
+  // paint; the RAF tick must see the latest value the same frame).
+  playingRef.current = playing;
   renderFrameRef.current = (ctx) => {
     const W = outWidth, H = outHeight;
-    if (ctx.canvas.width !== W || ctx.canvas.height !== H) { ctx.canvas.width = W; ctx.canvas.height = H; }
+    // LOW-RES PREVIEW: the canvas BACKING is W·S × H·S (S<1 while playing), and a
+    // setTransform(S) maps the unchanged full-res [0,W]×[0,H] draw coords into it.
+    // CSS upscales to display size; export is untouched (full res). Only the few
+    // spots that snapshot the canvas onto itself (blur/mask/transition scratch
+    // canvases) need to know S — everything else draws in full-res coords.
+    const S = Math.max(0.1, Math.min(1, drawScaleRef.current || 1));
+    const bw = Math.max(2, Math.round(W * S)), bh = Math.max(2, Math.round(H * S));
+    if (ctx.canvas.width !== bw || ctx.canvas.height !== bh) { ctx.canvas.width = bw; ctx.canvas.height = bh; }
+    ctx.setTransform(S, 0, 0, S, 0, 0);
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = bgColor || '#000000';
     ctx.fillRect(0, 0, W, H);
+    // Clipping-mask state for this frame: the first mask captures the full
+    // composite (base + overlays) and resets the canvas to the pristine base;
+    // every mask then stamps that composite inside its shape → union of holes.
+    let maskInitDone = false;
+    let maskVFull = null;
     for (const layer of layers) {
       if (layer.hidden) continue;
       if (layer.type === 'mainVideo') {
@@ -4145,7 +4387,7 @@ function Editor({ state, setState }) {
           if (tmp.height !== ch) tmp.height = ch;
           const tctx = tmp.getContext('2d');
           tctx.clearRect(0, 0, cw, ch);
-          try { tctx.drawImage(ctx.canvas, cx0, cy0, cw, ch, 0, 0, cw, ch); } catch(e) {}
+          try { tctx.drawImage(ctx.canvas, cx0 * S, cy0 * S, cw * S, ch * S, 0, 0, cw, ch); } catch(e) {}
           ctx.save();
           ctx.beginPath(); ctx.rect(b.x, b.y, b.w, b.h); ctx.clip();
           ctx.filter = `blur(${strength}px)`;
@@ -4156,35 +4398,41 @@ function Editor({ state, setState }) {
       } else if (layer.type === 'mask') {
         // Clipping mask (cookie-cutter): inside the shape we keep the full
         // composition; OUTSIDE the shape we fall back to the main video base
-        // (the lower layer), NOT a flat bgColor hole. This matches the ffmpeg
-        // export, which composites the clipped stream over the pristine
-        // mainVideo split. So a circle mask over an overlay reads as "the
-        // overlay is cut to the circle, the base video keeps playing around it".
+        // (the lower layer), NOT a flat bgColor hole. Multiple masks UNION —
+        // each cuts its own hole — so the FIRST active mask captures the full
+        // composite and resets the canvas to the pristine base, then every
+        // active mask stamps that composite inside its own shape. (The old code
+        // re-derived the base per mask, so the 2nd mask erased the 1st's hole —
+        // matching the export bug that dropped a mask on render.)
         const b = getLayerPx(layer);
         const r = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
-        // 1) Snapshot the current composition (everything below the mask).
-        const tmp = blurTmpRef.current || (blurTmpRef.current = document.createElement('canvas'));
-        if (tmp.width !== W) tmp.width = W;
-        if (tmp.height !== H) tmp.height = H;
-        const tctx = tmp.getContext('2d');
-        tctx.clearRect(0, 0, W, H);
-        try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-        // 2) Rebuild the OUTSIDE-shape backdrop = bgColor + the main video base
-        //    only (the lower layer), so masked overlays read as cookie-cut over
-        //    the underlying video instead of over a black hole.
-        ctx.save();
-        ctx.fillStyle = bgColor || '#000000';
-        ctx.fillRect(0, 0, W, H);
-        const mv = layers.find(l => l.type === 'mainVideo');
-        if (mv && currentTime >= videoStart && currentTime <= videoEnd) {
-          const vid = mv.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current;
-          if (vid && vid.readyState >= 2) {
-            const mb = getLayerPx(mv);
-            try { ctx.drawImage(vid, mb.x, mb.y, mb.w, mb.h); } catch(e) {}
+        if (!maskInitDone) {
+          // 1) Capture the full composite (base + every overlay below the masks).
+          const vf = maskFullRef.current || (maskFullRef.current = document.createElement('canvas'));
+          if (vf.width !== bw) vf.width = bw;
+          if (vf.height !== bh) vf.height = bh;
+          const vfx = vf.getContext('2d');
+          vfx.setTransform(1, 0, 0, 1, 0, 0);
+          vfx.clearRect(0, 0, bw, bh);
+          try { vfx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          maskVFull = vf;
+          // 2) Reset the canvas to the pristine base = bgColor + the main video
+          //    only (mirrors the export's [vmaskBase] = pristine [vscaled]).
+          ctx.save();
+          ctx.fillStyle = bgColor || '#000000';
+          ctx.fillRect(0, 0, W, H);
+          const mv = layers.find(l => l.type === 'mainVideo');
+          if (mv && !mv.hidden && currentTime >= videoStart && currentTime <= videoEnd) {
+            const vid = mv.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current;
+            if (vid && vid.readyState >= 2) {
+              const mb = getLayerPx(mv);
+              try { ctx.drawImage(vid, mb.x, mb.y, mb.w, mb.h); } catch(e) {}
+            }
           }
+          ctx.restore();
+          maskInitDone = true;
         }
-        ctx.restore();
-        // 3) Re-draw the full composition clipped by the shape on top.
+        // 3) Stamp the captured composite inside THIS mask's shape (union).
         ctx.save();
         ctx.beginPath();
         if (layer.shape === 'circle') {
@@ -4205,7 +4453,7 @@ function Editor({ state, setState }) {
           ctx.rect(b.x, b.y, b.w, b.h);
         }
         ctx.clip();
-        try { ctx.drawImage(tmp, 0, 0); } catch(e) {}
+        if (maskVFull) { try { ctx.drawImage(maskVFull, 0, 0, W, H); } catch(e) {} }
         ctx.restore();
       } else if (layer.type === 'text') {
         const fs = layer.size || 48;
@@ -4483,11 +4731,13 @@ function Editor({ state, setState }) {
         // Triangle ramp 0 → 1 (mid) → 0; sine version is smoother.
         const peak = Math.sin(tProg * Math.PI);
 
-        // Reusable snapshot canvas (already used by other layers).
+        // Reusable snapshot canvas (already used by other layers). Sized to the
+        // BACKING (bw×bh) so the self-snapshot is 1:1; draw-backs use ,W,H dest.
         const tmp = blurTmpRef.current || (blurTmpRef.current = document.createElement('canvas'));
-        if (tmp.width !== W) tmp.width = W;
-        if (tmp.height !== H) tmp.height = H;
+        if (tmp.width !== bw) tmp.width = bw;
+        if (tmp.height !== bh) tmp.height = bh;
         const tctx = tmp.getContext('2d');
+        tctx.setTransform(1, 0, 0, 1, 0, 0);
 
         if (kind === 'shake') {
           // Shake + white flash combo (original).
@@ -4499,7 +4749,7 @@ function Editor({ state, setState }) {
           try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
           ctx.fillStyle = bgColor || '#000000';
           ctx.fillRect(0, 0, W, H);
-          try { ctx.drawImage(tmp, ox, oy); } catch(e) {}
+          try { ctx.drawImage(tmp, ox, oy, W, H); } catch(e) {}
           const flashMax = layer.flash ?? 0.85;
           let alpha;
           if (tProg < 0.15) alpha = (tProg / 0.15) * flashMax;
@@ -4525,7 +4775,7 @@ function Editor({ state, setState }) {
           ctx.fillRect(0, 0, W, H);
           ctx.save();
           if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
-          try { ctx.drawImage(tmp, xOff, 0); } catch(e) {}
+          try { ctx.drawImage(tmp, xOff, 0, W, H); } catch(e) {}
           ctx.restore();
         } else if (kind === 'zoom') {
           // Zoom punch — up to 300%, with blur ramping with scale.
@@ -4553,7 +4803,7 @@ function Editor({ state, setState }) {
             ctx.clearRect(0, 0, W, H);
             ctx.save();
             ctx.filter = `blur(${blurNow}px)`;
-            try { ctx.drawImage(tmp, 0, 0); } catch(e) {}
+            try { ctx.drawImage(tmp, 0, 0, W, H); } catch(e) {}
             ctx.restore();
           }
         } else if (kind === 'seamzoom') {
@@ -4611,10 +4861,11 @@ function Editor({ state, setState }) {
         const zfactor = 1 + (Math.max(0, layer.strength || 0) / 100) * ztri;
         if (zfactor > 1.001) {
           const tmp = zoomTmpRef.current || (zoomTmpRef.current = document.createElement('canvas'));
-          if (tmp.width !== W) tmp.width = W;
-          if (tmp.height !== H) tmp.height = H;
+          if (tmp.width !== bw) tmp.width = bw;
+          if (tmp.height !== bh) tmp.height = bh;
           const tctx = tmp.getContext('2d');
-          tctx.clearRect(0, 0, W, H);
+          tctx.setTransform(1, 0, 0, 1, 0, 0);
+          tctx.clearRect(0, 0, bw, bh);
           try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
           ctx.clearRect(0, 0, W, H);
           const dw = W * zfactor, dh = H * zfactor;
@@ -4967,17 +5218,29 @@ function Editor({ state, setState }) {
               }}
               onLoadedMetadata={(e) => {
                 const d = e.target.duration;
+                const vw = e.target.videoWidth, vh = e.target.videoHeight;
+                const nAR = (vw && vh) ? vw / vh : null;
                 if (!(d > 0)) return;
                 setState((s) => {
                   const next = { ...s };
                   const autoFit = Math.abs(s.totalDuration - 10) < 0.01;
                   if (autoFit) next.totalDuration = d;
+                  const frameAR = s.outWidth / s.outHeight;
                   next.layers = s.layers.map((lay) => {
                     if (lay.id !== l.id) return lay;
                     const srcDur = lay.srcDuration || d;
                     const maxEnd = (lay.startTime || 0) + Math.max(0.1, srcDur - (lay.srcStart || 0));
                     const newEnd = autoFit ? maxEnd : Math.min(lay.endTime ?? maxEnd, maxEnd);
-                    return { ...lay, srcDuration: srcDur, endTime: newEnd };
+                    const out = { ...lay, srcDuration: srcDur, endTime: newEnd };
+                    // First load → scale to COVER the whole preview frame (fill to
+                    // all borders, crop overflow), not just match the main video.
+                    if (lay.fitCover && nAR) {
+                      out.aspect = nAR;
+                      out.size = 100 * Math.max(1, nAR / frameAR);
+                      out.x = 50; out.y = 50;
+                      out.fitCover = false;
+                    }
+                    return out;
                   });
                   return next;
                 });
@@ -5175,7 +5438,7 @@ function Editor({ state, setState }) {
           <div className="ed-playback">
             <button className="ed-pb-btn ed-pb-play" onClick={togglePlay}>{playing ? '⏸' : '▶'}</button>
             <div className="ed-scrub" onPointerDown={scrubPointerDown}>
-              <div className="ed-scrub-fill" style={{ width:pct(currentTime) }} />
+              {renderBuffered()}<div className="ed-scrub-fill" style={{ width:pct(currentTime) }} />
               <div className="ed-scrub-head" style={{ left:pct(currentTime) }} />
             </div>
             <span className="ed-time">{fmt(currentTime)}</span>
@@ -5194,13 +5457,13 @@ function Editor({ state, setState }) {
               style={{ position:'fixed', inset:0, zIndex:9999, background:'#000', display:'flex', flexDirection:'column' }}>
               <div style={{ flex:'1 1 auto', display:'flex', alignItems:'center', justifyContent:'center', minHeight:0, overflow:'hidden' }}>
                 <canvas ref={fsCanvasRef}
-                  style={{ maxWidth:'100%', maxHeight:'100%', aspectRatio:`${outWidth}/${outHeight}`, display:'block' }} />
+                  style={{ width:'100%', height:'100%', objectFit:'contain', display:'block' }} />
               </div>
               <div className="ed-playback ed-playback-fs"
                 style={{ flex:'0 0 auto', display:'flex', alignItems:'center', gap:'10px', padding:'10px 16px', background:'rgba(20,20,22,.92)' }}>
                 <button className="ed-pb-btn ed-pb-play" onClick={togglePlay}>{playing ? '⏸' : '▶'}</button>
                 <div className="ed-scrub" style={{ flex:'1 1 auto' }} onPointerDown={scrubPointerDown}>
-                  <div className="ed-scrub-fill" style={{ width:pct(currentTime) }} />
+                  {renderBuffered()}<div className="ed-scrub-fill" style={{ width:pct(currentTime) }} />
                   <div className="ed-scrub-head" style={{ left:pct(currentTime) }} />
                 </div>
                 <span className="ed-time">{fmt(currentTime)}</span>
@@ -5760,13 +6023,68 @@ function Editor({ state, setState }) {
             <div className="ed-zoom">
               <span className="ed-zoom-lbl">Масштаб</span>
               <button className="ed-zoom-btn" onClick={()=>setZoom(z=>Math.max(1,+(z-0.5).toFixed(1)))}>−</button>
-              <span className="ed-zoom-val">{zoom}×</span>
+              {/* The value is a scrubber, same as the preview zoom: hold + drag
+                  up/down (or wheel over it) to dial the timeline zoom smoothly. */}
+              <span className={`ed-zoom-val zoom-pct-scrub${tlZoomScrubActive ? ' active' : ''}`}
+                title="Тяни вверх/вниз или крути колесо, чтобы менять масштаб"
+                onWheel={(e) => {
+                  e.preventDefault();
+                  const dir = e.deltaY < 0 ? 1 : -1;
+                  setZoom(z => Math.max(1, Math.min(8, +(z + dir * 0.25).toFixed(2))));
+                }}
+                onPointerDown={(e) => {
+                  e.stopPropagation(); e.preventDefault();
+                  const startY = e.clientY;
+                  const startZ = zoom;
+                  const el = e.currentTarget;
+                  try { el.setPointerCapture(e.pointerId); } catch {}
+                  setTlZoomScrubActive(true);
+                  const onMove = (ev) => {
+                    const dy = startY - ev.clientY;       // up = positive
+                    const factor = Math.pow(1.012, dy);   // ~1.2 % per px
+                    const next = Math.max(1, Math.min(8, startZ * factor));
+                    setZoom(+next.toFixed(2));
+                  };
+                  const onUp = () => {
+                    window.removeEventListener('pointermove', onMove);
+                    window.removeEventListener('pointerup', onUp);
+                    try { el.releasePointerCapture(e.pointerId); } catch {}
+                    setTlZoomScrubActive(false);
+                  };
+                  window.addEventListener('pointermove', onMove);
+                  window.addEventListener('pointerup', onUp);
+                }}>{zoom}×
+                {tlZoomScrubActive && (() => {
+                  // Vertical track shown while dragging (log scale over 1×–8×).
+                  const MIN = 1, MAX = 8;
+                  const pos = Math.log(zoom / MIN) / Math.log(MAX / MIN);
+                  return (
+                    <span className="zoom-scrub-track" aria-hidden="true">
+                      <span className="zoom-scrub-label top">8×</span>
+                      <span className="zoom-scrub-bar">
+                        <span className="zoom-scrub-mid" />
+                        <span className="zoom-scrub-thumb" style={{ bottom: `${pos * 100}%` }} />
+                      </span>
+                      <span className="zoom-scrub-label bot">1×</span>
+                    </span>
+                  );
+                })()}
+              </span>
               <button className="ed-zoom-btn" onClick={()=>setZoom(z=>Math.min(8,+(z+0.5).toFixed(1)))}>＋</button>
             </div>
           </div>
 
+          {/* Top horizontal scrollbar — appears only when zoomed in (timeline
+              wider than the viewport). Sits under the toolbar, above the tracks. */}
+          {tlBar.show && (
+            <div className="ed-tl-hscroll">
+              <div className="ed-tl-hscroll-thumb" style={{ width: `${tlBar.w}%`, left: `${tlBar.l}%` }}
+                onPointerDown={onTlBarThumbDown} />
+            </div>
+          )}
+
           {/* Scrollable timeline */}
-          <div className="ed-tl-scroll" ref={tlScrollRef}>
+          <div className="ed-tl-scroll" ref={tlScrollRef} onScroll={updateTlBar}>
             <div className="ed-tl-inner" style={{width:`${zoom*100}%`}}>
 
               {/* Ruler */}
@@ -5823,7 +6141,7 @@ function Editor({ state, setState }) {
                       onDragOver={e=>{ e.preventDefault(); e.currentTarget.classList.add('etl-drop-target'); }}
                       onDragLeave={e=>e.currentTarget.classList.remove('etl-drop-target')}
                       onDrop={e=>{ e.preventDefault(); e.currentTarget.classList.remove('etl-drop-target'); reorderLayer(layerDragRef.current, layer.id); layerDragRef.current=null; }}>
-                      <span className={`etl-track-label${layer._missing ? ' etl-missing' : ''}`} title={layer._missing ? `Файл не найден: ${layer.file || ''}` : undefined}>
+                      <span className={`etl-track-label${layer._missing ? ' etl-missing' : ''}`} title={layer._missing ? `Файл не найден: ${layer.file || ''}` : lFull(layer)}>
                         {layer._missing ? '⚠ ' : ''}{lName(layer)}
                       </span>
                       <div className="etl-track-actions">
