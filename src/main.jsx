@@ -2119,6 +2119,42 @@ function Editor({ state, setState }) {
     setState((s) => ({ ...s, totalDuration: v, videoEnd: Math.min(s.videoEnd, v) }));
   }
 
+  // Change the output frame size WITHOUT rescaling the content. Layer geometry is
+  // stored as a % of the frame, so a naive size change makes everything grow/
+  // shrink with the frame. Here we counter-scale each layer's size so its
+  // ABSOLUTE pixel dimensions stay the same — the frame changes, the content
+  // keeps its real size (centred layers stay centred via the %-position).
+  function setOutputSize(newW, newH) {
+    newW = Math.max(2, Math.round(Number(newW) || 0));
+    newH = Math.max(2, Math.round(Number(newH) || 0));
+    if (!newW || !newH) return;
+    pushUndo();
+    setState((s) => {
+      const oldW = Number(s.outWidth) || newW;
+      const oldH = Number(s.outHeight) || newH;
+      if (oldW === newW && oldH === newH) return { ...s, outWidth: newW, outHeight: newH };
+      const fx = oldW / newW, fy = oldH / newH;   // keep absolute px when the frame changes
+      const layers = (s.layers || []).map((l) => {
+        // Media sized as % of frame WIDTH (w = size% · W) — shrink the % so the
+        // absolute width (and height, via fixed aspect) is preserved.
+        if ((l.type === 'mainVideo' || l.type === 'videoOverlay' || l.type === 'image') && typeof l.size === 'number') {
+          return { ...l, size: l.size * fx };
+        }
+        // Region layers sized as % of frame (w = width%·W, h = height%·H).
+        if (l.type === 'blur' || l.type === 'mask' || l.type === 'maskedVideo') {
+          const o = { ...l };
+          if (typeof o.width === 'number') o.width = o.width * fx;
+          if (typeof o.height === 'number') o.height = o.height * fy;
+          return o;
+        }
+        // text / subtitles use an ABSOLUTE font size (px) + %-position, so they
+        // already keep their own size when the frame changes — leave untouched.
+        return l;
+      });
+      return { ...s, outWidth: newW, outHeight: newH, layers };
+    });
+  }
+
   async function pickFile() {
     const f = await window.strata?.pickMedia?.();
     addMediaPaths(f);
@@ -5370,7 +5406,7 @@ function Editor({ state, setState }) {
         <div className="ed-toolbar-group">
           {[['1080×1920','1080','1920'],['1080×1350','1080','1350'],['1080×1080','1080','1080'],['1920×1080','1920','1080']].map(([lbl,w,h]) => (
             <button key={lbl} className={`ed-preset-btn${widthStr===w&&heightStr===h?' active':''}`}
-              onClick={() => { set('outWidth',Number(w)); set('outHeight',Number(h)); setWidthStr(w); setHeightStr(h); }}>
+              onClick={() => { setOutputSize(Number(w), Number(h)); setWidthStr(w); setHeightStr(h); }}>
               {lbl}
             </button>
           ))}
@@ -5378,12 +5414,12 @@ function Editor({ state, setState }) {
             onClick={() => dimWidthRef.current?.select()}>Свой</button>
           <input ref={dimWidthRef} className="ed-dim-inp" type="number" value={widthStr} onChange={e=>setWidthStr(e.target.value)}
             onFocus={()=>setDimFocused(true)}
-            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(widthStr)||1080));setWidthStr(String(v));set('outWidth',v);setDimFocused(false);}}
+            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(widthStr)||1080));setWidthStr(String(v));setOutputSize(v, outHeight);setDimFocused(false);}}
             onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
           <span className="ed-dim-x">×</span>
           <input className="ed-dim-inp" type="number" value={heightStr} onChange={e=>setHeightStr(e.target.value)}
             onFocus={()=>setDimFocused(true)}
-            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(heightStr)||1920));setHeightStr(String(v));set('outHeight',v);setDimFocused(false);}}
+            onBlur={()=>{const v=Math.max(100,Math.min(7680,Number(heightStr)||1920));setHeightStr(String(v));setOutputSize(outWidth, v);setDimFocused(false);}}
             onKeyDown={e=>e.key==='Enter'&&e.target.blur()} />
         </div>
         <div style={{flex:1}} />
