@@ -2320,7 +2320,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
     const custom = payload.custom || {};
     const srcVideoKbps = (srcMbReal > 0) ? Math.max(200, (srcMbReal * 8192) / srcDurReal - 128) : 0;
     const presetMap = { max: 'slow', normal: 'medium', fast: 'veryfast', custom: 'medium' };
-    const encPreset = presetMap[quality] || 'medium';
+    // custom mode may override the x264 preset (whitelisted) — lets the preview
+    // proxy ask for veryfast+low-crf (fast render AND near-lossless quality).
+    const X264_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'];
+    const encPreset = (quality === 'custom' && X264_PRESETS.includes(custom.preset)) ? custom.preset : (presetMap[quality] || 'medium');
     const cCrf = (def) => Math.max(1, Math.min(51, Math.round(Number(custom.crf) || def)));
     const cFps = Math.max(0, Math.min(120, Math.round(Number(custom.fps) || 0)));
     let audioKbps = quality === 'fast' ? 128 : 160;

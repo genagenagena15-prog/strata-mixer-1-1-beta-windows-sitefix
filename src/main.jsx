@@ -4250,10 +4250,13 @@ function Editor({ state, setState }) {
           let outPath;
           try { outPath = await window.strata?.previewProxyPath?.(token * 10 + slot + i); } catch { ok = false; break; }
           if (!outPath) { ok = false; break; }
-          // Both passes use 'fast' (veryfast/crf27) — the ladder is purely a
-          // RESOLUTION upgrade (≈480 → ≈1080), which is exactly what reads as
-          // "soft/pixelated"; full res at 'fast' renders quickly and looks crisp.
-          const payload = buildEditPayload({ outWidth: ow, outHeight: oh, outPath, format: 'mp4', quality: 'fast', custom: {}, preview: true });
+          // LOW pass: 'fast' (veryfast/crf27) — speed, it's the temporary smooth
+          // fallback. HD pass: near-visually-lossless crf16 at the FAST 'veryfast'
+          // preset (crf = quality lever, preset = speed lever — so we get a render
+          // fast enough to appear during watch AND a picture that matches the
+          // UNcompressed paused canvas; crf27 was what read as "HD говно").
+          const hi = q >= 1;
+          const payload = buildEditPayload({ outWidth: ow, outHeight: oh, outPath, format: 'mp4', quality: hi ? 'custom' : 'fast', custom: hi ? { crf: 16, preset: 'veryfast' } : {}, preview: true });
           if (!payload) { ok = false; break; }
           payload.previewRange = { start: seg.start, end: seg.end };
           const res = await window.strata?.editVideo?.(payload);
