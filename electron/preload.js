@@ -40,6 +40,10 @@ contextBridge.exposeInMainWorld('strata', {
     return () => ipcRenderer.removeListener('project:save-prompt-request', handler);
   },
   savePromptResponse: (choice) => ipcRenderer.send('project:save-prompt-response', choice),
+  // Crash recovery: autosave the editor state; query/resolve a pending recovery.
+  autosaveEditor: (state) => ipcRenderer.invoke('editor:autosave', state),
+  getRecovery: () => ipcRenderer.invoke('editor:getRecovery'),
+  resolveRecovery: (accepted) => ipcRenderer.invoke('editor:resolveRecovery', !!accepted),
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
   previewProxyPath: (n) => ipcRenderer.invoke('editor:previewProxyPath', n),
   cancelPreview: () => ipcRenderer.invoke('editor:cancelPreview'),

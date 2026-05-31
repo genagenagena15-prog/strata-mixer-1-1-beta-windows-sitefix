@@ -355,6 +355,20 @@ function App() {
   const update = (key, value) => setSettings((s) => ({ ...s, [key]: value }));
   const [fileNames, setFileNames] = useState({});
   const [editorState, setEditorState] = useState(EDITOR_DEFAULT);
+  // Crash recovery — autosave the editor (debounced); on launch, if the previous
+  // exit was un-clean (crash), offer to reopen the last project.
+  const [recovery, setRecovery] = useState(null);
+  useEffect(() => {
+    const has = editorState && ((editorState.layers && editorState.layers.length) || editorState.file);
+    if (!has) return;
+    const t = setTimeout(() => { window.strata?.autosaveEditor?.(editorState); }, 1500);
+    return () => clearTimeout(t);
+  }, [editorState]);
+  useEffect(() => {
+    window.strata?.getRecovery?.().then(st => {
+      if (st && ((st.layers && st.layers.length) || st.file)) setRecovery(st);
+    }).catch(() => {});
+  }, []);
   const dragIndex = useRef(null);
   // Listen for project files opened from the OS (double-click .smproj in
   // Explorer / Finder, or "Open with…"). When one arrives, switch to the
@@ -493,6 +507,26 @@ function App() {
       {result && <ResultModal result={result} onClose={() => setResult(null)} />}
       {helpOpen && <HelpModal onClose={() => setHelpOpen(false)} />}
       {donateOpen && <DonateModal onClose={() => setDonateOpen(false)} />}
+      {recovery && (
+        <div className="modal-back" style={{ zIndex: 60 }}
+          onClick={() => { setRecovery(null); window.strata?.resolveRecovery?.(false); }}>
+          <div className="result-modal" style={{ width: 'min(460px,90vw)' }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>Восстановить проект?</h3>
+            <p className="hint" style={{ lineHeight: 1.55, margin: '6px 0 16px' }}>
+              Похоже, в прошлый раз программа закрылась некорректно (возможно, из-за ошибки).
+              Открыть последний проект, над которым ты работал?
+            </p>
+            <div className="modal-actions">
+              <button className="btn primary" onClick={() => { setEditorState(recovery); setActive('editor'); setRecovery(null); window.strata?.resolveRecovery?.(true); }}>
+                Открыть последний проект
+              </button>
+              <button className="btn" onClick={() => { setRecovery(null); window.strata?.resolveRecovery?.(false); }}>
+                Не надо
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {progress.running && active !== 'editor' && <div className="batch-lock-overlay" aria-hidden="true" />}
     </>
   );

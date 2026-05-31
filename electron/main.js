@@ -955,6 +955,40 @@ app.on('second-instance', (_event, argv) => {
     dispatchPendingProject();
   }
 });
+// ── Crash recovery: autosave the editor + detect un-clean exits ───────────
+// The renderer autosaves its editor state here (clean:false). A normal quit
+// flips clean:true; a crash leaves it false → on next launch we offer to
+// reopen the last project.
+function autosaveFile() { return path.join(app.getPath('userData'), 'strata-autosave.json'); }
+let pendingRecovery = null;
+function loadRecoveryAtStartup() {
+  try {
+    const f = autosaveFile();
+    if (!fs.existsSync(f)) return;
+    const d = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (d && d.clean === false && d.state) pendingRecovery = d.state;
+  } catch {}
+}
+function markCleanExit() {
+  try {
+    const f = autosaveFile();
+    if (!fs.existsSync(f)) return;
+    const d = JSON.parse(fs.readFileSync(f, 'utf8'));
+    d.clean = true;
+    fs.writeFileSync(f, JSON.stringify(d));
+  } catch {}
+}
+ipcMain.handle('editor:autosave', (_e, state) => {
+  try { fs.writeFileSync(autosaveFile(), JSON.stringify({ clean: false, ts: Date.now(), state })); } catch {}
+  return true;
+});
+ipcMain.handle('editor:getRecovery', () => pendingRecovery || null);
+ipcMain.handle('editor:resolveRecovery', (_e, accepted) => {
+  pendingRecovery = null;
+  if (!accepted) markCleanExit();   // dismissed → don't offer it again next launch
+  return true;
+});
+
 app.on('before-quit', (event) => {
   // If the renderer has unsaved work, intercept the quit and ask the user.
   // _quitCleared is set after the user has answered (or there was nothing
@@ -966,6 +1000,7 @@ app.on('before-quit', (event) => {
       if (proceed) {
         _quitCleared = true;
         isQuitting = true;
+        markCleanExit();        // normal quit → next launch won't offer recovery
         app.quit();
       } else {
         // Cancelled — stay open, stop the quit chain.
@@ -975,6 +1010,7 @@ app.on('before-quit', (event) => {
     return;
   }
   isQuitting = true;
+  markCleanExit();              // normal quit → next launch won't offer recovery
   // Best-effort sweep of orphaned temps. Fast and synchronous because the
   // process is exiting; lost files would otherwise stay until the OS cleans
   // %TEMP% (which on Windows is rarely).
@@ -1012,6 +1048,7 @@ app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return;
   if (process.platform === 'win32') app.setAppUserModelId('com.stratamixer.app.1.1beta');
 
+  loadRecoveryAtStartup();   // crash recovery: was the previous exit un-clean?
   createSplashWindow();
   createWindow();
   createTray();
