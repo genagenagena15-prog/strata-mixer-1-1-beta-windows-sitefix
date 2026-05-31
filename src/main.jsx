@@ -1784,8 +1784,10 @@ function Editor({ state, setState }) {
   const [selectedId, setSelectedId] = useState(null);
   const [edPropTab, setEdPropTab] = useState('props');
   const [hotkeysOpen, setHotkeysOpen] = useState(false);
-  // Collapsed by default so the subtitle panel isn't a wall of controls.
-  const [subStyleOpen, setSubStyleOpen] = useState(false);
+  // Оформление (styling) is shown by default now; the text+timings list is the
+  // collapsible instead (tucked at the bottom under "Текст и тайминги").
+  const [subStyleOpen, setSubStyleOpen] = useState(true);
+  const [subSegOpen, setSubSegOpen] = useState(false);
   // Lightweight in-app toast for soft errors / hints. Replaces native alert()
   // so notifications match the editor's look — dark card, orange accent.
   const [editorHint, setEditorHint] = useState(null);
@@ -6114,33 +6116,6 @@ function Editor({ state, setState }) {
                   </div></div>
                 </div>
 
-                <div className="sub-seg-list">
-                  <div className="sub-seg-hint">Клик по фразе → переход к ней. Двойной клик по тексту → редактирование.</div>
-                  {segs.map((s, idx) => {
-                    const isActive = currentTime >= s.startTime && currentTime <= s.endTime;
-                    return (
-                      <div key={s.id} className={`sub-seg-item${isActive ? ' active' : ''}`}>
-                        <button className="sub-seg-time" onClick={() => jumpTo(s.startTime)} title="Перейти к этой фразе">
-                          {fmt(s.startTime)}
-                        </button>
-                        <textarea
-                          className="sub-seg-text"
-                          rows={1}
-                          spellCheck={false}
-                          value={s.text}
-                          onChange={e => updSegText(s.id, e.target.value)}
-                        />
-                        <div className="sub-seg-acts">
-                          <button className="sub-seg-act" title="Разделить пополам" onClick={() => splitAtMid(s.id)}>✂</button>
-                          {idx < segs.length - 1 && (
-                            <button className="sub-seg-act" title="Объединить со следующей" onClick={() => mergeWithNext(s.id)}>⇣</button>
-                          )}
-                          <button className="sub-seg-act danger" title="Удалить" onClick={() => delSeg(s.id)}>×</button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
                 <div className="ed-prop-row" style={{ marginTop: 10 }}>
                   <span className="ed-prop-label">Язык речи</span>
                   <select className="ed-font-sel" value={subLang} onChange={e => setSubLang(e.target.value)}>
@@ -6158,6 +6133,44 @@ function Editor({ state, setState }) {
                 <button className="sub-regen-btn" onClick={generateSubtitlesLayer} disabled={!!subProgress}>
                   Распознать заново
                 </button>
+
+                {/* Text + timings — collapsible, tucked at the bottom under the
+                    settings (was the always-open list; styling is shown instead). */}
+                <div className={`ed-effects-section sub-seg-acc${subSegOpen ? ' open' : ' collapsed'}`} style={{ marginTop: 12 }}>
+                  <button className="ed-effects-title ed-acc-toggle" onClick={() => setSubSegOpen(o => !o)} aria-expanded={subSegOpen}>
+                    <span>Текст и тайминги ({segs.length})</span>
+                    <span className="ed-acc-chev" aria-hidden="true">▾</span>
+                  </button>
+                  {subSegOpen && (
+                    <div className="sub-seg-list">
+                      <div className="sub-seg-hint">Клик по фразе → переход к ней. Двойной клик по тексту → редактирование.</div>
+                      {segs.map((s, idx) => {
+                        const isActive = currentTime >= s.startTime && currentTime <= s.endTime;
+                        return (
+                          <div key={s.id} className={`sub-seg-item${isActive ? ' active' : ''}`}>
+                            <button className="sub-seg-time" onClick={() => jumpTo(s.startTime)} title="Перейти к этой фразе">
+                              {fmt(s.startTime)}
+                            </button>
+                            <textarea
+                              className="sub-seg-text"
+                              rows={1}
+                              spellCheck={false}
+                              value={s.text}
+                              onChange={e => updSegText(s.id, e.target.value)}
+                            />
+                            <div className="sub-seg-acts">
+                              <button className="sub-seg-act" title="Разделить пополам" onClick={() => splitAtMid(s.id)}>✂</button>
+                              {idx < segs.length - 1 && (
+                                <button className="sub-seg-act" title="Объединить со следующей" onClick={() => mergeWithNext(s.id)}>⇣</button>
+                              )}
+                              <button className="sub-seg-act danger" title="Удалить" onClick={() => delSeg(s.id)}>×</button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             );
           })()}
