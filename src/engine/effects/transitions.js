@@ -206,31 +206,25 @@ void main(){
   fragColor=col;
 }`;
 
-// UI-picker metadata (pack §2).
+// UI-picker metadata — CURATED to 12 distinct transitions (the other 12 of the pack's 24 were
+// dropped as redundant/degenerate: duplicate glitches rgbglitch/glitchslice (kept datamosh),
+// duplicate zooms zoomblur/flashzoom (kept zoomrush/zoomspin/spin360), the pure A→B wipes
+// fade/lumawipe/lightsweep/iris/shutter/wavewipe (degenerate in our self-effect mode — need a
+// clip-pair feed), chromamelt (≈glitch-chroma) and mosaic (≈pixelate)). The shader (FS_TRANSITIONS)
+// still carries all 24 branches by u_type; only these ids are exposed/selectable. Types keep their
+// original numbers so the shader branches still match.
 export const TRANSITIONS = [
-  { id: 'fade',         type: 0,  name: 'Fade' },
-  { id: 'zoomblur',     type: 1,  name: 'Zoom-blur punch' },
-  { id: 'rgbglitch',    type: 2,  name: 'RGB Glitch' },
-  { id: 'lumawipe',     type: 3,  name: 'Luma wipe' },
-  { id: 'ripple',       type: 4,  name: 'Ripple' },
-  { id: 'pixelate',     type: 5,  name: 'Pixelate' },
-  { id: 'swirl',        type: 6,  name: 'Swirl' },
   { id: 'flash',        type: 7,  name: 'Flash' },
-  { id: 'liquidmelt',   type: 8,  name: 'Liquid melt' },
-  { id: 'fireburn',     type: 9,  name: '🔥 Fire burn' },
-  { id: 'datamosh',     type: 10, name: 'Datamosh glitch' },
-  { id: 'kaleidoscope', type: 11, name: 'Kaleidoscope' },
-  { id: 'lightsweep',   type: 12, name: 'Light sweep' },
-  { id: 'zoomspin',     type: 13, name: 'Zoom-spin whip' },
   { id: 'zoomrush',     type: 14, name: '⚡ Zoom rush' },
+  { id: 'zoomspin',     type: 13, name: 'Zoom-spin whip' },
   { id: 'spin360',      type: 15, name: 'Spin 360 blur' },
+  { id: 'datamosh',     type: 10, name: 'Glitch' },
+  { id: 'pixelate',     type: 5,  name: 'Pixelate' },
+  { id: 'fireburn',     type: 9,  name: '🔥 Fire burn' },
+  { id: 'liquidmelt',   type: 8,  name: 'Liquid melt' },
+  { id: 'swirl',        type: 6,  name: 'Swirl' },
+  { id: 'kaleidoscope', type: 11, name: 'Kaleidoscope' },
   { id: 'stretchwhip',  type: 16, name: 'Stretch whip' },
-  { id: 'iris',         type: 17, name: 'Iris (круг)' },
-  { id: 'shutter',      type: 18, name: 'Shutter bands' },
-  { id: 'wavewipe',     type: 19, name: 'Wave wipe' },
-  { id: 'glitchslice',  type: 20, name: 'Glitch slice' },
-  { id: 'flashzoom',    type: 21, name: 'Flash zoom' },
-  { id: 'chromamelt',   type: 22, name: 'Chroma melt' },
-  { id: 'mosaic',       type: 23, name: 'Mosaic blocks' },
+  { id: 'ripple',       type: 4,  name: 'Ripple' },
 ];
 export const TRANSITION_TYPE = Object.fromEntries(TRANSITIONS.map(t => [t.id, t.type]));
