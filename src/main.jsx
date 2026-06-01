@@ -8,7 +8,7 @@ import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
-import { TEXT_STYLES, TEXT_STYLE_TYPE } from './engine/effects/index.js';
+import { TEXT_STYLES, TEXT_STYLE_TYPE, TRANSITIONS } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
@@ -6736,9 +6736,16 @@ function Editor({ state, setState }) {
                 </button>
                 <div className="ed-acc-body"><div className="ed-acc-inner">
                   <p className="ed-effects-hint ed-effects-hint-section">Используется для склейки двух разных видео, добавляется новым слоем.</p>
-                  {/* Old transition kinds removed — pivoting to the GPU effects pack.
-                      The new set plugs in here once the pack is integrated. */}
-                  <p className="ed-effects-hint">Переходы временно отключены — переезжаем на новый GPU-движок эффектов. Скоро здесь появится новый набор.</p>
+                  {/* GPU transitions (ported pack, curated 12). Adds a transition layer with the pack
+                      kind → compositor _transitionGPU. Renders in engineMode (Ctrl+Shift+G) for now. */}
+                  <div className="ed-trans-chips ed-trans-chips-grid">
+                    {TRANSITIONS.map(t => (
+                      <button key={t.id} className="ed-trans-chip" onClick={() => addTransition(t.id, 50)}>
+                        {t.name}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="ed-effects-hint">Показываются в GPU-режиме (Ctrl+Shift+G), пока движок не выведен в дефолт.</p>
                 </div></div>
               </div>
             </div>
