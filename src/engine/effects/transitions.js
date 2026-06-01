@@ -215,12 +215,12 @@ void main(){
 // original numbers so the shader branches still match.
 export const TRANSITIONS = [
   { id: 'flash',        type: 7,  name: 'Flash' },
-  { id: 'zoomrush',     type: 14, name: '⚡ Zoom rush' },
+  { id: 'zoomrush',     type: 14, name: 'Zoom rush' },
   { id: 'zoomspin',     type: 13, name: 'Zoom-spin whip' },
   { id: 'spin360',      type: 15, name: 'Spin 360 blur' },
   { id: 'datamosh',     type: 10, name: 'Glitch' },
   { id: 'pixelate',     type: 5,  name: 'Pixelate' },
-  { id: 'fireburn',     type: 9,  name: '🔥 Fire burn' },
+  { id: 'fireburn',     type: 9,  name: 'Fire burn' },
   { id: 'liquidmelt',   type: 8,  name: 'Liquid melt' },
   { id: 'swirl',        type: 6,  name: 'Swirl' },
   { id: 'kaleidoscope', type: 11, name: 'Kaleidoscope' },

@@ -110,7 +110,7 @@ export const TEXT_STYLES = [
   { id: 'plain',   style: 0, name: 'Обычный' },
   { id: 'neon',    style: 1, name: 'Неон' },
   { id: 'glow',    style: 2, name: 'Свечение' },
-  { id: 'fire',    style: 3, name: '🔥 Огонь' },
+  { id: 'fire',    style: 3, name: 'Огонь' },
   { id: 'grad',    style: 4, name: 'Градиент' },
   { id: 'holo',    style: 5, name: 'Голограмма' },
   { id: 'chrome',  style: 6, name: 'Хром / металл' },
