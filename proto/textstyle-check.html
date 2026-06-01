@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>text-style check</title></head>
+<body style="margin:0;background:#101014">
+<canvas id="c" width="560" height="220"></canvas>
+<script type="module">
+import { Compositor } from '/src/engine/compositor.js';
+import { rasterizeWord } from '/src/engine/textRaster.js';
+const log = (m) => console.log(m);
+try {
+  const comp = new Compositor(document.getElementById('c'));
+  const styleId = parseInt(new URLSearchParams(location.search).get('style') || '1', 10);
+  const word = rasterizeWord('НЕОН', { cx: 280, cy: 110, w: 240 }, { fontSize: 96 }, 'bold sans-serif', true); // glyph-ALPHA
+  const draw = { ...word, style: styleId, base: [1, 1, 1], acc: [0.2, 0.9, 1.0], intensity: 1.5, opacity: 1 };
+  comp.renderFrame({
+    W: 560, H: 220, bgColor: '#101014', layers: [{ id: 's', type: 'subtitles' }], time: 0.5, videoStart: 0, videoEnd: 9, dur: 9,
+    getPx: () => ({ x: 0, y: 0, w: 0, h: 0 }), getSource: () => null,
+    getTextDraw: (l) => l.type === 'subtitles' ? [draw] : [], getCC: () => null,
+  });
+  log('@@BENCH@@' + JSON.stringify({ ok: 1, style: styleId }));
+} catch (e) { log('@@BENCH@@' + JSON.stringify({ err: String(e && e.message || e) })); }
+</script></body></html>

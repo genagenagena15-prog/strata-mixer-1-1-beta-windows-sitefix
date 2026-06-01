@@ -43,16 +43,21 @@ export function rasterizeText(layer, W, H, fontFamilyCss) {
 // Rasterize ONE subtitle word (or the base/highlight variant) into a fitted canvas.
 // `box` = {cx, cy, w} from buildSubtitleLayout (output px); style carries colour/font/outline.
 // Kept separate so karaoke can render base + highlight as two draws with different styles.
-export function rasterizeWord(word, box, style, fontFamilyCss) {
+// `alphaOnly` = produce a WHITE-glyph-on-transparent raster (NO outline/shadow/colour) so its
+// alpha channel is pure glyph coverage — the input the GPU text-style shader (effects/textStyles.js
+// FS_TEXT) wants (it paints colour/glow/outline itself). Extra padding gives the glow room to bleed.
+// Without the flag this is byte-for-byte the original colour-baked raster (shipping path unchanged).
+export function rasterizeWord(word, box, style, fontFamilyCss, alphaOnly) {
   const fs = Number(style.fontSize) || 56;
   const text = word || '';
   const m = measCtx();
   m.font = `${fs}px ${fontFamilyCss}`;
   const tw = m.measureText(text).width;
-  const outline = Number(style.outline) || 0;
-  const blur = Number(style.blur) || 0;                 // blurfocus anim
-  const padX = Math.ceil(fs * 0.4) + 8 + outline + Math.ceil(blur);
-  const padY = Math.ceil(fs * 0.4) + 8 + outline + Math.ceil(blur);
+  const outline = alphaOnly ? 0 : (Number(style.outline) || 0);
+  const blur = alphaOnly ? 0 : (Number(style.blur) || 0);   // blurfocus anim
+  const glowPad = alphaOnly ? Math.ceil(fs * 0.6) : 0;      // headroom for the shader's glow spread
+  const padX = Math.ceil(fs * 0.4) + 8 + outline + Math.ceil(blur) + glowPad;
+  const padY = Math.ceil(fs * 0.4) + 8 + outline + Math.ceil(blur) + glowPad;
   const boxW = Math.max(2, Math.ceil(tw + padX * 2));
   const boxH = Math.max(2, Math.ceil(fs + padY * 2));
   const c = document.createElement('canvas');
@@ -63,8 +68,13 @@ export function rasterizeWord(word, box, style, fontFamilyCss) {
   ctx.textAlign = 'center';
   ctx.lineJoin = 'round';                                // matches renderFrameRef ≈5010
   ctx.miterLimit = 2;
-  if (blur > 0.1) ctx.filter = `blur(${blur}px)`;
   const mx = boxW / 2, my = boxH / 2;
+  if (alphaOnly) {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(text, mx, my);
+    return { source: c, x: box.cx - boxW / 2, y: box.cy - boxH / 2, w: boxW, h: boxH };
+  }
+  if (blur > 0.1) ctx.filter = `blur(${blur}px)`;
   if (outline > 0) {
     ctx.lineWidth = outline * 2;
     ctx.strokeStyle = style.outlineColor || '#000000';

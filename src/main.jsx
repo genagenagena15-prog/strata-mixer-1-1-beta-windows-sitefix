@@ -8,6 +8,7 @@ import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
+import { TEXT_STYLES, TEXT_STYLE_TYPE } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
@@ -193,6 +194,13 @@ function lerpHex(c1, c2, f) {
   const g = Math.round(a[1] + (b[1]-a[1]) * f);
   const bl= Math.round(a[2] + (b[2]-a[2]) * f);
   return `rgb(${r},${g},${bl})`;
+}
+// Hex "#rrggbb" → [r,g,b] in 0..1 (for the GPU text-style shader uniforms u_base/u_acc).
+function hexToRgb01(hex) {
+  const h = String(hex || '#ffffff').replace('#', '');
+  const s = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
+  const n = parseInt(s || 'ffffff', 16);
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
 }
 
 // Legacy old→new effect migration REMOVED — the transition/subtitle sets it
@@ -3441,6 +3449,9 @@ function Editor({ state, setState }) {
         const olMode = (st.outlineMode === 'none' || st.outline === false) ? 'none' : 'external';
         const olT = (st.outlineWidth != null && st.outlineWidth !== '') ? Math.max(0, Number(st.outlineWidth)) : Math.max(2, Math.round(fs * 0.04));
         const anim = st.anim || 'slideup';
+        // GPU emissive text style (effects/textStyles.js) — 0/none = plain (opaque _drawLayer path).
+        const gpuStyleType = st.gpuStyle ? (TEXT_STYLE_TYPE[st.gpuStyle] || 0) : 0;
+        const gpuIntensity = st.gpuIntensity != null ? Number(st.gpuIntensity) : 1;
         const segStart = Number(segL.start) || 0;
         const Wp = outWidth, Hp = outHeight;
         let phraseScale = 1, phraseAlpha = 1;
@@ -3483,7 +3494,14 @@ function Editor({ state, setState }) {
           const color = isActive ? (wDynColor || highlightColor) : baseColor;
           const outline = olMode === 'none' ? 0 : olT * wOutlineMul;
           const oColor = neonOutlineColor || outlineColor;
-          const d = rasterizeWord(w.text, { cx: w.cx, cy: w.cy + dy, w: w.w }, { fontSize: fs, color, outlineColor: oColor, outline, blur: wBlur }, fcss);
+          let d;
+          if (gpuStyleType > 0) {
+            // GPU style: rasterize a glyph-ALPHA (white) word — the FS_TEXT shader paints colour/glow.
+            d = rasterizeWord(w.text, { cx: w.cx, cy: w.cy + dy, w: w.w }, { fontSize: fs }, fcss, true);
+            d.style = gpuStyleType; d.base = hexToRgb01(color); d.acc = hexToRgb01(highlightColor); d.intensity = gpuIntensity;
+          } else {
+            d = rasterizeWord(w.text, { cx: w.cx, cy: w.cy + dy, w: w.w }, { fontSize: fs, color, outlineColor: oColor, outline, blur: wBlur }, fcss);
+          }
           let scaleX = wScale * wScaleX, scaleY = wScale * wScaleY;
           if (phraseScale !== 1) {
             scaleX *= phraseScale; scaleY *= phraseScale;
@@ -6512,6 +6530,14 @@ function Editor({ state, setState }) {
                         {SUB_ANIMS.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                       </select>
                     </div>
+                    <div className="ed-prop-row">
+                      <span className="ed-prop-label">Стиль (GPU)</span>
+                      <select className="ed-font-sel" value={st.gpuStyle || 'none'} onChange={e => updStyle('gpuStyle', e.target.value === 'none' ? '' : e.target.value)}>
+                        <option value="none">Нет</option>
+                        {TEXT_STYLES.filter(s => s.id !== 'plain').map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                      </select>
+                    </div>
+                    {st.gpuStyle && <Slider label="Сила стиля, %" value={Math.round((st.gpuIntensity ?? 1) * 100)} min="20" max="300" onChange={v => updStyle('gpuIntensity', v / 100)} />}
                     <Slider label="Межстрочное, %" value={st.lineHeight ?? 125} min="60" max="300" onChange={v => updStyle('lineHeight', v)} />
                     <div className="ed-prop-row">
                       <span className="ed-prop-label">Цвет текста</span>

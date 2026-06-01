@@ -9,6 +9,7 @@ import {
   uploadElement, VS_QUAD, pxRectToNDC,
 } from './gl.js';
 import { FS_TRANSITIONS, TRANSITION_TYPE } from './effects/transitions.js';
+import { FS_TEXT } from './effects/textStyles.js';
 
 // CSS-filter colour-correct, shared by every shader that cc's. Mirrors canvas2d
 // `ctx.filter = brightness(%) contrast(%) saturate(%) hue-rotate(deg)` APPLIED IN THAT ORDER, in
@@ -172,6 +173,15 @@ layout(location=0) in vec2 aPos;
 out vec2 v_uv;
 void main(){ v_uv = aPos; gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); }`;
 
+// Positioned-quad VS for the text-style shader (FS_TEXT). VS_QUAD but emits `v_uv` (the varying
+// name FS_TEXT expects) + uFlip (canvas raster row0=top → upright in the GL scene, like _drawLayer).
+const VS_TEXTQUAD = `#version 300 es
+layout(location=0) in vec2 aPos;
+uniform vec4 uRect;
+uniform int uFlip;
+out vec2 v_uv;
+void main(){ v_uv = vec2(aPos.x, uFlip==1 ? 1.0 - aPos.y : aPos.y); gl_Position = vec4(mix(uRect.xy, uRect.zw, aPos), 0.0, 1.0); }`;
+
 function hexToRgb(hex) {
   const h = (hex || '#000000').replace('#', '');
   const s = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
@@ -198,6 +208,7 @@ export class Compositor {
     this.progScreen = makeProgram(gl, VS_QUAD, FS_MUL);
     this.progPixelize = makeProgram(gl, VS_QUAD, FS_PIXELIZE);
     this.progFX = makeProgram(gl, VS_FX, FS_TRANSITIONS);   // ported 24 GPU transitions (effects/transitions.js)
+    this.progText = makeProgram(gl, VS_TEXTQUAD, FS_TEXT);  // 9 emissive text styles (effects/textStyles.js)
     this.quad = createUnitQuad(gl);
     this.scene = createFBO(gl, 16, 16);   // accumulator
     this.scratchA = createFBO(gl, 16, 16); // ping-pong for effects that read the accumulator
@@ -286,7 +297,12 @@ export class Compositor {
             const sx = d.scaleX != null ? d.scaleX : 1, sy = d.scaleY != null ? d.scaleY : 1;
             if (sx !== 1 || sy !== 1) { const ccx = d.x + d.w / 2, ccy = d.y + d.h / 2; dw = d.w * sx; dh = d.h * sy; dx = ccx - dw / 2; dy = ccy - dh / 2; }
             const r2 = pxRectToNDC(dx, dy, dw, dh, frame.W, frame.H);
-            this._drawLayer(rec.tex, r2, d.opacity != null ? d.opacity : 1);
+            if (d.style != null && d.style > 0) {
+              // GPU emissive style (neon/fire/…): d.source is a glyph-ALPHA raster, recoloured in-shader.
+              this._drawTextStyled(rec.tex, d, r2, (d.source && d.source.width) || d.w, (d.source && d.source.height) || d.h, t);
+            } else {
+              this._drawLayer(rec.tex, r2, d.opacity != null ? d.opacity : 1);
+            }
           }
         }
       } else if (layer.type === 'zoom') {
@@ -328,6 +344,30 @@ export class Compositor {
     gl.uniform1f(p.u.uC, cc ? cc.c : 1);
     gl.uniform1f(p.u.uS, cc ? cc.s : 1);
     gl.uniform1f(p.u.uH, cc ? cc.h : 0);
+    gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
+    gl.uniform1i(p.u.uFlip, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // Emissive GPU text style (effects/textStyles.js FS_TEXT) — draws the glyph-ALPHA raster
+  // (white-on-transparent; d.source from rasterizeWord(...,alphaOnly=true)) at `rect`, ADDITIVELY
+  // over the scene, recolouring/glowing per d.style/base/acc/intensity/anim. Used for the 9 pack
+  // styles (neon/fire/chrome/…); plain text keeps the opaque _drawLayer path.
+  _drawTextStyled(tex, d, rect, texW, texH, time) {
+    const gl = this.gl, p = this.progText;
+    gl.useProgram(p); gl.bindVertexArray(this.quad);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE);   // additive emissive over video
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(p.u.u_text, 0);
+    gl.uniform1f(p.u.u_time, time || 0);
+    gl.uniform1f(p.u.u_intensity, d.intensity != null ? d.intensity : 1);
+    gl.uniform1i(p.u.u_style, d.style | 0);
+    gl.uniform1i(p.u.u_anim, d.anim | 0);
+    const base = d.base || [1, 1, 1], acc = d.acc || [1, 0.6, 0.1];
+    gl.uniform3f(p.u.u_base, base[0], base[1], base[2]);
+    gl.uniform3f(p.u.u_acc, acc[0], acc[1], acc[2]);
+    gl.uniform2f(p.u.u_texel, 1 / Math.max(1, texW), 1 / Math.max(1, texH));
     gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
     gl.uniform1i(p.u.uFlip, 1);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
