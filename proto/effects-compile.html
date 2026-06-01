@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>Effects compile check (WebGL2)</title></head>
+<body style="background:#0c0d12;color:#e7e9f0;font:13px sans-serif">
+<canvas id="c" width="64" height="64"></canvas>
+<pre id="log"></pre>
+<script type="module">
+import { getGL, makeProgram } from '/src/engine/gl.js';
+import { VS_TRANSITION, FS_TRANSITIONS } from '/src/engine/effects/transitions.js';
+import { VS_TEXT, FS_TEXT } from '/src/engine/effects/textStyles.js';
+const log = (m) => { console.log(m); const el = document.getElementById('log'); if (el) el.textContent += m + '\n'; };
+try {
+  const gl = getGL(document.getElementById('c'));
+  log('GL: ' + gl.getParameter(gl.VERSION) + ' / ' + gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
+  let ok = 0; const errs = [];
+  try { makeProgram(gl, VS_TRANSITION, FS_TRANSITIONS); log('transitions (24): COMPILED + LINKED ✓'); ok++; }
+  catch (e) { errs.push('transitions: ' + e.message); log('transitions ✗ ' + e.message); }
+  try { makeProgram(gl, VS_TEXT, FS_TEXT); log('text styles (9): COMPILED + LINKED ✓'); ok++; }
+  catch (e) { errs.push('text: ' + e.message); log('text ✗ ' + e.message); }
+  log('@@BENCH@@' + JSON.stringify({ ok, total: 2, errs: errs.map(s => s.slice(0, 400)) }));
+} catch (e) { log('@@BENCH@@' + JSON.stringify({ fatal: String(e && e.message || e) })); }
+</script></body></html>
