@@ -3493,20 +3493,50 @@ function Editor({ state, setState }) {
   // res through the SAME compositor as preview ⇒ preview==export by construction; streams RGBA frames to
   // ffmpeg rawvideo (transport de-risked at 1.52× realtime). Default-OFF — the existing video:edit
   // filtergraph export is untouched. Audio v1 = main source file only (overlay/audio amix = TODO).
-  async function runEngineExport() {
-    if (engineExportingRef.current) return;
-    if (!engineMode || engineTierRef.current !== 'A') { alert('Экспорт через движок требует включённый движок (Ctrl+Shift+G) на Tier A (WebGL2 + WebCodecs).'); return; }
-    let outPath = null;
-    try { const r = await window.strata.pickSaveAs('export_engine.mp4', 'mp4'); outPath = r && (r.path || (typeof r === 'string' ? r : null)); } catch {}
-    if (!outPath) return;
+  // Audio sources for the engine export's ffmpeg graph (main video + overlays/maskedVideo + audio
+  // layers) — mirrors video:edit's per-source atrim/atempo/adelay/volume math (engine:export-begin
+  // builds the actual filtergraph). srcStart = source-trim head, delay = timeline start, trim end =
+  // srcStart + clipLen*speed (source-seconds), speed → atempo, volume raw % (volumeCurve in main).
+  function buildEngineAudioSources() {
+    const out = [];
+    const mv = layers.find(l => l.type === 'mainVideo');
+    if (file && (!mv || !mv.muted)) {
+      const sp = Math.max(0.1, ((mv && mv.speed) || 100) / 100);
+      const clipLen = Math.max(0.01, videoEnd - videoStart);
+      const ss = Number((mv && mv.srcStart) || 0);
+      out.push({ file, trimStart: ss, trimEnd: ss + clipLen * sp, delayMs: Math.round(videoStart * 1000), speed: sp, volume: (mv && mv.volume) ?? 100 });
+    }
+    for (const l of layers) {
+      if ((l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file && !l.muted) {
+        const sp = Math.max(0.1, (l.speed || 100) / 100);
+        const oStart = l.startTime || 0, oEnd = Math.min(l.endTime ?? dur, dur), oLen = Math.max(0.1, oEnd - oStart);
+        const ss = Number(l.srcStart || 0);
+        out.push({ file: l.file, trimStart: ss, trimEnd: ss + oLen * sp, delayMs: Math.round(oStart * 1000), speed: sp, volume: l.volume ?? 100 });
+      } else if (l.type === 'audio' && l.file && !l.muted) {
+        const aStart = l.startTime || 0, aEnd = Math.min(l.endTime ?? dur, dur), aLen = Math.max(0.1, aEnd - aStart);
+        const ss = Number(l.srcStart || 0);
+        out.push({ file: l.file, trimStart: ss, trimEnd: ss + aLen, delayMs: Math.round(aStart * 1000), speed: 1, volume: l.volume ?? 100 });
+      }
+    }
+    return out;
+  }
+  // outPathArg/onPct set when called from the normal export (saveAs); standalone (Ctrl+Shift+E) picks
+  // its own path + alerts. Returns {ok,error}.
+  async function runEngineExport(outPathArg, onPct) {
+    if (engineExportingRef.current) return { ok: false, error: 'busy' };
+    if (!engineMode || engineTierRef.current !== 'A') { if (!onPct) alert('Экспорт через движок требует включённый движок (Ctrl+Shift+G) на Tier A (WebGL2 + WebCodecs).'); return { ok: false, error: 'engine off / not Tier A' }; }
+    let outPath = outPathArg || null;
+    if (!outPath) { try { const r = await window.strata.pickSaveAs('export_engine.mp4', 'mp4'); outPath = r && (r.path || (typeof r === 'string' ? r : null)); } catch {} }
+    if (!outPath) return { ok: false, error: 'canceled' };
     engineExportingRef.current = true;
-    const setPct = (p) => { proxyDbgRef.current = 'EXP ' + p + '%'; setProxyDbg('EXP ' + p + '%'); };
+    const setPct = (p) => { if (onPct) onPct(p); else { proxyDbgRef.current = 'EXP ' + p + '%'; setProxyDbg('EXP ' + p + '%'); } };
     setPct(0);
+    let result = { ok: false, error: 'unknown' };
     try {
       const fps = 30;
       const durationSec = Math.max(0.2, (Number(dur) || 0) || (videoEnd - videoStart) || 1);
-      const begin = await window.strata.engineExportBegin({ W: outWidth, H: outHeight, fps, outPath, mainFile: file || null });
-      if (!begin || !begin.ok) { alert('Экспорт не запустился: ' + ((begin && begin.error) || 'ffmpeg')); return; }
+      const begin = await window.strata.engineExportBegin({ W: outWidth, H: outHeight, fps, outPath, audioSources: buildEngineAudioSources() });
+      if (!begin || !begin.ok) { result = { ok: false, error: (begin && begin.error) || 'ffmpeg' }; if (!onPct) alert('Экспорт не запустился: ' + result.error); return result; }
       const spec = {
         W: outWidth, H: outHeight, fps, durationSec, bgColor, videoStart, videoEnd, layers,
         getPx: getLayerPx,
@@ -3517,10 +3547,11 @@ function Editor({ state, setState }) {
       };
       await renderExportFrames(spec, async (rgba) => { await window.strata.engineExportFrame(rgba.buffer); });
       const fin = await window.strata.engineExportFinish();
-      if (fin && fin.ok) alert('Готово (движок):\n' + outPath);
-      else alert('Экспорт: ' + ((fin && fin.error) || 'ошибка ffmpeg'));
-    } catch (e) { console.error('[engine-export]', e); try { await window.strata.engineExportFinish(); } catch {} alert('Экспорт через движок: ' + e.message); }
+      result = (fin && fin.ok) ? { ok: true } : { ok: false, error: (fin && fin.error) || 'ошибка ffmpeg' };
+      if (!onPct) { if (result.ok) alert('Готово (движок):\n' + outPath); else alert('Экспорт: ' + result.error); }
+    } catch (e) { console.error('[engine-export]', e); try { await window.strata.engineExportFinish(); } catch {} result = { ok: false, error: e.message }; if (!onPct) alert('Экспорт через движок: ' + e.message); }
     finally { engineExportingRef.current = false; proxyDbgRef.current = 'HD'; setProxyDbg('HD'); }
+    return result;
   }
   const paintOnce = () => {
     const draw = renderFrameRef.current;
@@ -4667,11 +4698,20 @@ function Editor({ state, setState }) {
         setSaveProgress(Math.round(d.percent || 0));
       }
     });
-    const result = await window.strata?.editVideo?.(
-      buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
-    );
+    let result;
+    if (fmt === 'mp4' && engineMode && engineTierRef.current === 'A') {
+      // Tier A + engine ON → render through the WebGL2 compositor (GPU effects baked in) + the
+      // multi-source audio graph. Falls back to the ffmpeg/ASS path for mp3/webm or Tier B.
+      off?.();   // engine path reports progress via setSaveProgress, not onEditProgress
+      result = await runEngineExport(outPath, (p) => setSaveProgress(Math.min(99, p)));
+      if (result?.ok) { playDoneSound(); setSaveProgress(100); setSaveFinishing(true); }
+    } else {
+      result = await window.strata?.editVideo?.(
+        buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
+      );
+    }
     exportingRef.current = false;
-    if (result && !result.ok) { setSaveProgress(null); setSaveFinishing(false); alert('Ошибка: ' + result.error); }
+    if (result && !result.ok && result.error !== 'canceled') { setSaveProgress(null); setSaveFinishing(false); alert('Ошибка: ' + result.error); }
     else if (result?.ok) window.strata?.revealFile?.(outPath);
   }
 

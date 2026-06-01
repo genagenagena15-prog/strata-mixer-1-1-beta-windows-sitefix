@@ -1035,13 +1035,36 @@ let _engExp = null;
 ipcMain.handle('engine:export-begin', (_e, meta) => {
   const ffmpeg = findFfmpeg();
   if (!ffmpeg) return { ok: false, error: 'ffmpeg not found' };
-  const { W, H, fps, outPath, mainFile } = meta || {};
+  const { W, H, fps, outPath, audioSources, mainFile } = meta || {};
   if (!outPath || !W || !H) return { ok: false, error: 'bad export meta' };
-  let hasAudio = false;
   const args = ['-y', '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${W}x${H}`, '-r', String(fps || 30), '-i', 'pipe:0'];
-  if (mainFile && fs.existsSync(mainFile)) { args.push('-i', mainFile); hasAudio = true; }
+  // Multi-source audio (main video + overlays/maskedVideo + audio layers): per-source
+  // atrim/atempo/adelay/volume → amix → loudnorm. Mirrors the video:edit audio graph so the
+  // engine export sounds identical. `audioSources` is built by the renderer (runEngineExport).
+  let srcs = Array.isArray(audioSources) ? audioSources.filter(s => s && s.file && fs.existsSync(s.file)) : [];
+  if (!srcs.length && mainFile && fs.existsSync(mainFile)) srcs = [{ file: mainFile, trimStart: 0, trimEnd: 1e6, delayMs: 0, speed: 1, volume: 100 }];
+  const filter = [], mix = [];
+  srcs.forEach((s, i) => {
+    args.push('-i', s.file);                         // input index = i+1 (0 = the rawvideo pipe)
+    const sp = Math.max(0.1, Number(s.speed) || 1);
+    const ts = Math.max(0, Number(s.trimStart) || 0);
+    const te = Math.max(ts + 0.01, Number(s.trimEnd) || (ts + 1));
+    const delay = Math.max(0, Math.round(Number(s.delayMs) || 0));
+    const vol = volumeCurve(s.volume != null ? Number(s.volume) : 100).toFixed(4);
+    const at = []; let r = sp; while (r > 2) { at.push('atempo=2.0'); r /= 2; } while (r < 0.5) { at.push('atempo=0.5'); r *= 2; } at.push(`atempo=${r.toFixed(4)}`);
+    const tempo = (Math.abs(sp - 1) > 1e-3) ? (',' + at.join(',')) : '';
+    filter.push(`[${i + 1}:a]atrim=${ts.toFixed(3)}:${te.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delay}:all=1,volume=${vol}[au${i}]`);
+    mix.push(`[au${i}]`);
+  });
+  const hasAudio = mix.length > 0;
+  if (hasAudio) {
+    const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+    if (mix.length === 1) filter.push(`${mix[0]}${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+    else filter.push(`${mix.join('')}amix=inputs=${mix.length}:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+    args.push('-filter_complex', filter.join(';'));
+  }
   args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p');
-  if (hasAudio) args.push('-map', '0:v', '-map', '1:a?', '-c:a', 'aac', '-b:a', '192k', '-shortest');
+  if (hasAudio) args.push('-map', '0:v', '-map', '[auFinal]', '-c:a', 'aac', '-b:a', '192k', '-shortest');
   else args.push('-map', '0:v', '-an');
   args.push(outPath);
   let stderr = '';
