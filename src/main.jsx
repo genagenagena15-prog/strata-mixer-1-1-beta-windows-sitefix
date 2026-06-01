@@ -3613,7 +3613,14 @@ function Editor({ state, setState }) {
   // Phase 2 Tier A: probe the tier once (async — WebCodecs hw check).
   useEffect(() => {
     let alive = true;
-    pickTier().then(r => { if (alive) engineTierRef.current = r.tier; }).catch(() => { if (alive) engineTierRef.current = 'B'; });
+    pickTier().then(r => {
+      if (!alive) return;
+      engineTierRef.current = r.tier;
+      // GRADUATION: the WebGL2 engine is the DEFAULT preview path on Tier A (WebGL2 + WebCodecs) —
+      // GPU effects (transitions/styles/anims) show without the Ctrl+Shift+G toggle. canvas2d stays
+      // the Tier-B fallback, and the per-frame error self-disable still reverts to it. Toggle preserved.
+      if (r.tier === 'A' && canUseWebgl()) setEngineMode(true);
+    }).catch(() => { if (alive) engineTierRef.current = 'B'; });
     return () => { alive = false; };
   }, []);
   // Phase 2 Tier A: keep one VideoSource per video layer alive while engineMode is on — create on
