@@ -8,6 +8,7 @@ import {
   getGL, makeProgram, createUnitQuad, createTexture, createFBO,
   uploadElement, VS_QUAD, pxRectToNDC,
 } from './gl.js';
+import { FS_TRANSITIONS, TRANSITION_TYPE } from './effects/transitions.js';
 
 // CSS-filter colour-correct, shared by every shader that cc's. Mirrors canvas2d
 // `ctx.filter = brightness(%) contrast(%) saturate(%) hue-rotate(deg)` APPLIED IN THAT ORDER, in
@@ -164,6 +165,13 @@ void main(){
   frag = vec4(clamp(c, 0.0, 1.0), a);
 }`;
 
+// Fullscreen-quad VS for the ported effect shaders (effects/*.js). Uses our location-0
+// unit quad (aPos in [0,1]²) and emits `v_uv` (0..1) — the varying name the pack FS expect.
+const VS_FX = `#version 300 es
+layout(location=0) in vec2 aPos;
+out vec2 v_uv;
+void main(){ v_uv = aPos; gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); }`;
+
 function hexToRgb(hex) {
   const h = (hex || '#000000').replace('#', '');
   const s = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
@@ -189,6 +197,7 @@ export class Compositor {
     this.progMaskedVideo = makeProgram(gl, VS_QUAD, FS_MASKEDVIDEO);
     this.progScreen = makeProgram(gl, VS_QUAD, FS_MUL);
     this.progPixelize = makeProgram(gl, VS_QUAD, FS_PIXELIZE);
+    this.progFX = makeProgram(gl, VS_FX, FS_TRANSITIONS);   // ported 24 GPU transitions (effects/transitions.js)
     this.quad = createUnitQuad(gl);
     this.scene = createFBO(gl, 16, 16);   // accumulator
     this.scratchA = createFBO(gl, 16, 16); // ping-pong for effects that read the accumulator
@@ -283,7 +292,9 @@ export class Compositor {
       } else if (layer.type === 'zoom') {
         this._zoomLayer(frame, layer, bw, bh);
       } else if (layer.type === 'transition') {
-        this._transition(frame, layer, bw, bh);
+        const fxType = TRANSITION_TYPE[layer.kind];
+        if (fxType != null) this._transitionGPU(frame, layer, bw, bh, fxType);  // ported GPU transition
+        else this._transition(frame, layer, bw, bh);                            // legacy kinds (now no-op)
       }
     }
 
@@ -631,6 +642,49 @@ export class Compositor {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  }
+
+  // GPU transition pass — the ported pack effects (effects/transitions.js, 24 kinds via u_type).
+  // SELF-EFFECT mode: u_from = u_to = the current composite (scratchA). Works for the energetic
+  // DISTORTION transitions (zoom-blur / glitch / spin / flash / pixelate / ripple / swirl / …); pure
+  // A→B crossfades (fade / luma-wipe / iris) are degenerate here (from==to) until a clip-pair feed
+  // lands — TODO (needs the outgoing+incoming clip textures at the cut). Gated by the layer window
+  // via u_progress 0..1; strength = layer.strength/50 (0..100 → ~0..2). Mirrors export by construction
+  // (same shader on both paths once engineExport renders the same pass).
+  _transitionGPU(frame, layer, bw, bh, fxType) {
+    const gl = this.gl;
+    const tls = layer.startTime || 0, tle = layer.endTime != null ? layer.endTime : frame.dur;
+    const span = Math.max(0.01, tle - tls);
+    const prog = Math.max(0, Math.min(1, (frame.time - tls) / span));
+    const strength = layer.strength != null ? Math.max(0, layer.strength) / 50 : 1;
+    this._snapshotScene(bw, bh);                 // composite → scratchA
+    this.scratchB.resize(bw, bh);
+    // render the transition (snapshot → scratchB)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchB.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.disable(gl.BLEND);
+    const p = this.progFX;
+    gl.useProgram(p); gl.bindVertexArray(this.quad);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchA.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.scratchA.tex);
+    gl.uniform1i(p.u.u_from, 0);
+    gl.uniform1i(p.u.u_to, 1);
+    gl.uniform1f(p.u.u_progress, prog);
+    gl.uniform1f(p.u.u_strength, strength);
+    gl.uniform1f(p.u.u_time, frame.time);
+    gl.uniform1i(p.u.u_type, fxType);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // scratchB → scene (replace, no blend)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.progBlit); gl.bindVertexArray(this.quad);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchB.tex);
+    gl.uniform1i(this.progBlit.u.uTex, 0);
+    gl.uniform4f(this.progBlit.u.uRect, -1, -1, 1, 1);
+    gl.uniform1i(this.progBlit.u.uFlip, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.activeTexture(gl.TEXTURE0); // restore default active unit
   }
 
   // transition layer (time-windowed) — engineMode parity for the 6 NEW transition kinds
