@@ -2,7 +2,7 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu, Tray, nativeImage, scr
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const archiver = require('archiver');
 const extractZip = require('extract-zip');
 
@@ -2227,6 +2227,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           // fuzzy match can hijack it (the old bug: "Arista Pro Thin" rendered as
           // Bold; "Open Sans" picked the Bold file; an installed system copy won).
           let subFontDir = '';
+          let subFontFileAscii = '';   // ASCII-path copy of the font (drawtext probe)
           let fontToken = null;
           const _ff = subL?.style?.fontFile;
           if (_ff) {
@@ -2242,6 +2243,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
                   fs.copyFileSync(_ff, dest); // patch failed → at least isolate
                 }
                 subFontDir = isoDir;
+                subFontFileAscii = dest;     // isolated ASCII copy → drawtext can open it
                 tmpFontDirs.push(isoDir);
               } else {
                 subFontDir = path.dirname(_ff);
@@ -2250,7 +2252,11 @@ ipcMain.handle('video:edit', async (_event, payload) => {
               subFontDir = path.dirname(_ff);  // fall back to the whole folder
             }
           }
-          const assText = buildAssForSubtitles(subL, evenW, evenH, fontToken);
+          // Measure how much larger libass must render so the burn equals the
+          // text layer (drawtext) / canvas preview for THIS exact font (cached).
+          const _assFontName = fontToken || readFontFamilyName(_ff) || subL?.style?.fontFamily || 'Arial';
+          const assScale = measureLibassFontScale(_ff || _assFontName, _assFontName, subFontDir, subFontFileAscii);
+          const assText = buildAssForSubtitles(subL, evenW, evenH, fontToken, assScale);
           const assPath = path.join(os.tmpdir(), `smass_${Date.now()}_${si}.ass`);
           fs.writeFileSync(assPath, assText, 'utf8');
           tmpFiles.push(assPath);
@@ -3396,49 +3402,86 @@ function patchFontFamilyToToken(srcFile, destFile, token) {
   } catch { return false; }
 }
 
-// libass sizes a style's Fontsize by the font's OS/2 win-metrics
-// ((usWinAscent + usWinDescent) / unitsPerEm), NOT by the em square the way a
-// CSS canvas does (`Npx` → em = N px). So at the same nominal size, libass text
-// is ~10-20% smaller than the canvas preview, and the gap VARIES per font.
-// We read the metrics from the file and return the scale that makes the burned
-// subtitle match the preview's pixel height 1:1. Measured empirically accurate
-// to ~1-2% across Arial/Impact/Verdana/Calibri/Times. Cached per file.
-const _fontScaleCache = new Map();
-function readFontAssScale(fontFile) {
-  if (!fontFile) return 1.16;
-  if (_fontScaleCache.has(fontFile)) return _fontScaleCache.get(fontFile);
-  let scale = 1.16;  // sane average fallback if the tables can't be read
+// ── libass ⇆ text/canvas size parity ───────────────────────────────────────
+// libass renders a given Fontsize SMALLER than ffmpeg `drawtext` (FreeType)
+// does, by a FONT-SPECIFIC factor (1.08–1.76× across our bundled fonts — libass
+// scales by the font's ascender/descender metrics, which differ per font and per
+// the USE_TYPO_METRICS flag). drawtext IS the reference: it's the exact
+// rasterizer the TEXT layer burns with, and it matches the real glyph outline
+// the canvas preview draws (the OS/2 sCapHeight metric is ~5% off on display
+// faces like Bangers, so we do NOT use it). We render the same flat-cap probe
+// BOTH ways at one nominal size, read the real glyph height from a raw frame, and
+// scale = drawtextHeight / libassHeight. Applied to the subtitle Fontsize this
+// makes the burn match the text layer AND the preview 1:1 (glyph WIDTH scales by
+// the same factor, so canvas-measured word positions still line up — no eaten
+// spaces). Resolution-independent (verified 600²…1080×1920 identical), so a tiny
+// 600² probe suffices. Cached per font file: two ~0.1 s renders the first time a
+// font is exported, then free.
+const _libassScaleCache = new Map();
+const _PROBE_BOX = 600;
+function _grayProbeHeight(vf) {
+  let ff = ''; try { ff = findFfmpeg(); } catch {}
+  if (!ff) return 0;
+  let out;
   try {
-    const buf = fs.readFileSync(fontFile);
-    let base = 0;
-    if (buf.toString('latin1', 0, 4) === 'ttcf') base = buf.readUInt32BE(12);
-    const numTables = buf.readUInt16BE(base + 4);
-    let headOff = 0, os2Off = 0, hheaOff = 0;
-    for (let i = 0; i < numTables; i++) {
-      const rec = base + 12 + i * 16;
-      const tag = buf.toString('latin1', rec, rec + 4);
-      if (tag === 'head') headOff = buf.readUInt32BE(rec + 8);
-      else if (tag === 'OS/2') os2Off = buf.readUInt32BE(rec + 8);
-      else if (tag === 'hhea') hheaOff = buf.readUInt32BE(rec + 8);
-    }
-    if (headOff) {
-      const unitsPerEm = buf.readUInt16BE(headOff + 18) || 2048;
-      let h = 0;
-      if (os2Off) {
-        // usWinAscent (+74, uint16) + usWinDescent (+76, uint16) — the metric
-        // libass actually scales by on Windows-style TrueType fonts.
-        h = buf.readUInt16BE(os2Off + 74) + buf.readUInt16BE(os2Off + 76);
-      }
-      if (!h && hheaOff) {
-        // Fallback to hhea ascent-descent if there's no OS/2 table.
-        h = buf.readInt16BE(hheaOff + 4) - buf.readInt16BE(hheaOff + 6);
-      }
-      if (h > 0) scale = h / unitsPerEm;
-    }
-  } catch { scale = 1.16; }
-  // Guard against absurd values from a malformed table.
-  if (!(scale > 0.8 && scale < 1.6)) scale = 1.16;
-  _fontScaleCache.set(fontFile, scale);
+    out = spawnSync(ff, ['-hide_banner', '-f', 'lavfi', '-i', `color=c=black:s=${_PROBE_BOX}x${_PROBE_BOX}:d=0.1`,
+      '-vf', vf, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+      { windowsHide: true, maxBuffer: 1 << 24 });
+  } catch { return 0; }
+  const buf = out && out.stdout;
+  if (!buf || buf.length < _PROBE_BOX * _PROBE_BOX) return 0;
+  let minY = -1, maxY = -1;
+  for (let y = 0; y < _PROBE_BOX; y++) {
+    let any = false;
+    const row = y * _PROBE_BOX;
+    for (let x = 0; x < _PROBE_BOX; x++) { if (buf[row + x] > 80) { any = true; break; } }
+    if (any) { if (minY < 0) minY = y; maxY = y; }
+  }
+  return maxY < 0 ? 0 : (maxY - minY + 1);
+}
+function _libassProbeHeight(fontName, fontsDir, size) {
+  const probe = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${_PROBE_BOX}
+PlayResY: ${_PROBE_BOX}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: P,${fontName || 'Arial'},${size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,P,,0,0,0,,{\\an5\\pos(${_PROBE_BOX / 2},${_PROBE_BOX / 2})}HXHIX
+`;
+  const probePath = path.join(os.tmpdir(), `smass_probe_${Date.now()}_${Math.floor(Math.random() * 1e6)}.ass`);
+  try {
+    fs.writeFileSync(probePath, probe, 'utf8');
+    const vf = (fontsDir ? `ass='${ffPath(probePath)}':fontsdir='${ffPath(fontsDir)}'` : `ass='${ffPath(probePath)}'`) + ',format=gray';
+    return _grayProbeHeight(vf);
+  } catch { return 0; } finally { try { fs.unlinkSync(probePath); } catch {} }
+}
+function _drawtextProbeHeight(fontFileAscii, size) {
+  if (!fontFileAscii) return 0;
+  return _grayProbeHeight(`drawtext=fontfile='${ffPath(fontFileAscii)}':text=HXHIX:fontsize=${size}:fontcolor=white:x=(w-tw)/2:y=(h-th)/2,format=gray`);
+}
+// Multiplier to apply to a subtitle Fontsize so libass renders it the same pixel
+// size the text layer (drawtext) / canvas preview would. `fontFileAscii` must be
+// an ASCII-path copy of the font (drawtext/FreeType silently can't open
+// non-ASCII paths — the export already isolates one into tmp). Cached per file.
+function measureLibassFontScale(cacheKey, libassFontName, fontsDir, fontFileAscii) {
+  const key = cacheKey || libassFontName || '';
+  if (_libassScaleCache.has(key)) return _libassScaleCache.get(key);
+  let scale = 1.16; // safe average if probing can't run
+  try {
+    const P = 200;
+    const libH = _libassProbeHeight(libassFontName, fontsDir, P);
+    const textH = _drawtextProbeHeight(fontFileAscii, P);
+    if (libH > 0 && textH > 0) scale = textH / libH;
+  } catch {}
+  if (!(scale > 0.8 && scale < 2.8)) scale = 1.16;
+  _libassScaleCache.set(key, scale);
   return scale;
 }
 
@@ -3467,21 +3510,20 @@ function _assTime(t) {
 // but only one word is in highlightColor. This is the simplest path to CapCut-
 // style karaoke that works with any libass build (vanilla \k tags would invert
 // the colour semantics).
-function buildAssForSubtitles(subL, outWidth, outHeight, fontNameOverride) {
+function buildAssForSubtitles(subL, outWidth, outHeight, fontNameOverride, assScale) {
   const style = subL.style || {};
   // Prefer the layout's (possibly auto-fitted) fontSize over style.fontSize so
   // shrink-to-fit-box behaves identically in the burned-in result.
   const layoutFs = subL._layout && Number(subL._layout.fontSize);
   const canvasPx = Math.max(12, Math.round(layoutFs || Number(style.fontSize) || 56));
-  // libass renders glyphs at the SAME scale a CSS canvas does (Fontsize ≡ em
-  // size, factor ≈ 1.0 — measured exactly 1.000 on Arista Pro, ~0.9-1.0 on the
-  // rest within cap-metric noise). So NO size correction is needed: Fontsize =
-  // canvasPx, ScaleX = ScaleY = 100. The old win-metric scale (~1.44) was a
-  // mis-correction that EITHER widened glyphs (ate the spaces between words) when
-  // applied to Fontsize, OR stretched them vertically (text looked condensed)
-  // when applied to ScaleY. Both are gone now: glyph width matches the canvas-
-  // measured positions (no overlap/gap) and the aspect ratio is undistorted.
-  const fontSize = canvasPx;
+  // libass renders a given Fontsize SMALLER than the canvas does, by a
+  // FONT-SPECIFIC factor (1.16–1.75× across our fonts — it scales by the font's
+  // ascender/descender metrics, not the em square). `assScale` is MEASURED per
+  // font (measureLibassFontScale) so the burn matches the preview 1:1. One
+  // uniform scale on Fontsize fixes BOTH height and width (the glyph is simply
+  // bigger), so the canvas-measured word positions still line up — no eaten
+  // spaces, no vertical-only stretch. ScaleX = ScaleY = 100.
+  const fontSize = Math.max(12, Math.round(canvasPx * (Number(assScale) > 0 ? Number(assScale) : 1)));
   const yScale = 100;
   // fontNameOverride is the unique token of the patched/isolated font file (see
   // the export loop) — using it guarantees libass loads the EXACT file the

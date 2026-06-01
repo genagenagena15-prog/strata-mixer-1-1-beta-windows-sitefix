@@ -2048,6 +2048,17 @@ html[data-theme="light"] .save-fmt-dialog{
   background:transparent; outline:none; border:0; z-index:6;
   cursor:text; user-select:text; paint-order:stroke fill;
 }
+/* Inline text-layer editor — edits the text IN PLACE, styled exactly like the
+   rendered text (font/size/colour/align/shadow set inline), so you see what
+   you're changing live. The canvas hides this layer while editing. */
+.text-inline-edit{
+  position:absolute; inset:0;
+  box-sizing:border-box; margin:0;
+  display:flex; align-items:center;
+  white-space:pre; overflow:visible;
+  background:transparent; outline:none; border:0; z-index:6;
+  cursor:text; user-select:text;
+}
 /* In-app hint toast — replaces native alert() so warnings match the editor's
    look. Slides in from the top-center, auto-dismisses after 4 s. Clickable to
    dismiss early; × button for explicit close. */

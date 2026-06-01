@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
-const APP_VERSION = 'v1.3.4';
+const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
 // crisp still). 0.5 → ¼ the pixels → ~4× cheaper compositing, no audio glitch.
 const PREVIEW_SCALE = 0.5;
@@ -1923,6 +1923,17 @@ function Editor({ state, setState }) {
       });
       return { ...l, segments: news };
     }));
+  }
+  // Inline TEXT-layer editing on the preview (same UX as subtitles): double-click
+  // a text layer → type right there, styled exactly like the rendered text, so
+  // you see the applied font/size/colour live. The canvas hides the layer while
+  // editing (the styled HTML field shows it instead — no double text).
+  const [textEdit, setTextEdit] = useState(null);     // layerId | null
+  const [textEditText, setTextEditText] = useState('');
+  const textEditRef = useRef(null);
+  useEffect(() => { textEditRef.current = textEdit; kickRender(); }, [textEdit]);
+  function setLayerText(layerId, newText) {
+    set('layers', (ls) => ls.map(l => l.id === layerId ? { ...l, text: newText } : l));
   }
   // Lightweight in-app toast for soft errors / hints. Replaces native alert()
   // so notifications match the editor's look — dark card, orange accent.
@@ -4861,6 +4872,9 @@ function Editor({ state, setState }) {
         if (maskVFull) { try { ctx.drawImage(maskVFull, 0, 0, W, H); } catch(e) {} }
         ctx.restore();
       } else if (layer.type === 'text') {
+        // While inline-editing this text layer, the styled HTML field renders it
+        // instead — skip the canvas draw so they don't double up.
+        if (textEditRef.current === layer.id) continue;
         const fs = layer.size || 48;
         ctx.save();
         ctx.font = `${fs}px ${fontCss(layer)}`;
@@ -5687,7 +5701,7 @@ function Editor({ state, setState }) {
 
           <div className="ed-preview-wrap" data-onb="preview"
             onPointerDown={startPreviewPan}
-            onPointerDownCapture={(e) => { if (e.target && e.target.closest && e.target.closest('.sub-inline-edit')) return; const a = document.activeElement; if (a && a !== document.body && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || '') || a.isContentEditable)) { try { a.blur(); } catch {} } }}
+            onPointerDownCapture={(e) => { if (e.target && e.target.closest && (e.target.closest('.sub-inline-edit') || e.target.closest('.text-inline-edit'))) return; const a = document.activeElement; if (a && a !== document.body && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || '') || a.isContentEditable)) { try { a.blur(); } catch {} } }}
             style={{ flex: '0 0 auto', height: previewH, position:'relative', cursor: 'grab' }}>
             {/* Current preview quality — in the top-left CORNER of the preview
                 area (off the video), subtle transparent-black chip. */}
@@ -5725,19 +5739,55 @@ function Editor({ state, setState }) {
                       (currentTime < (layer.startTime||0) || currentTime > (layer.endTime??dur))) return null;
                   const isSel = selectedId === layer.id || selectedIds.has(layer.id);
                   const b = getLayerPx(layer);
+                  const isTextEditing = layer.type === 'text' && textEdit === layer.id;
+                  // canvas px → displayed preview px (so the field matches the draw).
+                  const tScale = (canvasRef.current?.offsetWidth || outWidth) / outWidth;
                   return (
                     <div key={layer.type==='text'?`${layer.id}-${fontRevision}`:layer.id}
-                      onPointerDown={makePreviewDrag(layer.id)}
+                      onPointerDown={isTextEditing ? undefined : makePreviewDrag(layer.id)}
+                      onDoubleClick={layer.type === 'text'
+                        ? () => { pushUndo(); setTextEdit(layer.id); setTextEditText(layer.text || ''); }
+                        : undefined}
+                      title={layer.type === 'text' ? 'Двойной клик → редактировать текст прямо здесь' : undefined}
                       style={{ position:'absolute',
                         left:`${b.x/outWidth*100}%`, top:`${b.y/outHeight*100}%`,
                         width:`${b.w/outWidth*100}%`, height:`${b.h/outHeight*100}%`,
-                        cursor:'move', userSelect:'none', touchAction:'none', background:'transparent',
+                        cursor: isTextEditing ? 'text' : 'move', userSelect:'none', touchAction:'none', background:'transparent',
                         border: isSel ? '1px dashed rgba(255,255,255,.85)' : undefined,
                         boxShadow: isSel ? '0 0 0 1px rgba(0,0,0,.55)' : undefined }}>
                       {layer.reversed && <span className="ed-reversed-badge">⏪</span>}
-                      {isSel && ['nw','n','ne','e','se','s','sw','w'].map(h =>
+                      {!isTextEditing && isSel && ['nw','n','ne','e','se','s','sw','w'].map(h =>
                         <div key={h} className={`preview-rh preview-rh-${h}`}
                           onPointerDown={makePreviewResize(layer.id, h)} />)}
+                      {isTextEditing && (
+                        <div className="text-inline-edit" contentEditable suppressContentEditableWarning
+                          ref={el => {
+                            if (!el || el._inited) return;
+                            el._inited = true;
+                            el.textContent = textEditText;
+                            setTimeout(() => { try { el.focus(); const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); } catch {} }, 0);
+                          }}
+                          onPointerDown={e => e.stopPropagation()}
+                          onInput={e => setTextEditText(e.currentTarget.textContent || '')}
+                          onBlur={() => { setLayerText(layer.id, textEditText); setTextEdit(null); }}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); }
+                            else if (e.key === 'Escape') { e.preventDefault(); setTextEdit(null); }
+                          }}
+                          style={{
+                            justifyContent: layer.align === 'left' ? 'flex-start' : layer.align === 'right' ? 'flex-end' : 'center',
+                            textAlign: layer.align || 'center',
+                            paddingLeft: layer.align === 'left' ? `${12 * tScale}px` : 0,
+                            paddingRight: layer.align === 'right' ? `${12 * tScale}px` : 0,
+                            fontFamily: fontCss(layer),
+                            fontSize: `${Math.max(8, (layer.size || 48) * tScale)}px`,
+                            lineHeight: 1,
+                            color: layer.color || '#ffffff',
+                            opacity: (layer.opacity || 100) / 100,
+                            textShadow: `${2 * tScale}px ${2 * tScale}px 0 rgba(0,0,0,.85)`,
+                            caretColor: layer.color || '#ffffff',
+                          }} />
+                      )}
                     </div>
                   );
                 })}
