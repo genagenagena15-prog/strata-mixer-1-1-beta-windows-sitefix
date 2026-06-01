@@ -1951,30 +1951,35 @@ html[data-theme="light"] .save-fmt-dialog{
 /* ═══════════════ Preview zoom controls ═══════════════ */
 .preview-zoom-ctrl{
   position:absolute;bottom:8px;right:8px;z-index:25;
-  display:flex;align-items:center;gap:2px;
-  padding:4px 6px;
+  display:flex;align-items:center;gap:1px;
+  padding:2px 3px;
   background:rgba(15,15,18,.78);
   border:1px solid rgba(255,255,255,.10);
-  border-radius:10px;
+  border-radius:8px;
   color:#dfe6f5;
-  font-size:11px;font-weight:800;
+  font-size:9px;font-weight:800;
   user-select:none;
   backdrop-filter:blur(6px);
   -webkit-backdrop-filter:blur(6px);
   box-shadow:0 4px 14px rgba(0,0,0,.4);
 }
 .preview-zoom-ctrl button{
-  width:24px;height:24px;
+  width:16px;height:16px;
   display:flex;align-items:center;justify-content:center;
   border:0;background:transparent;color:inherit;
-  border-radius:6px;cursor:pointer;
-  font-size:16px;font-weight:700;line-height:1;
+  border-radius:5px;cursor:pointer;
+  font-size:12px;font-weight:700;line-height:1;
   padding:0;transition:background .12s,color .12s;
 }
+.preview-zoom-ctrl button svg{width:10px;height:10px}
 .preview-zoom-ctrl button:hover{background:rgba(255,255,255,.12);color:#fff}
 .preview-zoom-ctrl button:active{background:rgba(255,138,0,.22)}
-.preview-zoom-ctrl .zoom-pct{min-width:38px;text-align:center;font-variant-numeric:tabular-nums;color:#fff;position:relative;cursor:ns-resize;user-select:none}
+.preview-zoom-ctrl .zoom-pct{min-width:26px;text-align:center;font-variant-numeric:tabular-nums;color:#fff;position:relative;cursor:ns-resize;user-select:none}
 .preview-zoom-ctrl .zoom-pct-scrub.active{color:#ff8a00}
+/* The volume control sits in the TOP-right, so its drag-track drops DOWN (below
+   the buttons) instead of up — otherwise it would render above the preview and
+   be off-screen. */
+.ed-prevol-ctrl .zoom-scrub-track{bottom:auto;top:calc(100% + 8px);animation:zoomScrubDown .14s ease-out;z-index:26}
 /* Vertical zoom-scrub track — pops up above the % label while the user is
    dragging. Anchors to the bottom-center of the % span, height ~150px. */
 .zoom-scrub-track{

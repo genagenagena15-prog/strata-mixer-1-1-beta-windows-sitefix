@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Strata — GPU Preview Engine · Phase 1 De-risk Bench</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0c0d12; color: #e7e9f0; font: 13px/1.45 -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 14px; height: 100vh; }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  .sub { color: #8b90a3; font-size: 11px; margin: 0 0 12px; }
+  .panel { background: #14161f; border: 1px solid #232636; border-radius: 10px; padding: 12px; }
+  .left { overflow: auto; }
+  .right { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 4px 6px; border-bottom: 1px solid #1d2030; vertical-align: top; }
+  td.k { color: #99a; white-space: nowrap; }
+  td.val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .ok { color: #4ade80; } .warn { color: #fbbf24; } .bad { color: #f87171; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #7c819a; margin: 14px 0 6px; }
+  button { background: #2b6cf0; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #3b78f5; }
+  .verdict { font-size: 15px; font-weight: 700; padding: 12px; border-radius: 10px; background: #14161f; border: 1px solid #232636; min-height: 22px; }
+  .verdict.ok { border-color: #1f6b3a; background: #0f1a13; }
+  .verdict.warn { border-color: #6b551f; background: #1a160f; }
+  .verdict.bad { border-color: #6b1f1f; background: #1a0f0f; }
+  #view { width: 100%; height: 100%; object-fit: contain; background: #000; border-radius: 8px; max-height: calc(100vh - 230px); }
+  .viewbox { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; background: #07080c; border: 1px solid #232636; border-radius: 10px; }
+  #log { font: 11px/1.4 ui-monospace, Consolas, monospace; color: #9aa0b5; background: #0a0b10; border: 1px solid #1d2030; border-radius: 8px; padding: 8px; height: 150px; overflow: auto; white-space: pre-wrap; }
+  #log .bad { color: #f87171; } #log .warn { color: #fbbf24; }
+  .hint { color: #6b7088; font-size: 11px; }
+  .stress { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
+  .srow { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; padding: 3px 4px; border-bottom: 1px solid #1d2030; }
+  .sname { color: #aab; }
+  .sval { font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .sval.ok { color: #4ade80; } .sval.warn { color: #fbbf24; } .sval.bad { color: #f87171; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel left">
+    <h1>GPU Preview Engine — Phase 1</h1>
+    <p class="sub">De-risk: WebCodecs 0-copy → WebGL2 composite → SDF glow. GO/NO-GO on this machine.</p>
+    <button id="run">▶ Перезапустить бенч</button>
+
+    <h2>Capabilities · Tier</h2>
+    <table>
+      <tr><td class="k">WebGL2</td><td id="cap-webgl2" class="val">…</td></tr>
+      <tr><td class="k">Renderer (GPU)</td><td id="cap-renderer" class="val" style="font-size:10px;font-weight:500">…</td></tr>
+      <tr><td class="k">HW / Software</td><td id="cap-software" class="val">…</td></tr>
+      <tr><td class="k">WebCodecs</td><td id="cap-webcodecs" class="val">…</td></tr>
+      <tr><td class="k">H.264 hardware</td><td id="cap-hwh264" class="val">…</td></tr>
+      <tr><td class="k">→ Tier</td><td id="cap-tier" class="val">…</td></tr>
+      <tr><td class="k">GPU timer</td><td id="cap-timer" class="val">…</td></tr>
+    </table>
+
+    <h2>Decode / Upload</h2>
+    <table>
+      <tr><td class="k">Decode (12 layers)</td><td id="r-decode" class="val">…</td></tr>
+      <tr><td class="k">Upload (0-copy)</td><td id="r-upload" class="val">…</td></tr>
+    </table>
+
+    <h2>Stress ladder · реальные GPU ms</h2>
+    <div id="stress" class="stress"></div>
+    <p class="hint">Зелёный &lt;16.6мс (60fps), жёлтый &lt;33мс (30fps), красный — не тянет. На RTX всё будет зелёным — смысл в ЗАПАСЕ для прогноза на встройку.</p>
+
+    <h2>Log</h2>
+    <div id="log"></div>
+    <p class="hint">Глянь на превью справа: бирюзовое слово «НЕОН» — свечение должно быть ГЛАДКИМ, без квадратиков. Это проверка SDF-glow.</p>
+  </div>
+
+  <div class="right">
+    <div id="verdict" class="verdict">…</div>
+    <div class="viewbox"><canvas id="view"></canvas></div>
+  </div>
+</div>
+<script type="module" src="./bench.js"></script>
+</body>
+</html>

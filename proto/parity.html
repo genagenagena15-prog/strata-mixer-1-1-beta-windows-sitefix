@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<title>Strata — Engine Parity Harness (Step A)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0c0d12; color: #e7e9f0; font: 13px -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { padding: 14px; }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  .verdict { font-size: 14px; font-weight: 700; padding: 10px 12px; border-radius: 8px; background: #14161f; border: 1px solid #232636; margin-bottom: 12px; }
+  .verdict.ok { border-color: #1f6b3a; background: #0f1a13; color: #4ade80; }
+  .verdict.warn { border-color: #6b551f; background: #1a160f; color: #fbbf24; }
+  .verdict.bad { border-color: #6b1f1f; background: #1a0f0f; color: #f87171; }
+  .row { display: flex; gap: 14px; align-items: flex-start; }
+  .col { display: flex; flex-direction: column; gap: 4px; }
+  .col span { color: #8b90a3; font-size: 11px; }
+  canvas { height: 70vh; max-height: 720px; width: auto; background: #000; border: 1px solid #232636; border-radius: 6px; }
+  #log { margin-top: 12px; font: 11px ui-monospace, Consolas, monospace; color: #9aa0b5; background: #0a0b10; border: 1px solid #1d2030; border-radius: 6px; padding: 8px; white-space: pre-wrap; max-height: 140px; overflow: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Engine Parity Harness — Step A (video / image / overlay)</h1>
+  <div id="verdict" class="verdict">running…</div>
+  <div class="row">
+    <div class="col"><span>canvas2d (reference)</span><canvas id="c2"></canvas></div>
+    <div class="col"><span>WebGL2 Compositor</span><canvas id="cg"></canvas></div>
+    <div class="col"><span>diff ×6 (black = identical)</span><canvas id="c3"></canvas></div>
+  </div>
+  <div id="log"></div>
+</div>
+<script type="module" src="./parity.js"></script>
+</body>
+</html>

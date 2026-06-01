@@ -2,6 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import './styles.css';
+// Phase 2 — ONE WebGL2 compositor (preview source-of-truth, default OFF behind engineMode).
+import { Compositor } from './engine/compositor.js';
+import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
+import { canUseWebgl, pickTier } from './engine/caps.js';
+import { VideoSource } from './engine/decode.js';
+import { renderExportFrames } from './engine/exportRender.js';
 
 const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
@@ -154,46 +160,30 @@ const SUB_EFFECTS = [
 // Per-word/phrase subtitle animations. The timing constants here are the SHARED
 // contract between the canvas preview (src/main.jsx) and the ASS export
 // (electron/main.js buildAssForSubtitles) — change them in both or they drift.
+// Old 8 subtitle animations REMOVED (pivoting to the GPU effects pack). Only the
+// no-animation option remains until the pack's anims land. The SUB_ANIM timing
+// consts below are kept (referenced by now-dead render branches that no-op when
+// anim==='none') and get physically removed when the pack replaces that code.
 const SUB_ANIMS = [
-  { id: 'none',      name: 'Без анимации' },
-  { id: 'pop',       name: 'Поп' },              // active word scale-punches when spoken
-  { id: 'bam',       name: 'Бам' },              // overshooting pop: 150% → 85% → 100%
-  { id: 'scale',     name: 'Масштаб (зум-ин)' }, // whole phrase scales 60→100 + fades in
-  { id: 'zoomout',   name: 'Зум-аут' },          // whole phrase scales 140→100 + fades in
-  { id: 'type',      name: 'Печатная' },         // words appear one-by-one as spoken
-  { id: 'rise',      name: 'Подъём' },           // words rise up + fade in as spoken
-  { id: 'blurfocus', name: 'Размытие в фокус' }, // active word starts blurred → sharp
-  { id: 'glow',      name: 'Glow-пульс' },       // outline width pulses on active word
-  { id: 'colorwave', name: 'Цвет-волна' },       // active word cycles colours
-  { id: 'neon',      name: 'Неон-мерцание' },    // thick neon outline + rapid alpha flicker
-  { id: 'typewriter',name: 'Печатная + курсор' },// type reveal + blinking | cursor after last word
-  { id: 'shake',     name: 'Тряска' },           // ±4° rotation jitter on active word
-  { id: 'bounce',    name: 'Отскок' },           // drops in from above with squash-and-stretch
+  { id: 'none', name: 'Без анимации' },
 ];
 const SUB_ANIM = {
-  POP_MS: 130, POP_SCALE: 1.30,         // pop: 130% → 100% over 130ms
-  SCALE_MS: 200, SCALE_FROM: 0.60, SCALE_FADE_MS: 120,
-  RISE_MS: 150, RISE_OFFSET: 28, RISE_FADE_MS: 100,
-  // NEW:
-  BAM_MS1: 100, BAM_MS2: 180,           // bam: 150%→85% over 0-100ms, 85%→100% over 100-180ms
-  BAM_FROM: 1.50, BAM_MID: 0.85,
-  BLUR_MS: 200, BLUR_PX: 8,             // blurfocus: 8px → 0 over 200ms
-  ZOUT_MS: 200, ZOUT_FROM: 1.40, ZOUT_FADE_MS: 120,
-  GLOW_MS: 500, GLOW_MUL: 2.5,          // outline width pulses base → base*MUL → base, triangle wave
-  WAVE_MS: 350,                          // colour-wave: 350ms per colour
-  WAVE_COLORS: ['#ff9a1f', '#ff3bb8', '#46d3ff', '#aaff00'],
-  // neon: outline becomes thick + cyan, alpha flickers in 6 stages over 200ms then stable
-  NEON_MS: 200, NEON_BORD_MUL: 2.2, NEON_COLOR: '#00f0ff',
-  NEON_STAGES: [[0,50,1.0],[50,70,0.0],[70,100,1.0],[100,120,0.0],[120,160,0.45],[160,Infinity,1.0]],
-  // typewriter: cursor | blinks 250ms on / 250ms off after each revealed word
-  TYPE_CURSOR_MS: 500,                  // full blink period (on+off)
-  TYPE_CURSOR_PAD: 0.18,                // gap between word end and cursor, in fontSize units
-  // shake: 5 stages of rotation pivoting around the word center, ±4° decaying
-  SHAKE_STAGES: [[0,40,4],[40,80,-4],[80,120,3],[120,160,-2],[160,200,0]],
-  // bounce: drops from above with squash; 3 phases (drop / squash / settle)
-  BOUNCE_OFFSET: 60, BOUNCE_DROP_MS: 120, BOUNCE_SQUASH_MS: 80, BOUNCE_SETTLE_MS: 100,
-  BOUNCE_FROM_FSCX: 80, BOUNCE_FROM_FSCY: 140,   // drop start (tall+thin)
-  BOUNCE_HIT_FSCX: 120, BOUNCE_HIT_FSCY: 70,    // impact (wide+short)
+  // slideup: rise OFFSET px from below + fade, over MS (reveal as spoken)
+  SLIDE_MS: 160, SLIDE_OFFSET: 32, SLIDE_FADE_MS: 110,
+  // punch: 150% → 90% (0-MS1) → 100% (MS1-MS2) overshoot on the active word
+  PUNCH_MS1: 90, PUNCH_MS2: 170, PUNCH_FROM: 1.50, PUNCH_MID: 0.90,
+  // flip: vertical open, scaleY 0 → 100 over MS (reveal)
+  FLIP_MS: 180,
+  // glowpulse: outline width pulses base → base*MUL → base, triangle wave period MS
+  GPULSE_MS: 480, GPULSE_MUL: 2.6,
+  // rainbow: cycle colours, MS per colour
+  RAIN_MS: 320, RAIN_COLORS: ['#ff3b6b', '#ffb03b', '#3bd8ff', '#9b6bff'],
+  // typeon: reveal as spoken + quick fade-in
+  TYPEON_FADE_MS: 90,
+  // drop: fall DROP_OFFSET px from above (0-DROP_MS) + squash settle (scaleY) over DROP_SQUASH_MS
+  DROP_OFFSET: 70, DROP_MS: 150, DROP_SQUASH_MS: 90, DROP_SQUASH_FSCY: 78,
+  // zoomin: whole phrase scales ZOOMIN_FROM → 100 + fades in over MS
+  ZOOMIN_MS: 200, ZOOMIN_FROM: 0.60, ZOOMIN_FADE_MS: 120,
 };
 // Linear lerp between two #rrggbb hex colours → "rgb(r,g,b)".
 function lerpHex(c1, c2, f) {
@@ -203,6 +193,14 @@ function lerpHex(c1, c2, f) {
   const g = Math.round(a[1] + (b[1]-a[1]) * f);
   const bl= Math.round(a[2] + (b[2]-a[2]) * f);
   return `rgb(${r},${g},${bl})`;
+}
+
+// Legacy old→new effect migration REMOVED — the transition/subtitle sets it
+// mapped into were deleted (pivoting to the GPU effects pack). Kept as an identity
+// passthrough so the project-load call sites stay unchanged; old projects still
+// open fine, their removed effects simply no-op until the pack lands.
+function migrateLegacyLayers(layers) {
+  return Array.isArray(layers) ? layers : [];
 }
 
 const nav = [
@@ -386,7 +384,7 @@ function App() {
         totalDuration: Number(s.totalDuration) || 10,
         videoStart: Number(s.videoStart) || 0,
         videoEnd: Number(s.videoEnd) || (Number(s.totalDuration) || 10),
-        layers: Array.isArray(s.layers) ? s.layers : [],
+        layers: migrateLegacyLayers(s.layers),
         outWidth: Number(s.outWidth) || 1080,
         outHeight: Number(s.outHeight) || 1920,
         bgColor: s.bgColor || '#000000',
@@ -527,7 +525,7 @@ function App() {
                     st = { ...st, layers: (st.layers || []).map(l => (l.file && ex[l.file] === false) ? { ...l, _missing: true } : l) };
                   }
                 } catch {}
-                setEditorState(st); setActive('editor'); setRecovery(null); window.strata?.resolveRecovery?.(true);
+                setEditorState({ ...st, layers: migrateLegacyLayers(st.layers) }); setActive('editor'); setRecovery(null); window.strata?.resolveRecovery?.(true);
               }}>
                 Открыть последний проект
               </button>
@@ -2138,6 +2136,18 @@ function Editor({ state, setState }) {
   }, [zoom]);
   const canvasRef = useRef(null);
   const previewCanvasRef = useRef(null);
+  // Phase 2 WebGL2 compositor (engineMode, default OFF — the canvas2d path stays source-of-truth
+  // until parity is validated in-app). A canvas gives 2d OR webgl, not both → a separate GL canvas
+  // overlays the 2d one and is shown only while engineMode is on.
+  const glCanvasRef = useRef(null);
+  const compRef = useRef(null);
+  const [engineMode, setEngineMode] = useState(false);
+  const engineModeRef = useRef(false);
+  // Phase 2 Tier A (WebCodecs 0-copy): detected tier + one VideoSource per video layer. When the
+  // source isn't ready yet, getSource falls back to the DOM <video> so the picture never blanks.
+  const engineTierRef = useRef(null);          // 'A' | 'B' (null until probed)
+  const videoSourcesRef = useRef(new Map());   // layerId -> VideoSource
+  const engineExportingRef = useRef(false);    // P2-8 engineExport in-flight guard
   // Fullscreen preview: a second canvas painted by the same render loop, shown
   // in a fixed overlay that goes into real OS fullscreen for distraction-free
   // playback review.
@@ -2180,6 +2190,12 @@ function Editor({ state, setState }) {
   // remounts an element (src change).
   const audioCtxRef = useRef(null);
   const gainNodesRef = useRef(new WeakMap());
+  const masterGainRef = useRef(null);
+  const previewVolumeRef = useRef(100);
+  // Master PREVIEW listening volume (0–200%) — affects only what you HEAR in the
+  // editor, never the exported audio. Set by the volume control (top-right of preview).
+  const [previewVolume, setPreviewVolume] = useState(100);
+  const [prevolScrub, setPrevolScrub] = useState(false);
   function getAudioCtx() {
     if (!audioCtxRef.current) {
       try { audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)(); }
@@ -2187,6 +2203,21 @@ function Editor({ state, setState }) {
     }
     return audioCtxRef.current;
   }
+  // One master gain that every per-element gain routes into, so a single knob
+  // sets the overall preview loudness.
+  function getMasterGain() {
+    const ctx = getAudioCtx(); if (!ctx) return null;
+    if (!masterGainRef.current) {
+      try { const m = ctx.createGain(); m.gain.value = (previewVolumeRef.current ?? 100) / 100; m.connect(ctx.destination); masterGainRef.current = m; }
+      catch { masterGainRef.current = null; }
+    }
+    return masterGainRef.current;
+  }
+  useEffect(() => {
+    previewVolumeRef.current = previewVolume;
+    const m = masterGainRef.current;
+    if (m) { try { m.gain.value = previewVolume / 100; } catch {} }
+  }, [previewVolume]);
   function setBoostedVolume(el, percent) {
     if (!el) return;
     const gain = volumeCurve(percent);
@@ -2198,7 +2229,7 @@ function Editor({ state, setState }) {
         const source = ctx.createMediaElementSource(el);
         const g = ctx.createGain();
         source.connect(g);
-        g.connect(ctx.destination);
+        g.connect(getMasterGain() || ctx.destination);
         node = { source, gain: g };
         gainNodesRef.current.set(el, node);
       } catch {
@@ -2245,6 +2276,7 @@ function Editor({ state, setState }) {
   const previewFullscreenRef = useRef(false);
   const measureCanvasRef = useRef(null);
   const blurTmpRef = useRef(null);
+  const pixTmpRef = useRef(null);   // small scratch for the 'pixelize' transition (down/up nearest)
   // Holds the full composite (base + overlays) captured at the first clipping
   // mask each frame, so every mask reveals it inside its shape (union of holes).
   const maskFullRef = useRef(null);
@@ -2501,7 +2533,7 @@ function Editor({ state, setState }) {
     if (f) addLayer({ id: Date.now(), type: 'image', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 100, opacity: 100, fitCover: true });
   }
   function addBlurRegion() {
-    addLayer({ id: Date.now(), type: 'blur', startTime: 0, endTime: Math.min(3, dur), x: 25, y: 25, width: 50, height: 30, strength: 15 });
+    addLayer({ id: Date.now(), type: 'blur', startTime: 0, endTime: Math.min(3, dur), x: 25, y: 25, width: 50, height: 30, strength: 15, shape: 'square', radius: 12 });
   }
   function addZoom() {
     addLayer({ id: uid(), type: 'zoom', startTime: 0, endTime: Math.min(2, dur), strength: 30 });
@@ -2530,18 +2562,9 @@ function Editor({ state, setState }) {
   // - whippan: fast horizontal motion-blur sweep
   // - zoom:    quick zoom punch with blur (up to 3× scale)
   // - blur:    burst of gaussian blur that resolves
-  function transitionParams(kind, strength) {
-    const s = Math.max(0, Math.min(100, Number(strength) || 50)) / 100;
-    if (kind === 'shake')   return { amp: 14 + (60 - 14) * s,     flash: 0.55 + (1.00 - 0.55) * s };
-    if (kind === 'whippan') return { shift: 35 + (100 - 35) * s,  blur: 10 + (40 - 10) * s };
-    if (kind === 'zoom')    return { scale: 1.5 + (3.0 - 1.5) * s, blur: 4 + (18 - 4) * s };
-    if (kind === 'blur')    return { blur: 10 + (50 - 10) * s };
-    if (kind === 'seamzoom') return {
-      scale: 3 + (6 - 3) * s,         // max zoom 3× → 6×
-      blur:  8 + (22 - 8) * s,        // gaussian blur sigma at peak
-      rgb:   4 + (14 - 4) * s,        // chromatic aberration px at peak
-      flash: 0.18 + (0.38 - 0.18) * s,// white flash alpha at peak
-    };
+  // Old transition kinds REMOVED (pivoting to the GPU effects pack). No params
+  // until the pack's transitions land — returns {} so callers stay safe.
+  function transitionParams() {
     return {};
   }
 
@@ -2549,7 +2572,7 @@ function Editor({ state, setState }) {
     // Strength = 0-100 → visual intensity (amp / blur / shift / scale).
     // Duration is fixed at 0.4 s; the user stretches the clip on the
     // timeline independently — length = how long, slider = how strong.
-    const k = kind || 'shake';
+    const k = kind || 'none';
     const numStrength = Math.max(0, Math.min(100, Number(strength) || 50));
     const duration = 0.4;
     const params = transitionParams(k, numStrength);
@@ -2748,7 +2771,7 @@ function Editor({ state, setState }) {
           fontFamily: fontFam,
           fontFile: sysFont?.file || '',
           fontSize: fsDefault,
-          anim: 'pop',
+          anim: 'none',
           color: '#ffffff',
           outlineColor: '#000000',
           highlightColor: '#ff9a1f',
@@ -2953,7 +2976,7 @@ function Editor({ state, setState }) {
       totalDuration: Number(s.totalDuration) || 10,
       videoStart: Number(s.videoStart) || 0,
       videoEnd: Number(s.videoEnd) || (Number(s.totalDuration) || 10),
-      layers: Array.isArray(s.layers) ? s.layers : [],
+      layers: migrateLegacyLayers(s.layers),
       outWidth: Number(s.outWidth) || 1080,
       outHeight: Number(s.outHeight) || 1920,
       bgColor: s.bgColor || '#000000',
@@ -3371,12 +3394,170 @@ function Editor({ state, setState }) {
   // decoded <video> frame after a seek/edit still lands on the canvas), then it
   // STOPS. Idle = zero work.
   const nowMs = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+  // Phase 2: assemble the compositor frame from the LIVE editor state — geometry from getLayerPx,
+  // sources from the same DOM <video>/<img>/frame-cache the 2d path uses (stage A: DOM textures;
+  // WebCodecs 0-copy sources swap in at stage C). getCC/subtitle-karaoke land in stage B.
+  // With (timeOverride, forExport) it serves an ARBITRARY time t for offscreen EXPORT. forExport ⇒
+  // video sources MUST come from the WebCodecs VideoSource at t (no DOM fallback — the DOM <video>
+  // isn't seeked to t); also full-res (backingScale 1). Preview calls it with no args (t=currentTime).
+  const buildEngineFrame = (timeOverride, forExport) => {
+    const T = (timeOverride != null) ? timeOverride : currentTime;
+    return {
+    W: outWidth, H: outHeight, bgColor, layers,
+    time: T, videoStart, videoEnd, dur,
+    backingScale: forExport ? 1 : drawScaleRef.current,
+    getPx: getLayerPx,
+    getSource: (l) => {
+      const wc = engineTierRef.current === 'A' && !l.reversed && (!l.speed || l.speed === 1);
+      if (l.type === 'mainVideo') {
+        if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T); if (f) return f; } }
+        if (forExport) return null;
+        const v = l.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current; return (v && v.readyState >= 2) ? v : null;
+      }
+      if (l.type === 'image') return imgCacheRef.current.get(l.file) || null;
+      if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
+        if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T - (l.startTime || 0) + (l.srcStart || 0)); if (f) return f; } }
+        if (forExport) return null;
+        const ov = videoOverlayRefs.current[l.id];
+        if (ov && ov.readyState >= 2 && ov.videoWidth) return ov;
+        const cache = videoFrameCacheRef.current.get(l.id);
+        return (cache && cache.width) ? cache : null;
+      }
+      return null;
+    },
+    getTextDraw: (l) => {
+      if (l.type === 'text') { const d = rasterizeText(l, outWidth, outHeight, fontCss(l)); return d ? [d] : []; }
+      if (l.type === 'subtitles') {
+        const layout = subtitleLayoutsRef.current && subtitleLayoutsRef.current.get(l.id);
+        if (!layout) return [];
+        const segL = (layout.segments || []).find(s => T >= s.start && T <= s.end);
+        if (!segL || !segL.words.length) return [];
+        const st = l.style || {};
+        const fs = layout.fontSize;
+        const fcss = fontCss({ fontFamily: st.fontFamily, fontFile: st.fontFile });
+        const baseColor = st.color || '#ffffff';
+        const highlightColor = st.highlightColor || '#ff9a1f';
+        const outlineColor = st.outlineColor || '#000000';
+        const olMode = (st.outlineMode === 'none' || st.outline === false) ? 'none' : 'external';
+        const olT = (st.outlineWidth != null && st.outlineWidth !== '') ? Math.max(0, Number(st.outlineWidth)) : Math.max(2, Math.round(fs * 0.04));
+        const anim = st.anim || 'slideup';
+        const segStart = Number(segL.start) || 0;
+        const Wp = outWidth, Hp = outHeight;
+        let phraseScale = 1, phraseAlpha = 1;
+        const phraseCx = ((st.x ?? 50) / 100) * Wp, phraseCy = ((st.y ?? 85) / 100) * Hp;
+        if (anim === 'zoomin') {
+          const tau = (T - segStart) * 1000;
+          const p = Math.max(0, Math.min(1, tau / SUB_ANIM.ZOOMIN_MS));
+          phraseScale = SUB_ANIM.ZOOMIN_FROM + (1 - SUB_ANIM.ZOOMIN_FROM) * p;
+          phraseAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.ZOOMIN_FADE_MS));
+        }
+        const draws = [];
+        for (const w of segL.words) {
+          const appeared = T >= w.start;
+          if ((anim === 'slideup' || anim === 'flip' || anim === 'typeon' || anim === 'drop') && !appeared) continue;
+          const isActive = T >= w.start && T <= w.end;
+          const tau = (T - w.start) * 1000;
+          let wScale = 1, dy = 0, wAlpha = 1, wBlur = 0, wOutlineMul = 1, wDynColor = null;
+          let wScaleX = 1, wScaleY = 1, neonOutlineColor = null;
+          if (anim === 'slideup') {
+            dy = SUB_ANIM.SLIDE_OFFSET * Math.max(0, 1 - tau / SUB_ANIM.SLIDE_MS);
+            wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.SLIDE_FADE_MS));
+          } else if (anim === 'punch' && isActive) {
+            if (tau < SUB_ANIM.PUNCH_MS1) wScale = SUB_ANIM.PUNCH_FROM + (SUB_ANIM.PUNCH_MID - SUB_ANIM.PUNCH_FROM) * (tau / SUB_ANIM.PUNCH_MS1);
+            else if (tau < SUB_ANIM.PUNCH_MS2) wScale = SUB_ANIM.PUNCH_MID + (1 - SUB_ANIM.PUNCH_MID) * ((tau - SUB_ANIM.PUNCH_MS1) / (SUB_ANIM.PUNCH_MS2 - SUB_ANIM.PUNCH_MS1));
+          } else if (anim === 'flip') {
+            wScaleY = Math.max(0, Math.min(1, tau / SUB_ANIM.FLIP_MS));
+          } else if (anim === 'glowpulse' && isActive) {
+            const ph = (tau / SUB_ANIM.GPULSE_MS) % 1; const tri = ph < 0.5 ? ph * 2 : (1 - ph) * 2;
+            wOutlineMul = 1 + tri * (SUB_ANIM.GPULSE_MUL - 1);
+          } else if (anim === 'rainbow' && isActive) {
+            const pal = SUB_ANIM.RAIN_COLORS; const idxF = tau / SUB_ANIM.RAIN_MS;
+            const idx = Math.floor(idxF) % pal.length; const next = (idx + 1) % pal.length;
+            wDynColor = lerpHex(pal[idx], pal[next], idxF - Math.floor(idxF));
+          } else if (anim === 'typeon') {
+            wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.TYPEON_FADE_MS));
+          } else if (anim === 'drop') {
+            if (tau < SUB_ANIM.DROP_MS) { const p = tau / SUB_ANIM.DROP_MS; dy = -SUB_ANIM.DROP_OFFSET * (1 - p); wAlpha = Math.min(1, p * 1.5); }
+            else if (tau < SUB_ANIM.DROP_MS + SUB_ANIM.DROP_SQUASH_MS) { const p = (tau - SUB_ANIM.DROP_MS) / SUB_ANIM.DROP_SQUASH_MS; wScaleY = (SUB_ANIM.DROP_SQUASH_FSCY + (100 - SUB_ANIM.DROP_SQUASH_FSCY) * p) / 100; }
+          }
+          const color = isActive ? (wDynColor || highlightColor) : baseColor;
+          const outline = olMode === 'none' ? 0 : olT * wOutlineMul;
+          const oColor = neonOutlineColor || outlineColor;
+          const d = rasterizeWord(w.text, { cx: w.cx, cy: w.cy + dy, w: w.w }, { fontSize: fs, color, outlineColor: oColor, outline, blur: wBlur }, fcss);
+          let scaleX = wScale * wScaleX, scaleY = wScale * wScaleY;
+          if (phraseScale !== 1) {
+            scaleX *= phraseScale; scaleY *= phraseScale;
+            const ncx = phraseCx + (w.cx - phraseCx) * phraseScale;
+            const ncy = phraseCy + ((w.cy + dy) - phraseCy) * phraseScale;
+            d.x += (ncx - w.cx); d.y += (ncy - (w.cy + dy));
+          }
+          d.opacity = wAlpha * phraseAlpha;
+          d.scaleX = scaleX; d.scaleY = scaleY;
+          draws.push(d);
+        }
+        return draws;
+      }
+      return [];
+    },
+    getCC: (l) => {
+      if (l.type !== 'videoOverlay' && l.type !== 'maskedVideo') return null;
+      const B = (100 + (l.ccB || 0)) / 100, C = (l.ccC ?? 100) / 100, Sa = (l.ccS ?? 100) / 100, Hh = l.ccH ?? 0;
+      if (B === 1 && C === 1 && Sa === 1 && Hh === 0) return null;
+      return { b: B, c: C, s: Sa, h: Hh };
+    },
+    };
+  };
+  // P2-8: EXPORT via the compositor (engineExport, Ctrl+Shift+E). Renders every frame OFFSCREEN at full
+  // res through the SAME compositor as preview ⇒ preview==export by construction; streams RGBA frames to
+  // ffmpeg rawvideo (transport de-risked at 1.52× realtime). Default-OFF — the existing video:edit
+  // filtergraph export is untouched. Audio v1 = main source file only (overlay/audio amix = TODO).
+  async function runEngineExport() {
+    if (engineExportingRef.current) return;
+    if (!engineMode || engineTierRef.current !== 'A') { alert('Экспорт через движок требует включённый движок (Ctrl+Shift+G) на Tier A (WebGL2 + WebCodecs).'); return; }
+    let outPath = null;
+    try { const r = await window.strata.pickSaveAs('export_engine.mp4', 'mp4'); outPath = r && (r.path || (typeof r === 'string' ? r : null)); } catch {}
+    if (!outPath) return;
+    engineExportingRef.current = true;
+    const setPct = (p) => { proxyDbgRef.current = 'EXP ' + p + '%'; setProxyDbg('EXP ' + p + '%'); };
+    setPct(0);
+    try {
+      const fps = 30;
+      const durationSec = Math.max(0.2, (Number(dur) || 0) || (videoEnd - videoStart) || 1);
+      const begin = await window.strata.engineExportBegin({ W: outWidth, H: outHeight, fps, outPath, mainFile: file || null });
+      if (!begin || !begin.ok) { alert('Экспорт не запустился: ' + ((begin && begin.error) || 'ffmpeg')); return; }
+      const spec = {
+        W: outWidth, H: outHeight, fps, durationSec, bgColor, videoStart, videoEnd, layers,
+        getPx: getLayerPx,
+        getSource: (l, t) => buildEngineFrame(t, true).getSource(l),
+        getTextDraw: (l, t) => buildEngineFrame(t, true).getTextDraw(l),
+        getCC: (l) => buildEngineFrame(0, true).getCC(l),
+        onProgress: (done, total) => setPct(Math.round(done / total * 100)),
+      };
+      await renderExportFrames(spec, async (rgba) => { await window.strata.engineExportFrame(rgba.buffer); });
+      const fin = await window.strata.engineExportFinish();
+      if (fin && fin.ok) alert('Готово (движок):\n' + outPath);
+      else alert('Экспорт: ' + ((fin && fin.error) || 'ошибка ffmpeg'));
+    } catch (e) { console.error('[engine-export]', e); try { await window.strata.engineExportFinish(); } catch {} alert('Экспорт через движок: ' + e.message); }
+    finally { engineExportingRef.current = false; proxyDbgRef.current = 'HD'; setProxyDbg('HD'); }
+  }
   const paintOnce = () => {
     const draw = renderFrameRef.current;
     if (!draw) return;
     // Phase 2: while the proxy <video> is serving the picture, skip the whole
     // canvas recomposite — that idle main thread is what keeps audio smooth.
     if (proxyPlayRef.current) return;
+    // Phase 2 WebGL2 compositor path (engineMode, default OFF). Renders the SAME layers through
+    // the GL compositor; on any error it self-disables and falls back to the 2d path below.
+    if (engineModeRef.current) {
+      const gl = glCanvasRef.current;
+      if (gl) {
+        try {
+          if (!compRef.current) compRef.current = new Compositor(gl);
+          compRef.current.renderFrame(buildEngineFrame());
+          return;
+        } catch (e) { engineModeRef.current = false; setEngineMode(false); console.error('[engine] disabled:', e); }
+      }
+    }
     const canvas = previewCanvasRef.current;
     if (canvas) draw(canvas.getContext('2d'));
     const fs = fsCanvasRef.current;   // fullscreen mirror, when open
@@ -3440,8 +3621,62 @@ function Editor({ state, setState }) {
     return () => { /* loop self-stops; nothing to cancel here */ };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing]);
+  // Phase 2: engineMode toggle → mirror to the ref the paint loop reads + kick a repaint so the
+  // switch is immediate. (Compositor is built lazily on first engine paint; kept across toggles.)
+  useEffect(() => {
+    engineModeRef.current = engineMode;
+    kickRender();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineMode]);
+  // Phase 2 Tier A: probe the tier once (async — WebCodecs hw check).
+  useEffect(() => {
+    let alive = true;
+    pickTier().then(r => { if (alive) engineTierRef.current = r.tier; }).catch(() => { if (alive) engineTierRef.current = 'B'; });
+    return () => { alive = false; };
+  }, []);
+  // Phase 2 Tier A: keep one VideoSource per video layer alive while engineMode is on — create on
+  // add / file-change, dispose on remove / engine-off. Bytes arrive via the preload IPC (fetch
+  // file:// is blocked). Until a source is ready, getSource uses the DOM <video> (no blank frame).
+  useEffect(() => {
+    const map = videoSourcesRef.current;
+    const tearDownAll = () => { for (const vs of map.values()) { try { vs.dispose && vs.dispose(); } catch {} } map.clear(); };
+    if (!engineMode) { tearDownAll(); return; }
+    const wanted = new Map();
+    for (const l of layers) {
+      if (l.hidden) continue;
+      if ((l.type === 'mainVideo' || l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file) wanted.set(l.id, l.file);
+    }
+    for (const [id, vs] of [...map]) {
+      if (wanted.get(id) !== (vs && vs._file)) { try { vs.dispose && vs.dispose(); } catch {} map.delete(id); }
+    }
+    if (engineTierRef.current === 'A') {
+      for (const [id, file] of wanted) {
+        if (map.has(id)) continue;
+        const placeholder = { ready: false, _file: file, frameAt: () => null, dispose: () => {} };
+        map.set(id, placeholder);
+        (async () => {
+          try {
+            if (!window.strata || !window.strata.readFileBytes) return;
+            const bytes = await window.strata.readFileBytes(file);
+            if (!bytes || map.get(id) !== placeholder) return;
+            const vs = new VideoSource(new Blob([bytes]), { label: id });
+            vs._file = file;
+            await vs.init();
+            if (map.get(id) === placeholder) { map.set(id, vs); kickRender(); }
+            else { try { vs.dispose(); } catch {} }
+          } catch (e) { console.error('[engine] VideoSource init failed for', id, e); if (map.get(id) === placeholder) map.delete(id); }
+        })();
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineMode, layers]);
   // Stop the loop on unmount.
-  useEffect(() => () => { loopRunningRef.current = false; cancelAnimationFrame(rafRef.current); }, []);
+  useEffect(() => () => {
+    loopRunningRef.current = false; cancelAnimationFrame(rafRef.current);
+    try { compRef.current?.dispose(); } catch {}
+    for (const vs of videoSourcesRef.current.values()) { try { vs.dispose && vs.dispose(); } catch {} }
+    videoSourcesRef.current.clear();
+  }, []);
 
   // An edit invalidates the prepared buffer: bump the token (so a stale render's
   // progress stops touching the bar), clear the bar, and kill the running proxy.
@@ -3771,6 +4006,16 @@ function Editor({ state, setState }) {
     else if (e.key === 'Delete') { e.preventDefault(); delSelected(); }
     else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') { copySelected(); }
     else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') { e.preventDefault(); pasteClipboard(); }
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyD') { e.preventDefault(); e.stopPropagation(); splitAtPlayhead(); }
+    // Phase 2: toggle the WebGL2 compositor preview (default OFF). Guarded on WebGL2 support.
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyG') {
+      e.preventDefault(); e.stopPropagation();
+      setEngineMode(v => { const nv = !v; if (nv && !canUseWebgl()) { alert('WebGL2 недоступен — движок предпросмотра Phase 2 требует WebGL2.'); return false; } return nv; });
+    }
+    // Phase 2: EXPORT через компоновщик (engineExport, default-OFF). Требует включённый движок (Ctrl+Shift+G).
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyE') {
+      e.preventDefault(); e.stopPropagation(); runEngineExport();
+    }
   };
   useEffect(() => {
     const handler = (e) => keyHandlerImplRef.current?.(e);
@@ -4272,7 +4517,8 @@ function Editor({ state, setState }) {
         pushUndo();
         const move = (ev) => {
           const r = timelineRef.current?.getBoundingClientRect(); if (!r) return;
-          const t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
+          let t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
+          t = snapTime(t, ev.shiftKey);   // hold Shift → snap to clip edges / playhead
           if (isStart) {
             setState((s) => ({ ...s, videoStart: Math.max(0, Math.min(s.videoEnd - 0.1, t)) }));
           } else {
@@ -4289,7 +4535,8 @@ function Editor({ state, setState }) {
       pushUndo();
       const move = (ev) => {
         const r = timelineRef.current?.getBoundingClientRect(); if (!r) return;
-        const t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
+        let t = Math.max(0, Math.min(dur, ((ev.clientX - r.left) / r.width) * dur));
+        t = snapTime(t, ev.shiftKey, id);   // hold Shift → snap to nearby clip edges / playhead
         if (isStart) {
           // Trimming the HEAD of a clip: move startTime AND shift srcStart so
           // the source IN-point moves with it. Without the srcStart update
@@ -4334,10 +4581,13 @@ function Editor({ state, setState }) {
 
   // Snap a candidate time `t` to the nearest clip edge / 0 / dur, when held.
   // Mirrors the per-layer snap behaviour so scrubbing feels consistent.
-  function snapTime(t, shiftKey) {
+  function snapTime(t, shiftKey, excludeId) {
     if (!shiftKey) return t;
-    const targets = [0, dur];
+    // Snap targets: timeline bounds, the PLAYHEAD (where the cursor sits), and
+    // every OTHER clip's start/end edges (skip the clip being edited).
+    const targets = [0, dur, currentTime];
     for (const o of layers) {
+      if (excludeId != null && o.id === excludeId) continue;
       targets.push(o.startTime || 0);
       targets.push(o.endTime ?? dur);
     }
@@ -4569,7 +4819,7 @@ function Editor({ state, setState }) {
     if (l.type === 'mask') return 'Маска';
     if (l.type === 'maskedVideo') return 'Маска' + rev;
     if (l.type === 'transition') {
-      const kLbl = { shake: 'Удар', whippan: 'Whip pan', zoom: 'Zoom', blur: 'Blur' }[l.kind || 'shake'] || 'Переход';
+      const kLbl = { flash: 'Вспышка', slide: 'Сдвиг', spin: 'Спин', rgbsplit: 'RGB-сдвиг', glitch: 'Глитч', pixelize: 'Пиксели' }[l.kind || 'flash'] || 'Переход';
       const s = typeof l.strength === 'number'
         ? Math.round(l.strength)
         : (l.strength === 'low' ? 25 : l.strength === 'high' ? 80 : l.strength === 'mid' ? 50 : null);
@@ -4805,7 +5055,21 @@ function Editor({ state, setState }) {
           tctx.clearRect(0, 0, cw, ch);
           try { tctx.drawImage(ctx.canvas, cx0 * S, cy0 * S, cw * S, ch * S, 0, 0, cw, ch); } catch(e) {}
           ctx.save();
-          ctx.beginPath(); ctx.rect(b.x, b.y, b.w, b.h); ctx.clip();
+          ctx.beginPath();
+          const bshape = layer.shape || 'square';
+          const brad = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
+          if (bshape === 'circle') {
+            ctx.ellipse(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, b.h / 2, 0, 0, Math.PI * 2);
+          } else if (bshape === 'rounded') {
+            const x0 = b.x, y0 = b.y, x1 = b.x + b.w, y1 = b.y + b.h;
+            ctx.moveTo(x0 + brad, y0); ctx.lineTo(x1 - brad, y0); ctx.arcTo(x1, y0, x1, y0 + brad, brad);
+            ctx.lineTo(x1, y1 - brad); ctx.arcTo(x1, y1, x1 - brad, y1, brad);
+            ctx.lineTo(x0 + brad, y1); ctx.arcTo(x0, y1, x0, y1 - brad, brad);
+            ctx.lineTo(x0, y0 + brad); ctx.arcTo(x0, y0, x0 + brad, y0, brad);
+          } else {
+            ctx.rect(b.x, b.y, b.w, b.h);
+          }
+          ctx.clip();
           ctx.filter = `blur(${strength}px)`;
           try { ctx.drawImage(tmp, 0, 0, cw, ch, cx0, cy0, cw, ch); } catch(e) {}
           ctx.filter = 'none';
@@ -4931,20 +5195,17 @@ function Editor({ state, setState }) {
           : Math.max(2, Math.round(fs * 0.04));
         const outlineW = Math.max(1, Math.round(olT * 2));   // canvas lineWidth
         ctx.lineWidth = outlineW;
-        const anim = st.anim || 'pop';
+        const anim = st.anim || 'slideup';
         const segStart = Number(segL.start) || 0;
         // 'scale' animates the WHOLE phrase around its anchor (style.x/y point).
         const phraseCx = ((st.x ?? 50) / 100) * W, phraseCy = ((st.y ?? 85) / 100) * H;
         // Phrase-level entrance animations — wrap the whole word loop in a
         // single transform around the phrase anchor (style.x/y point).
-        if (anim === 'scale' || anim === 'zoomout') {
-          const from = anim === 'scale' ? SUB_ANIM.SCALE_FROM : SUB_ANIM.ZOUT_FROM;
-          const ms   = anim === 'scale' ? SUB_ANIM.SCALE_MS   : SUB_ANIM.ZOUT_MS;
-          const fadeMs = anim === 'scale' ? SUB_ANIM.SCALE_FADE_MS : SUB_ANIM.ZOUT_FADE_MS;
+        if (anim === 'zoomin') {
           const tau = (currentTime - segStart) * 1000;
-          const p = Math.max(0, Math.min(1, tau / ms));
-          const sc = from + (1 - from) * p;
-          ctx.globalAlpha = Math.max(0, Math.min(1, tau / fadeMs));
+          const p = Math.max(0, Math.min(1, tau / SUB_ANIM.ZOOMIN_MS));
+          const sc = SUB_ANIM.ZOOMIN_FROM + (1 - SUB_ANIM.ZOOMIN_FROM) * p;
+          ctx.globalAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.ZOOMIN_FADE_MS));
           ctx.translate(phraseCx, phraseCy);
           ctx.scale(sc, sc);
           ctx.translate(-phraseCx, -phraseCy);
@@ -4953,79 +5214,48 @@ function Editor({ state, setState }) {
           for (let wi = 0; wi < line.words.length; wi++) {
             const w = line.words[wi];
             const appeared = currentTime >= w.start;
-            // Typewriter / rise / bounce / typewriter-cursor reveal words only once their time arrives.
-            if ((anim === 'type' || anim === 'rise' || anim === 'bounce' || anim === 'typewriter') && !appeared) continue;
+            // slideup / flip / typeon / drop reveal each word only once its own start time arrives.
+            if ((anim === 'slideup' || anim === 'flip' || anim === 'typeon' || anim === 'drop') && !appeared) continue;
             const isActive = currentTime >= w.start && currentTime <= w.end;
             const tau = (currentTime - w.start) * 1000;  // ms since the word started
             let wScale = 1, dy = 0, wAlpha = 1, wBlur = 0, wOutlineMul = 1, wDynColor = null;
             let wScaleX = 1, wScaleY = 1, wRot = 0, neonOutlineColor = null;
-            if (anim === 'pop' && isActive) {
-              wScale = 1 + (SUB_ANIM.POP_SCALE - 1) * Math.max(0, 1 - tau / SUB_ANIM.POP_MS);
-            } else if (anim === 'rise') {
-              dy = SUB_ANIM.RISE_OFFSET * Math.max(0, 1 - tau / SUB_ANIM.RISE_MS);
-              wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.RISE_FADE_MS));
-            } else if (anim === 'bam' && isActive) {
-              // 3-segment overshoot: 150% → 85% → 100%. Linear pieces — match ASS.
-              if (tau < SUB_ANIM.BAM_MS1) {
-                wScale = SUB_ANIM.BAM_FROM + (SUB_ANIM.BAM_MID - SUB_ANIM.BAM_FROM) * (tau / SUB_ANIM.BAM_MS1);
-              } else if (tau < SUB_ANIM.BAM_MS2) {
-                wScale = SUB_ANIM.BAM_MID + (1 - SUB_ANIM.BAM_MID) * ((tau - SUB_ANIM.BAM_MS1) / (SUB_ANIM.BAM_MS2 - SUB_ANIM.BAM_MS1));
-              }
-            } else if (anim === 'blurfocus' && isActive) {
-              wBlur = SUB_ANIM.BLUR_PX * Math.max(0, 1 - tau / SUB_ANIM.BLUR_MS);
-            } else if (anim === 'glow' && isActive) {
-              // Triangle wave (linear ramp up & down) — matches ASS chained \t.
-              const ph = (tau / SUB_ANIM.GLOW_MS) % 1;
+            if (anim === 'slideup') {
+              dy = SUB_ANIM.SLIDE_OFFSET * Math.max(0, 1 - tau / SUB_ANIM.SLIDE_MS);
+              wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.SLIDE_FADE_MS));
+            } else if (anim === 'punch' && isActive) {
+              // overshoot 150% → 90% → 100%. Linear pieces — matches ASS.
+              if (tau < SUB_ANIM.PUNCH_MS1) wScale = SUB_ANIM.PUNCH_FROM + (SUB_ANIM.PUNCH_MID - SUB_ANIM.PUNCH_FROM) * (tau / SUB_ANIM.PUNCH_MS1);
+              else if (tau < SUB_ANIM.PUNCH_MS2) wScale = SUB_ANIM.PUNCH_MID + (1 - SUB_ANIM.PUNCH_MID) * ((tau - SUB_ANIM.PUNCH_MS1) / (SUB_ANIM.PUNCH_MS2 - SUB_ANIM.PUNCH_MS1));
+            } else if (anim === 'flip') {
+              wScaleY = Math.max(0, Math.min(1, tau / SUB_ANIM.FLIP_MS));
+            } else if (anim === 'glowpulse' && isActive) {
+              const ph = (tau / SUB_ANIM.GPULSE_MS) % 1;
               const tri = ph < 0.5 ? ph * 2 : (1 - ph) * 2;
-              wOutlineMul = 1 + tri * (SUB_ANIM.GLOW_MUL - 1);
-            } else if (anim === 'colorwave' && isActive) {
-              const pal = SUB_ANIM.WAVE_COLORS;
-              const idxF = tau / SUB_ANIM.WAVE_MS;
+              wOutlineMul = 1 + tri * (SUB_ANIM.GPULSE_MUL - 1);
+            } else if (anim === 'rainbow' && isActive) {
+              const pal = SUB_ANIM.RAIN_COLORS;
+              const idxF = tau / SUB_ANIM.RAIN_MS;
               const idx = Math.floor(idxF) % pal.length;
               const next = (idx + 1) % pal.length;
               wDynColor = lerpHex(pal[idx], pal[next], idxF - Math.floor(idxF));
-            } else if (anim === 'neon' && isActive) {
-              // Find which flicker stage tau falls into → alpha for that stage.
-              for (const [t0, t1, a] of SUB_ANIM.NEON_STAGES) { if (tau >= t0 && tau < t1) { wAlpha = a; break; } }
-              wOutlineMul = SUB_ANIM.NEON_BORD_MUL;
-              neonOutlineColor = SUB_ANIM.NEON_COLOR;
-            } else if (anim === 'shake' && isActive) {
-              // Stagewise rotation jitter; linear lerp inside each stage.
-              for (const [t0, t1, deg] of SUB_ANIM.SHAKE_STAGES) {
-                if (tau >= t0 && tau < t1) {
-                  // Lerp from PREVIOUS stage's deg → this stage's deg.
-                  const prev = SUB_ANIM.SHAKE_STAGES[SUB_ANIM.SHAKE_STAGES.indexOf(SUB_ANIM.SHAKE_STAGES.find(([a,b]) => a === t0)) - 1];
-                  const fromDeg = prev ? prev[2] : 0;
-                  const p = (tau - t0) / Math.max(1, t1 - t0);
-                  wRot = fromDeg + (deg - fromDeg) * p;
-                  break;
-                }
-              }
-            } else if (anim === 'bounce') {
-              // Phase 1: drop from above (dy interp negative→0) while squashing fscy 140→100
-              // Phase 2: impact squash fscx→120, fscy→70
-              // Phase 3: settle back to 100/100
-              const D = SUB_ANIM.BOUNCE_DROP_MS, S = SUB_ANIM.BOUNCE_SQUASH_MS, T = SUB_ANIM.BOUNCE_SETTLE_MS;
-              if (tau < D) {
-                const p = tau / D;
-                dy = -SUB_ANIM.BOUNCE_OFFSET * (1 - p);
-                wScaleX = (SUB_ANIM.BOUNCE_FROM_FSCX + (100 - SUB_ANIM.BOUNCE_FROM_FSCX) * p) / 100;
-                wScaleY = (SUB_ANIM.BOUNCE_FROM_FSCY + (100 - SUB_ANIM.BOUNCE_FROM_FSCY) * p) / 100;
+            } else if (anim === 'typeon') {
+              wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.TYPEON_FADE_MS));
+            } else if (anim === 'drop') {
+              // Phase 1: fall from above (dy −OFFSET→0). Phase 2: squash settle (scaleY).
+              if (tau < SUB_ANIM.DROP_MS) {
+                const p = tau / SUB_ANIM.DROP_MS;
+                dy = -SUB_ANIM.DROP_OFFSET * (1 - p);
                 wAlpha = Math.min(1, p * 1.5);
-              } else if (tau < D + S) {
-                const p = (tau - D) / S;
-                wScaleX = (100 + (SUB_ANIM.BOUNCE_HIT_FSCX - 100) * p) / 100;
-                wScaleY = (100 + (SUB_ANIM.BOUNCE_HIT_FSCY - 100) * p) / 100;
-              } else if (tau < D + S + T) {
-                const p = (tau - D - S) / T;
-                wScaleX = (SUB_ANIM.BOUNCE_HIT_FSCX + (100 - SUB_ANIM.BOUNCE_HIT_FSCX) * p) / 100;
-                wScaleY = (SUB_ANIM.BOUNCE_HIT_FSCY + (100 - SUB_ANIM.BOUNCE_HIT_FSCY) * p) / 100;
+              } else if (tau < SUB_ANIM.DROP_MS + SUB_ANIM.DROP_SQUASH_MS) {
+                const p = (tau - SUB_ANIM.DROP_MS) / SUB_ANIM.DROP_SQUASH_MS;
+                wScaleY = (SUB_ANIM.DROP_SQUASH_FSCY + (100 - SUB_ANIM.DROP_SQUASH_FSCY) * p) / 100;
               }
             }
             ctx.save();
             if (wAlpha !== 1) ctx.globalAlpha = ctx.globalAlpha * wAlpha;
             if (wBlur > 0.1) ctx.filter = `blur(${wBlur}px)`;
-            // Combined transform — uniform scale (pop/bam) OR independent X/Y (bounce) + rotation (shake)
+            // Combined transform — uniform scale (punch) or independent scaleY (flip/drop)
             // around the word's anchor point (cx, cy+dy).
             const hasTransform = wScale !== 1 || wScaleX !== 1 || wScaleY !== 1 || wRot !== 0;
             if (hasTransform) {
@@ -5044,25 +5274,6 @@ function Editor({ state, setState }) {
             ctx.fillStyle = isActive ? (wDynColor || highlightColor) : baseColor;
             ctx.fillText(w.text, w.cx, w.cy + dy);
             ctx.restore();
-            // Typewriter cursor — blinking `|` after the last revealed word in the segment.
-            if (anim === 'typewriter') {
-              const isLastRevealed = (wi === line.words.length - 1)
-                || (currentTime < line.words[wi + 1]?.start);
-              if (isLastRevealed) {
-                const period = SUB_ANIM.TYPE_CURSOR_MS;
-                const phase = ((currentTime - w.end) * 1000) / period;
-                const visible = (Math.floor(phase * 2) % 2) === 0; // on/off halves
-                if (visible) {
-                  const cursorX = w.cx + (w.w || fs * 0.5) / 2 + fs * SUB_ANIM.TYPE_CURSOR_PAD;
-                  if (olMode !== 'none') {
-                    ctx.strokeStyle = outlineColor;
-                    ctx.strokeText('|', cursorX, w.cy);
-                  }
-                  ctx.fillStyle = highlightColor;
-                  ctx.fillText('|', cursorX, w.cy);
-                }
-              }
-            }
           }
         }
         ctx.restore();
@@ -5149,7 +5360,7 @@ function Editor({ state, setState }) {
         const span = Math.max(0.01, tle - tls);
         const tProg = Math.max(0, Math.min(1, (currentTime - tls) / span));
         const t = currentTime;
-        const kind = layer.kind || 'shake';
+        const kind = layer.kind || 'flash';
         // Triangle ramp 0 → 1 (mid) → 0; sine version is smoother.
         const peak = Math.sin(tProg * Math.PI);
 
@@ -5161,117 +5372,94 @@ function Editor({ state, setState }) {
         const tctx = tmp.getContext('2d');
         tctx.setTransform(1, 0, 0, 1, 0, 0);
 
-        if (kind === 'shake') {
-          // Shake + white flash combo (original).
-          const amp = (layer.amp || 30);
-          const decay = 1 - tProg * 0.85;
-          const ox = (Math.sin(t * 113) * 0.6 + Math.sin(t * 187) * 0.4) * amp * decay;
-          const oy = (Math.cos(t * 97)  * 0.6 + Math.cos(t * 151) * 0.4) * amp * decay;
-          tctx.clearRect(0, 0, W, H);
-          try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-          ctx.fillStyle = bgColor || '#000000';
-          ctx.fillRect(0, 0, W, H);
-          try { ctx.drawImage(tmp, ox, oy, W, H); } catch(e) {}
+        if (kind === 'flash') {
+          // Clean white flash punch — the picture stays; white ramps up to the peak then down.
           const flashMax = layer.flash ?? 0.85;
-          let alpha;
-          if (tProg < 0.15) alpha = (tProg / 0.15) * flashMax;
-          else              alpha = Math.max(0, flashMax * (1 - (tProg - 0.15) / 0.85));
-          if (alpha > 0.001) {
-            ctx.save();
-            ctx.globalAlpha = Math.min(1, alpha);
-            ctx.fillStyle = '#ffffff';
-            ctx.fillRect(0, 0, W, H);
-            ctx.restore();
-          }
-        } else if (kind === 'whippan') {
-          // Fast horizontal motion-blur swipe.
-          const shiftMax = (layer.shift || 60) / 100 * W;
-          const blurMax = layer.blur || 22;
-          // The frame goes off to the right (or left) at midpoint, returns.
-          // Direction baked into the sign of the shift curve.
-          const xOff = Math.sin(tProg * Math.PI) * shiftMax; // 0 → +shift → 0
+          const alpha = peak * flashMax;
+          if (alpha > 0.001) { ctx.save(); ctx.globalAlpha = Math.min(1, alpha); ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+        } else if (kind === 'slide') {
+          // Curtain: the frame slides off to the left over the bg, then settles back.
+          const dist = (layer.dist || 80) / 100 * W;
+          const blurMax = layer.blur || 12;
+          const xOff = -peak * dist;
           const blurNow = blurMax * peak;
-          tctx.clearRect(0, 0, W, H);
-          try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-          ctx.fillStyle = bgColor || '#000000';
-          ctx.fillRect(0, 0, W, H);
-          ctx.save();
-          if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
+          tctx.clearRect(0, 0, W, H); try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          ctx.fillStyle = bgColor || '#000000'; ctx.fillRect(0, 0, W, H);
+          ctx.save(); if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
           try { ctx.drawImage(tmp, xOff, 0, W, H); } catch(e) {}
           ctx.restore();
-        } else if (kind === 'zoom') {
-          // Zoom punch — up to 300%, with blur ramping with scale.
-          const scaleMax = layer.scale || 2;
-          const blurMax = layer.blur || 8;
-          const scale = 1 + (scaleMax - 1) * peak;
-          const blurNow = blurMax * peak;
-          if (scale > 1.001 || blurNow > 0.5) {
-            tctx.clearRect(0, 0, W, H);
-            try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-            ctx.clearRect(0, 0, W, H);
-            ctx.save();
-            if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
-            const dw = W * scale, dh = H * scale;
-            try { ctx.drawImage(tmp, (W - dw) / 2, (H - dh) / 2, dw, dh); } catch(e) {}
-            ctx.restore();
-          }
-        } else if (kind === 'blur') {
-          // Burst of gaussian blur that resolves.
-          const blurMax = layer.blur || 25;
-          const blurNow = blurMax * peak;
-          if (blurNow > 0.5) {
-            tctx.clearRect(0, 0, W, H);
-            try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-            ctx.clearRect(0, 0, W, H);
-            ctx.save();
-            ctx.filter = `blur(${blurNow}px)`;
-            try { ctx.drawImage(tmp, 0, 0, W, H); } catch(e) {}
-            ctx.restore();
-          }
-        } else if (kind === 'seamzoom') {
-          // Seamless zoom: camera "falls" into the frame with motion blur +
-          // chromatic aberration + a peak white flash that hides the cut between
-          // the outgoing and incoming clip. Curve is a sine peaking at midpoint.
-          const scaleMax = layer.scale || 4.5;
-          const blurMax = layer.blur || 16;
-          const rgbMax = layer.rgb || 9;
-          const flashMax = layer.flash ?? 0.28;
+        } else if (kind === 'spin') {
+          // Whip-spin: rotate + zoom + motion blur around the centre.
+          const degMax = layer.deg || 180;
+          const scaleMax = layer.scale || 1.6;
+          const blurMax = layer.blur || 12;
+          const rot = (peak * degMax) * Math.PI / 180;
           const sc = 1 + (scaleMax - 1) * peak;
           const blurNow = blurMax * peak;
-          const rgbNow = rgbMax * peak;
-          // 1. Snapshot the current composition.
-          tctx.clearRect(0, 0, W, H);
-          try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
-          // 2. Repaint background, then the zoomed+blurred snapshot.
-          ctx.fillStyle = bgColor || '#000000';
-          ctx.fillRect(0, 0, W, H);
-          const dw = W * sc, dh = H * sc;
-          const dx = (W - dw) / 2, dy = (H - dh) / 2;
+          tctx.clearRect(0, 0, W, H); try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          ctx.fillStyle = bgColor || '#000000'; ctx.fillRect(0, 0, W, H);
           ctx.save();
           if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
-          try { ctx.drawImage(tmp, dx, dy, dw, dh); } catch(e) {}
+          ctx.translate(W / 2, H / 2); ctx.rotate(rot); ctx.scale(sc, sc); ctx.translate(-W / 2, -H / 2);
+          try { ctx.drawImage(tmp, 0, 0, W, H); } catch(e) {}
           ctx.restore();
-          // 3. Chromatic ghost — duplicate offsets in screen blend reads as
-          // RGB aberration without needing a per-channel offscreen.
-          if (rgbNow > 0.5) {
-            ctx.save();
-            ctx.globalCompositeOperation = 'screen';
-            ctx.globalAlpha = 0.4;
-            if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
-            try { ctx.drawImage(tmp, dx + rgbNow, dy, dw, dh); } catch(e) {}
-            try { ctx.drawImage(tmp, dx - rgbNow, dy, dw, dh); } catch(e) {}
+        } else if (kind === 'rgbsplit') {
+          // Chromatic aberration that diverges to the peak — base + two screen-blended offset ghosts.
+          const rgbMax = layer.rgb || 20;
+          const blurMax = layer.blur || 6;
+          const off = peak * rgbMax;
+          const blurNow = blurMax * peak;
+          tctx.clearRect(0, 0, W, H); try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          ctx.save();
+          if (blurNow > 0.5) ctx.filter = `blur(${blurNow}px)`;
+          try { ctx.drawImage(tmp, 0, 0, W, H); } catch(e) {}
+          if (off > 0.5) {
+            ctx.globalCompositeOperation = 'screen'; ctx.globalAlpha = 0.5;
+            try { ctx.drawImage(tmp, -off, 0, W, H); } catch(e) {}
+            try { ctx.drawImage(tmp, off, 0, W, H); } catch(e) {}
+          }
+          ctx.restore();
+        } else if (kind === 'glitch') {
+          // Digital glitch: horizontal slices jitter sideways (flicker seeded by time) + RGB ghost.
+          const rgbMax = layer.rgb || 18;
+          const slices = Math.max(2, Math.round(layer.slices || 12));
+          const jitMax = layer.jitter || 30;
+          const off = peak * rgbMax;
+          const S2 = bw / W;
+          tctx.clearRect(0, 0, W, H); try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          ctx.fillStyle = bgColor || '#000000'; ctx.fillRect(0, 0, W, H);
+          const sliceH = H / slices;
+          const fr = Math.floor(t * 30);
+          for (let i = 0; i < slices; i++) {
+            const seed = Math.sin(i * 12.9898 + fr * 78.233) * 43758.5453;
+            const jit = ((seed - Math.floor(seed)) * 2 - 1) * jitMax * peak;
+            const sy = i * sliceH;
+            try { ctx.drawImage(tmp, 0, sy * S2, bw, sliceH * S2, jit, sy, W, sliceH); } catch(e) {}
+          }
+          if (off > 0.5) {
+            ctx.save(); ctx.globalCompositeOperation = 'screen'; ctx.globalAlpha = 0.5;
+            try { ctx.drawImage(tmp, -off, 0, W, H); } catch(e) {}
+            try { ctx.drawImage(tmp, off, 0, W, H); } catch(e) {}
             ctx.restore();
           }
-          // 4. White flash centred on the peak — hides the cut and gives punch.
-          if (peak > 0.5) {
-            const fAlpha = ((peak - 0.5) / 0.5) * flashMax;
-            if (fAlpha > 0.001) {
-              ctx.save();
-              ctx.globalAlpha = Math.min(1, fAlpha);
-              ctx.fillStyle = '#ffffff';
-              ctx.fillRect(0, 0, W, H);
-              ctx.restore();
-            }
+        } else if (kind === 'pixelize') {
+          // Pixelation burst — downscale then upscale nearest-neighbour, peaking at the cut.
+          const pxMax = layer.px || 24;
+          const block = 1 + (pxMax - 1) * peak;
+          tctx.clearRect(0, 0, W, H); try { tctx.drawImage(ctx.canvas, 0, 0); } catch(e) {}
+          if (block > 1.5) {
+            const sw = Math.max(1, Math.round(W / block)), sh = Math.max(1, Math.round(H / block));
+            const small = pixTmpRef.current || (pixTmpRef.current = document.createElement('canvas'));
+            if (small.width !== sw) small.width = sw;
+            if (small.height !== sh) small.height = sh;
+            const sctx = small.getContext('2d');
+            sctx.imageSmoothingEnabled = false;
+            sctx.clearRect(0, 0, sw, sh);
+            try { sctx.drawImage(tmp, 0, 0, bw, bh, 0, 0, sw, sh); } catch(e) {}
+            ctx.save();
+            ctx.imageSmoothingEnabled = false;
+            try { ctx.drawImage(small, 0, 0, sw, sh, 0, 0, W, H); } catch(e) {}
+            ctx.restore();
           }
         }
       } else if (layer.type === 'zoom') {
@@ -5706,6 +5894,51 @@ function Editor({ state, setState }) {
             {/* Current preview quality — in the top-left CORNER of the preview
                 area (off the video), subtle transparent-black chip. */}
             <div style={{ position:'absolute', top:8, left:8, zIndex:7, font:'600 11px system-ui,sans-serif', color: proxyDbg === 'Low' ? '#f0b86a' : '#7fdca0', background:'rgba(0,0,0,.42)', padding:'2px 7px', borderRadius:5, pointerEvents:'none', letterSpacing:'.4px' }}>{proxyDbg || 'HD'}</div>
+            {/* Master preview volume — 1:1 the preview-zoom control's design
+                (− / value / + + icon button), pinned top-right. Value scrubs
+                (drag up/down) & wheels. Affects only what you hear, not export. */}
+            <div className="preview-zoom-ctrl ed-prevol-ctrl" data-onb="prevol" style={{ top:8, bottom:'auto', zIndex:8 }}
+              onPointerDown={(e) => e.stopPropagation()}>
+              <button onClick={(e) => { e.stopPropagation(); setPreviewVolume(v => Math.max(0, v - 10)); }} title="Тише (−)">−</button>
+              <span className={`zoom-pct zoom-pct-scrub${prevolScrub ? ' active' : ''}`}
+                title="Громкость превью — тяни вверх/вниз или крути колесо. Двойной клик — 100%"
+                onWheel={(e) => { e.preventDefault(); const dir = e.deltaY < 0 ? 1 : -1; setPreviewVolume(v => Math.max(0, Math.min(200, v + dir * 5))); }}
+                onDoubleClick={(e) => { e.stopPropagation(); setPreviewVolume(100); }}
+                onPointerDown={(e) => {
+                  e.stopPropagation(); e.preventDefault();
+                  const startY = e.clientY, startV = previewVolume;
+                  const el = e.currentTarget;
+                  try { el.setPointerCapture(e.pointerId); } catch {}
+                  setPrevolScrub(true);
+                  try { const c = audioCtxRef.current; if (c && c.state === 'suspended') c.resume(); } catch {}
+                  const onMove = (ev) => { const dy = startY - ev.clientY; setPreviewVolume(Math.max(0, Math.min(200, Math.round(startV + dy * 0.7)))); };
+                  const onUp = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); try { el.releasePointerCapture(e.pointerId); } catch {} setPrevolScrub(false); };
+                  window.addEventListener('pointermove', onMove);
+                  window.addEventListener('pointerup', onUp);
+                }}>{previewVolume}%
+                {prevolScrub && (() => {
+                  const pos = Math.max(0, Math.min(1, previewVolume / 200));
+                  return (
+                    <span className="zoom-scrub-track" aria-hidden="true">
+                      <span className="zoom-scrub-label top">200%</span>
+                      <span className="zoom-scrub-bar">
+                        <span className="zoom-scrub-mid" />
+                        <span className="zoom-scrub-thumb" style={{ bottom: `${pos * 100}%` }} />
+                      </span>
+                      <span className="zoom-scrub-label bot">0%</span>
+                    </span>
+                  );
+                })()}
+              </span>
+              <button onClick={(e) => { e.stopPropagation(); setPreviewVolume(v => Math.min(200, v + 10)); }} title="Громче (+)">+</button>
+              <button onClick={(e) => { e.stopPropagation(); setPreviewVolume(100); }} title="Сбросить (100%)" className="zoom-reset" aria-label="Сбросить громкость">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                </svg>
+              </button>
+            </div>
             <div ref={canvasRef} style={{ position:'relative', height:'100%', width:'auto', maxWidth:'100%', aspectRatio:`${outWidth}/${outHeight}`, transform:`translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`, transformOrigin:'center center', transition:'transform .08s linear' }}>
                 {/* Clip layer: only the rendered canvas + orange frame get clipped
                     to the project rect. The interactive bounding boxes/handles
@@ -5715,6 +5948,10 @@ function Editor({ state, setState }) {
                 <div className="ed-preview-clip" style={{ position:'absolute', inset:0, overflow:'hidden', background:'#000', borderRadius:'10px' }}>
                   <canvas ref={previewCanvasRef}
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', display:'block', pointerEvents:'none' }} />
+                  {/* Phase 2: WebGL2 compositor canvas — overlays the 2d one, shown only in engineMode. */}
+                  <canvas ref={glCanvasRef}
+                    style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', display: engineMode ? 'block' : 'none', pointerEvents:'none', zIndex:1 }} />
+                  {engineMode && <div style={{ position:'absolute', top:6, left:6, zIndex:4, padding:'2px 7px', borderRadius:6, background:'rgba(40,90,200,.85)', color:'#fff', font:'600 11px ui-monospace,monospace', pointerEvents:'none' }}>⚡ GL</div>}
                   {/* Phase 2 play-from-proxy: muted picture source that overlays
                       the canvas while a rendered proxy segment covers the playhead
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
@@ -6014,13 +6251,25 @@ function Editor({ state, setState }) {
             </div>
           )}
 
-          {/* Blur properties */}
+          {/* Blur properties — size/position are dragged on the preview; the panel
+              keeps only the shape picker + strength (+ corner radius for rounded). */}
           {sel?.type === 'blur' && (
             <div className="ed-prop-block ed-prop-sel">
               <div className="ed-prop-head">◎ Блюр</div>
-              <Slider label="Ширина, %" value={sel.width} min="5" max="100" onChange={v=>updLayer(sel.id,'width',v)} />
-              <Slider label="Высота, %" value={sel.height} min="5" max="100" onChange={v=>updLayer(sel.id,'height',v)} />
+              <div className="ed-mask-shapes">
+                {[['square','◼','Квадрат'],['rounded','▢','Скругл.'],['circle','●','Круг']].map(([id,glyph,lbl]) => (
+                  <button key={id} type="button" className={`ed-mask-shape${(sel.shape||'square')===id?' active':''}`}
+                    onClick={()=>updLayer(sel.id,'shape',id)} title={lbl}>
+                    <span className="ed-mask-shape-glyph">{glyph}</span>
+                    <span className="ed-mask-shape-lbl">{lbl}</span>
+                  </button>
+                ))}
+              </div>
+              {(sel.shape||'square') === 'rounded' && (
+                <Slider label="Скругление углов, %" value={sel.radius ?? 12} min="0" max="50" onChange={v=>updLayer(sel.id,'radius',v)} />
+              )}
               <Slider label="Сила блюра" value={sel.strength} min="1" max="50" onChange={v=>updLayer(sel.id,'strength',v)} />
+              <p className="ed-effects-hint">Размер и положение — тяни прямо на превью.</p>
             </div>
           )}
 
@@ -6093,7 +6342,7 @@ function Editor({ state, setState }) {
               ? sel.strength
               : (sel.strength === 'low' ? 25 : sel.strength === 'high' ? 80 : 50);
             const applyStrength = (v) => {
-              const params = transitionParams(sel.kind || 'shake', v);
+              const params = transitionParams(sel.kind || 'none', v);
               set('layers', ls => ls.map(x => x.id === sel.id
                 ? { ...x, strength: Number(v), ...params }
                 : x));
@@ -6259,7 +6508,7 @@ function Editor({ state, setState }) {
                 <div className="sub-style-head">Оформление</div>
                     <div className="ed-prop-row">
                       <span className="ed-prop-label">Анимация</span>
-                      <select className="ed-font-sel" value={st.anim || 'pop'} onChange={e => updStyle('anim', e.target.value)}>
+                      <select className="ed-font-sel" value={st.anim || 'slideup'} onChange={e => updStyle('anim', e.target.value)}>
                         {SUB_ANIMS.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                       </select>
                     </div>
@@ -6461,23 +6710,9 @@ function Editor({ state, setState }) {
                 </button>
                 <div className="ed-acc-body"><div className="ed-acc-inner">
                   <p className="ed-effects-hint ed-effects-hint-section">Используется для склейки двух разных видео, добавляется новым слоем.</p>
-                  {/* Click a kind to add that transition with default strength */}
-                  <div className="ed-trans-chips ed-trans-chips-grid">
-                    {[
-                      { kind: 'shake',   label: 'Удар',       desc: 'тряска + вспышка' },
-                      { kind: 'whippan', label: 'Whip pan',   desc: 'горизонтальный сдвиг' },
-                      { kind: 'zoom',    label: 'Zoom punch', desc: 'резкий зум с блюром' },
-                      { kind: 'blur',    label: 'Blur burst', desc: 'размытие при склейке' },
-                      { kind: 'seamzoom',label: 'Бесшовный зум', desc: 'провал в кадр + блюр' },
-                    ].map(({ kind, label, desc }) => (
-                      <button key={kind}
-                        className="ed-trans-chip"
-                        onClick={() => addTransition(kind, 50)}>
-                        {label}
-                        <small>{desc}</small>
-                      </button>
-                    ))}
-                  </div>
+                  {/* Old transition kinds removed — pivoting to the GPU effects pack.
+                      The new set plugs in here once the pack is integrated. */}
+                  <p className="ed-effects-hint">Переходы временно отключены — переезжаем на новый GPU-движок эффектов. Скоро здесь появится новый набор.</p>
                 </div></div>
               </div>
             </div>
@@ -6500,7 +6735,7 @@ function Editor({ state, setState }) {
               title={!hasAudioSrc ? 'Сначала добавь видео или аудио' : 'Автоматически распознать речь и добавить субтитры'}>
               <span aria-hidden="true" style={{marginRight:6}}>✦</span>Субтитры
             </button>
-            <button className="etl-add-btn" onClick={splitAtPlayhead} title="Разрезать клип под курсором по позиции воспроизведения">✂ Разрезать</button>
+            <button className="etl-add-btn" onClick={splitAtPlayhead} title="Разрезать клип под курсором по позиции воспроизведения (Ctrl+Shift+D)">✂ Разрезать</button>
             <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+клик по клипам на таймлайне для мультивыбора)">⛓ Объединить</button>
             <div style={{flex:1}} />
             <div className="ed-zoom">

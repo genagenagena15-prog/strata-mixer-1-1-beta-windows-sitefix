@@ -387,12 +387,20 @@ function setUpdateWindowStatus(payload) {
 }
 
 function getInstallerFileName(url) {
+  // STABLE per-platform name so each download OVERWRITES the previous installer
+  // (no pile-up of 200-330MB files in userData/updates). The filename itself is
+  // irrelevant to installing — Windows runs the .exe, macOS mounts the .dmg by
+  // its content. We only need the RIGHT EXTENSION: the old code hard-coded
+  // `.exe`, so a Mac `.dmg` was saved as `StrataMixer_Update.exe` → macOS won't
+  // mount a "`.exe`" and just opened the updates folder. Take the extension from
+  // the asset URL (.exe/.dmg), else fall back to the platform default.
+  let ext = process.platform === 'darwin' ? 'dmg' : 'exe';
   try {
     const u = new URL(url);
-    const base = path.basename(decodeURIComponent(u.pathname));
-    if (base && /\.exe$/i.test(base)) return base;
+    const m = path.basename(decodeURIComponent(u.pathname)).match(/\.(exe|dmg)$/i);
+    if (m) ext = m[1].toLowerCase();
   } catch {}
-  return 'StrataMixer_Update.exe';
+  return `StrataMixer_Update.${ext}`;
 }
 
 async function downloadUpdateInstaller(url, onProgress) {
@@ -402,6 +410,16 @@ async function downloadUpdateInstaller(url, onProgress) {
 
   const updatesDir = path.join(app.getPath('userData'), 'updates');
   fs.mkdirSync(updatesDir, { recursive: true });
+  // Clear ANY previous installer (incl. the old mis-named `StrataMixer_Update.exe`
+  // that was really a .dmg, and any half-finished `.download`) so they never pile
+  // up — each is 200-330MB. Without this, leftover installers waste disk.
+  try {
+    for (const f of fs.readdirSync(updatesDir)) {
+      if (/\.(exe|dmg|download)$/i.test(f)) {
+        try { fs.rmSync(path.join(updatesDir, f), { force: true }); } catch {}
+      }
+    }
+  } catch {}
 
   const fileName = getInstallerFileName(url);
   const outPath = path.join(updatesDir, fileName);
@@ -788,8 +806,16 @@ async function checkMacUpdate() {
       return;
     }
     const dmgAsset = (data.assets || []).find(a => /\.dmg$/i.test(a.name));
-    const downloadUrl = dmgAsset?.browser_download_url || data.html_url;
-    pushUpdateState({ status: 'mac-available', version: tag, downloadUrl, error: null });
+    if (!dmgAsset || !dmgAsset.browser_download_url) {
+      // The release exists but its .dmg isn't uploaded yet: Mac CI builds and
+      // attaches the .dmg a few minutes AFTER the Windows release is published
+      // (or the CI failed). Don't surface an update we can't install — the old
+      // code fell back to the release PAGE url, and the installer flow then tried
+      // to download an HTML page AS a .dmg. Wait for the .dmg on a later check.
+      pushUpdateState({ status: 'idle', error: null });
+      return;
+    }
+    pushUpdateState({ status: 'mac-available', version: tag, downloadUrl: dmgAsset.browser_download_url, error: null });
   } catch { /* silent — try again later */ }
   finally { clearTimeout(timer); }
 }
@@ -840,6 +866,13 @@ ipcMain.handle('update:install', async () => {
   // progress window, then open it so the user just drags the app into
   // Applications. Falls back to opening the browser download if anything fails.
   if (process.platform === 'darwin' && updateState.status === 'mac-available' && updateState.downloadUrl) {
+    // Safety net: only auto-download a real .dmg. If the URL somehow isn't a
+    // direct .dmg (e.g. a release page), open it in the browser instead of
+    // saving an HTML page as a bogus installer.
+    if (!/\.dmg(\?|$)/i.test(updateState.downloadUrl)) {
+      try { shell.openExternal(updateState.downloadUrl); } catch {}
+      return true;
+    }
     const verText = updateState.version ? `v${updateState.version}` : 'новая версия';
     const detail = 'Скачиваем обновление. Когда загрузка завершится, откроется установщик — перетащи Strata Mixer в папку «Программы».';
     try {
@@ -990,6 +1023,51 @@ ipcMain.handle('files:exist', async (_e, paths) => {
   const out = {};
   for (const p of (paths || [])) { try { out[p] = !!p && fs.existsSync(p); } catch { out[p] = false; } }
   return out;
+});
+// Phase 2 Tier A: return raw bytes of a media file (→ Uint8Array in the renderer) so the WebGL
+// engine can demux+decode it via mediabunny+WebCodecs. fetch('file://') is blocked in the renderer.
+ipcMain.handle('file:readBytes', async (_e, p) => {
+  try { return await fs.promises.readFile(p); } catch { return null; }
+});
+// Phase 2 engineExport — receive compositor-rendered RGBA frames + spawn ffmpeg (rawvideo → H.264 +
+// optional main-source audio). A NEW, default-off path; the existing video:edit filtergraph is untouched.
+let _engExp = null;
+ipcMain.handle('engine:export-begin', (_e, meta) => {
+  const ffmpeg = findFfmpeg();
+  if (!ffmpeg) return { ok: false, error: 'ffmpeg not found' };
+  const { W, H, fps, outPath, mainFile } = meta || {};
+  if (!outPath || !W || !H) return { ok: false, error: 'bad export meta' };
+  let hasAudio = false;
+  const args = ['-y', '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${W}x${H}`, '-r', String(fps || 30), '-i', 'pipe:0'];
+  if (mainFile && fs.existsSync(mainFile)) { args.push('-i', mainFile); hasAudio = true; }
+  args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p');
+  if (hasAudio) args.push('-map', '0:v', '-map', '1:a?', '-c:a', 'aac', '-b:a', '192k', '-shortest');
+  else args.push('-map', '0:v', '-an');
+  args.push(outPath);
+  let stderr = '';
+  const ff = spawn(ffmpeg, args);
+  ff.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-4000); });
+  ff.on('error', () => {});
+  const drains = [];
+  ff.stdin.on('drain', () => { const r = drains.splice(0); r.forEach((fn) => fn()); });
+  ff.stdin.on('error', () => {});
+  _engExp = { ff, drains, getErr: () => stderr };
+  return { ok: true };
+});
+ipcMain.handle('engine:export-frame', async (_e, buf) => {
+  if (!_engExp) return false;
+  try {
+    const ok = _engExp.ff.stdin.write(Buffer.from(buf));
+    if (!ok) await new Promise((r) => _engExp.drains.push(r));
+    return true;
+  } catch { return false; }
+});
+ipcMain.handle('engine:export-finish', async () => {
+  if (!_engExp) return { ok: false, error: 'no export in progress' };
+  const { ff, getErr } = _engExp; _engExp = null;
+  try { ff.stdin.end(); } catch {}
+  const code = await new Promise((r) => ff.on('close', r));
+  return code === 0 ? { ok: true } : { ok: false, error: 'ffmpeg ' + code + ': ' + getErr().slice(-400) };
 });
 ipcMain.handle('editor:resolveRecovery', (_e, accepted) => {
   pendingRecovery = null;
@@ -1829,105 +1907,59 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           const ts = Number(layer.startTime) || 0;
           const te = Number(layer.endTime) || ts + 0.3;
           const span = Math.max(0.05, te - ts);
-          const kind = layer.kind || 'shake';
+          const kind = layer.kind || 'flash';
           const enableExpr = `enable='between(t,${ts.toFixed(3)},${te.toFixed(3)})'`;
+          const halfSpanT = span / 2;
 
-          if (kind === 'shake') {
-            // Camera shake (exp-decay) + tblend motion blur + short bloom flash.
-            const ampPx = Number(layer.amp) || 30;
+          if (kind === 'flash') {
+            // Clean white flash punch — triangle alpha (up then down) over the span.
             const flashMax = Math.max(0, Math.min(1, layer.flash ?? 0.85));
-            const margin = Math.max(0.06, ampPx / Math.min(evenW, evenH) + 0.02);
-            const sxScale = (1 + margin * 2);
-            const bigW = Math.round(evenW * sxScale);
-            const bigH = Math.round(evenH * sxScale);
-            // Exponential decay = energetic punch + fast falloff
-            const decay = `exp(-3.2*max(0,t-${ts})/${span})`;
-            const xExpr = `(${bigW}-${evenW})/2 + (sin((t-${ts})*113)*0.6 + sin((t-${ts})*187)*0.4) * ${ampPx} * ${decay}`;
-            const yExpr = `(${bigH}-${evenH})/2 + (cos((t-${ts})*97)*0.6 + cos((t-${ts})*151)*0.4) * ${ampPx} * ${decay}`;
-            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
-            // tblend averages current with previous frame → free motion blur during fast shakes
-            filterParts.push(`[trS${i}]scale=${bigW}:${bigH},crop=${evenW}:${evenH}:'${xExpr}':'${yExpr}',tblend=all_mode=average[trShaken${i}]`);
-            filterParts.push(`[trM${i}][trShaken${i}]overlay=0:0:${enableExpr}[trAfterShake${i}]`);
-            videoStream = `[trAfterShake${i}]`;
-            // Punchy short flash (45% of span) with sharp rise and tail
-            const flashDur = Math.max(0.05, span * 0.45);
-            const fadeIn = Math.max(0.02, flashDur * 0.18);
-            const fadeOut = Math.max(0.02, flashDur - fadeIn);
-            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${flashDur.toFixed(3)},format=rgba,fade=t=in:st=0:d=${fadeIn.toFixed(3)}:alpha=1,fade=t=out:st=${fadeIn.toFixed(3)}:d=${fadeOut.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${ts.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trFlash${i}]`);
-            filterParts.push(`${videoStream}[trFlash${i}]overlay=0:0:enable='between(t,${ts.toFixed(3)},${(ts+flashDur).toFixed(3)})'[trDone${i}]`);
+            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${span.toFixed(3)},format=rgba,fade=t=in:st=0:d=${halfSpanT.toFixed(3)}:alpha=1,fade=t=out:st=${halfSpanT.toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${ts.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trFlash${i}]`);
+            filterParts.push(`${videoStream}[trFlash${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
             videoStream = `[trDone${i}]`;
-          } else if (kind === 'whippan') {
-            // Horizontal whip with directional smear + chromatic aberration
-            // + tblend motion blur from the fast frame-to-frame displacement.
-            const shiftPct = Math.max(0, Math.min(150, Number(layer.shift) || 60));
-            const blurSigma = Math.max(0, Number(layer.blur) || 22);
-            // Scale wider than canvas so the crop can scroll past the centre.
-            const bigW = Math.round(evenW * (1 + shiftPct / 100 * 1.4));
-            const xCenter = (bigW - evenW) / 2;
-            // sin(0)=0, sin(pi/2)=1, sin(pi)=0 → peak in the middle
-            const xExpr = `${xCenter.toFixed(2)} + ${(shiftPct / 100 * evenW).toFixed(2)} * sin((t-${ts})/${span}*${Math.PI.toFixed(5)})`;
-            // boxblur=lumaRadius x lumaPower : chromaRadius x chromaPower
-            // Big horizontal radius, 0 vertical = directional smear.
-            const blurH = Math.max(1, Math.round(blurSigma));
+          } else if (kind === 'slide') {
+            // Curtain slide — crop-scrolls the frame sideways (sine peak) with directional smear.
+            const dist = Math.max(0, Math.min(100, Number(layer.dist) || 80));
+            const blurH = Math.max(1, Math.round(Number(layer.blur) || 12));
+            const bigW = Math.round(evenW * (1 + dist / 100));
+            const xExpr = `(${bigW}-${evenW})*0.5 + ${(dist / 100 * evenW).toFixed(2)} * sin((t-${ts})/${span}*${Math.PI.toFixed(5)})`;
             filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
-            // rgbashift = R/B channel offset (chromatic aberration) before smear,
-            // then tblend averages with previous frame for true motion blur during the sweep.
-            filterParts.push(`[trS${i}]scale=${bigW}:${evenH},crop=${evenW}:${evenH}:'${xExpr}':0,rgbashift=rh=8:bh=-8:gh=0,boxblur=${blurH}:1:0:0,tblend=all_mode=average[trWhip${i}]`);
-            filterParts.push(`[trM${i}][trWhip${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
+            filterParts.push(`[trS${i}]scale=${bigW}:${evenH},crop=${evenW}:${evenH}:'${xExpr}':0,boxblur=${blurH}:1:0:0,tblend=all_mode=average[trSlide${i}]`);
+            filterParts.push(`[trM${i}][trSlide${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
             videoStream = `[trDone${i}]`;
-          } else if (kind === 'zoom') {
-            // Zoom punch — pre-scaled copy crossfaded over base, heavy blur
-            // + chromatic aberration + brief white impact flash at the peak.
-            const scaleMax = Math.max(1.05, Number(layer.scale) || 2);
-            const blurSigma = Math.max(4, Number(layer.blur) || 14);
-            const zw = Math.round(evenW * scaleMax);
-            const zh = Math.round(evenH * scaleMax);
-            const halfSpan = span / 2;
+          } else if (kind === 'spin') {
+            // Whip-spin — rotate (sine angle) + zoom + motion blur around centre.
+            const degMax = Number(layer.deg) || 180;
+            const scaleMax = Math.max(1.05, Number(layer.scale) || 1.6);
+            const blurSigma = Math.max(2, Number(layer.blur) || 12);
+            const sw = Math.round(evenW * scaleMax), sh = Math.round(evenH * scaleMax);
+            const aExpr = `${(degMax * Math.PI / 180).toFixed(5)} * sin((t-${ts})/${span}*${Math.PI.toFixed(5)})`;
             filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
-            filterParts.push(`[trS${i}]scale=${zw}:${zh},crop=${evenW}:${evenH},gblur=sigma=${blurSigma.toFixed(2)},rgbashift=rh=10:bh=-10:gh=0,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1,fade=t=out:st=${(ts+halfSpan).toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1[trZoom${i}]`);
-            filterParts.push(`[trM${i}][trZoom${i}]overlay=0:0:${enableExpr}[trAfterZoom${i}]`);
-            videoStream = `[trAfterZoom${i}]`;
-            // Impact flash: short white pulse centred on the peak
-            const flashSpan = Math.max(0.05, span * 0.22);
-            const flashStart = ts + (span - flashSpan) / 2;
-            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${flashSpan.toFixed(3)},format=rgba,fade=t=in:st=0:d=${(flashSpan*0.4).toFixed(3)}:alpha=1,fade=t=out:st=${(flashSpan*0.4).toFixed(3)}:d=${(flashSpan*0.6).toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${flashStart.toFixed(3)}/TB,colorchannelmixer=aa=0.32[trZoomFlash${i}]`);
-            filterParts.push(`${videoStream}[trZoomFlash${i}]overlay=0:0:enable='between(t,${flashStart.toFixed(3)},${(flashStart+flashSpan).toFixed(3)})'[trDone${i}]`);
+            filterParts.push(`[trS${i}]scale=${sw}:${sh},rotate='${aExpr}':c=none:ow=${sw}:oh=${sh},crop=${evenW}:${evenH},gblur=sigma=${(blurSigma * 0.5).toFixed(2)},tblend=all_mode=average[trSpin${i}]`);
+            filterParts.push(`[trM${i}][trSpin${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
             videoStream = `[trDone${i}]`;
-          } else if (kind === 'blur') {
-            // Blur burst with faux-bloom: heavy gaussian + curves lift on
-            // midtones/highlights + saturation pump for that "dreamy glow" feel.
-            const blurSigma = Math.max(8, Number(layer.blur) || 30);
-            const halfSpan = span / 2;
+          } else if (kind === 'rgbsplit') {
+            // Chromatic aberration that fades in to the peak then out — R/B channel offset.
+            const rgb = Math.max(0, Math.round(Number(layer.rgb) || 20));
+            const blurSigma = Math.max(0, Number(layer.blur) || 6);
             filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
-            // gblur (heavy), then curves lift midtone 0.5→0.65 (highlights pop without crushing shadows), then +40% saturation
-            filterParts.push(`[trS${i}]gblur=sigma=${blurSigma.toFixed(2)},curves=all='0/0 0.5/0.65 1/1',eq=saturation=1.4,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1,fade=t=out:st=${(ts+halfSpan).toFixed(3)}:d=${halfSpan.toFixed(3)}:alpha=1[trBlur${i}]`);
-            filterParts.push(`[trM${i}][trBlur${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
+            filterParts.push(`[trS${i}]rgbashift=rh=${rgb}:bh=${-rgb}:gh=0,gblur=sigma=${blurSigma.toFixed(2)},format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1,fade=t=out:st=${(ts + halfSpanT).toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1[trRgb${i}]`);
+            filterParts.push(`[trM${i}][trRgb${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
             videoStream = `[trDone${i}]`;
-          } else if (kind === 'seamzoom') {
-            // Seamless zoom: per-frame scale ramps 1× → max → 1× via a sine.
-            // Implemented with `zoompan` (the one filter whose `z` accepts a
-            // time-based expression for video input). `tblend` averages adjacent
-            // frames → free radial motion blur from the fast zoom. `rgbashift`
-            // gives chromatic aberration. A short white flash centred on the
-            // peak hides the actual cut between the two clips.
-            const scaleMax = Math.max(1.5, Number(layer.scale) || 4.5);
-            const rgb = Math.max(0, Math.round(Number(layer.rgb) || 9));
-            const flashMax = Math.max(0, Math.min(1, layer.flash ?? 0.28));
-            const K = (scaleMax - 1).toFixed(3);
-            const env = `sin((time-${ts})/${span}*${Math.PI.toFixed(5)})`;
-            // max(1,...) clamps to no-zoom outside the window (zoompan's z must
-            // be ≥ 1; outside the enable, the overlay hides this stream anyway).
-            const zExpr = `max(1,1+${K}*${env})`;
+          } else if (kind === 'glitch') {
+            // Digital glitch — strong chromatic shift + noise, faded over the span.
+            const rgb = Math.max(0, Math.round(Number(layer.rgb) || 18));
             filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
-            filterParts.push(`[trS${i}]zoompan=z='${zExpr}':d=1:s=${evenW}x${evenH}:fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',rgbashift=rh=${rgb}:bh=${-rgb}:gh=0,tblend=all_mode=average[trSZ${i}]`);
-            filterParts.push(`[trM${i}][trSZ${i}]overlay=0:0:${enableExpr}[trAfterSZ${i}]`);
-            videoStream = `[trAfterSZ${i}]`;
-            // Brief white flash centred on the peak (~25% of span).
-            const flashSpan = Math.max(0.05, span * 0.25);
-            const flashStart = ts + (span - flashSpan) / 2;
-            const fIn = flashSpan * 0.4, fOut = flashSpan - fIn;
-            filterParts.push(`color=c=white:s=${evenW}x${evenH}:r=30:d=${flashSpan.toFixed(3)},format=rgba,fade=t=in:st=0:d=${fIn.toFixed(3)}:alpha=1,fade=t=out:st=${fIn.toFixed(3)}:d=${fOut.toFixed(3)}:alpha=1,setpts=PTS-STARTPTS+${flashStart.toFixed(3)}/TB,colorchannelmixer=aa=${flashMax.toFixed(3)}[trSZFlash${i}]`);
-            filterParts.push(`${videoStream}[trSZFlash${i}]overlay=0:0:enable='between(t,${flashStart.toFixed(3)},${(flashStart + flashSpan).toFixed(3)})'[trDone${i}]`);
+            filterParts.push(`[trS${i}]rgbashift=rh=${rgb}:bh=${-rgb}:gh=0,noise=alls=16:allf=t,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1,fade=t=out:st=${(ts + halfSpanT).toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1[trGl${i}]`);
+            filterParts.push(`[trM${i}][trGl${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
+            videoStream = `[trDone${i}]`;
+          } else if (kind === 'pixelize') {
+            // Pixelation burst — downscale then upscale nearest-neighbour, faded over the span.
+            const pxMax = Math.max(2, Number(layer.px) || 24);
+            const sw = Math.max(1, Math.round(evenW / pxMax)), sh = Math.max(1, Math.round(evenH / pxMax));
+            filterParts.push(`${videoStream}split[trM${i}][trS${i}]`);
+            filterParts.push(`[trS${i}]scale=${sw}:${sh}:flags=neighbor,scale=${evenW}:${evenH}:flags=neighbor,format=rgba,fade=t=in:st=${ts.toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1,fade=t=out:st=${(ts + halfSpanT).toFixed(3)}:d=${halfSpanT.toFixed(3)}:alpha=1[trPix${i}]`);
+            filterParts.push(`[trM${i}][trPix${i}]overlay=0:0:${enableExpr}[trDone${i}]`);
             videoStream = `[trDone${i}]`;
           }
         } else if (layer.type === 'mask') {
@@ -1997,8 +2029,22 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           const w = Math.min(evenW - x, bw);
           const h = Math.min(evenH - y, bh);
           const enable = `enable='between(t,${layer.startTime},${layer.endTime})'`;
+          const blurShape = layer.shape || 'square';
           filterParts.push(`${videoStream}split[vb${i}main][vb${i}copy]`);
-          filterParts.push(`[vb${i}copy]crop=${w}:${h}:${x}:${y},gblur=sigma=${layer.strength}[vb${i}blurred]`);
+          if (blurShape === 'square') {
+            filterParts.push(`[vb${i}copy]crop=${w}:${h}:${x}:${y},gblur=sigma=${layer.strength}[vb${i}blurred]`);
+          } else {
+            // Carve the blurred crop to the shape via an alpha geq (mirrors the mask
+            // shapes); coords RELATIVE to the crop (centre w/2,h/2). overlay respects alpha.
+            let aExpr;
+            if (blurShape === 'circle') {
+              aExpr = `if(lte(pow((X-${w / 2})/${Math.max(1, w / 2)},2)+pow((Y-${h / 2})/${Math.max(1, h / 2)},2),1),255,0)`;
+            } else { // rounded
+              const R = Math.max(0, Math.min(w, h) / 2 * (Math.max(0, Number(layer.radius) || 0) / 100));
+              aExpr = `if(lte(pow(X-clip(X,${R},${w - R}),2)+pow(Y-clip(Y,${R},${h - R}),2),${(R * R).toFixed(1)}),255,0)`;
+            }
+            filterParts.push(`[vb${i}copy]crop=${w}:${h}:${x}:${y},gblur=sigma=${layer.strength},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='${aExpr}'[vb${i}blurred]`);
+          }
           filterParts.push(`[vb${i}main][vb${i}blurred]overlay=${x}:${y}:${enable}[vblur${i}]`);
           videoStream = `[vblur${i}]`;
         } else if (layer.type === 'image') {
@@ -3580,48 +3626,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   //   • a HIGHLIGHT-colour Dialogue spanning that word's active window (Layer 1,
   //     drawn on top) — so the active word lights up exactly when the preview's
   //     does, with no lingering.
-  // Animation preset (shared timing constants with the canvas preview's
-  // SUB_ANIM). 'pop' scale-punches the spoken word; 'scale' scales+fades the
-  // whole phrase in; 'type' reveals words one-by-one; 'rise' rises words in.
-  const anim = (style.anim) || 'pop';
+  // Animation preset (shared timing constants with the canvas preview's SUB_ANIM):
+  // slideup/flip/typeon/drop reveal each word at its own start; punch overshoots the
+  // spoken word; glowpulse pulses its outline; rainbow cycles its colour; zoomin scales
+  // the whole phrase in.
+  const anim = (style.anim) || 'slideup';
+  // Timing/scale contract shared with the canvas preview (src/main.jsx SUB_ANIM). Scales are in
+  // PERCENT here (ASS \fscx is percent); offsets in px; durations in ms.
   const A = {
-    POP_MS: 130, POP_SCALE: 130,
-    SCALE_MS: 200, SCALE_FROM: 60, SCALE_FADE_MS: 120,
-    RISE_MS: 150, RISE_OFFSET: 28, RISE_FADE_MS: 100,
-    BAM_MS1: 100, BAM_MS2: 180, BAM_FROM: 150, BAM_MID: 85,
-    BLUR_MS: 200, BLUR_PX: 8,
-    ZOUT_MS: 200, ZOUT_FROM: 140, ZOUT_FADE_MS: 120,
-    GLOW_MS: 500, GLOW_MUL: 2.5,
-    WAVE_MS: 350,
-    WAVE_COLORS: ['#ff9a1f', '#ff3bb8', '#46d3ff', '#aaff00'],
-    // neon-flicker: thick cyan outline + alpha pattern via chained instant-\t toggles
-    NEON_MS: 200, NEON_BORD_MUL: 2.2, NEON_COLOR: '#00f0ff',
-    // typewriter-cursor: blinking | after last revealed word, 500ms full period (250 on / 250 off)
-    TYPE_CURSOR_MS: 500, TYPE_CURSOR_PAD: 0.18,
-    // shake: ±4° rotation jitter via 5 chained \t blocks of \frz
-    SHAKE_STAGES: [[0,40,4],[40,80,-4],[80,120,3],[120,160,-2],[160,200,0]],
-    // bounce: drop-from-above with squash-and-stretch (drop / hit / settle)
-    BOUNCE_OFFSET: 60, BOUNCE_DROP_MS: 120, BOUNCE_SQUASH_MS: 80, BOUNCE_SETTLE_MS: 100,
-    BOUNCE_FROM_FSCX: 80, BOUNCE_FROM_FSCY: 140,
-    BOUNCE_HIT_FSCX: 120, BOUNCE_HIT_FSCY: 70,
+    SLIDE_MS: 160, SLIDE_OFFSET: 32, SLIDE_FADE_MS: 110,
+    PUNCH_MS1: 90, PUNCH_MS2: 170, PUNCH_FROM: 150, PUNCH_MID: 90,
+    FLIP_MS: 180,
+    GPULSE_MS: 480, GPULSE_MUL: 2.6,
+    RAIN_MS: 320, RAIN_COLORS: ['#ff3b6b', '#ffb03b', '#3bd8ff', '#9b6bff'],
+    TYPEON_FADE_MS: 90,
+    DROP_OFFSET: 70, DROP_MS: 150, DROP_SQUASH_MS: 90, DROP_SQUASH_FSCY: 78,
+    ZOOMIN_MS: 200, ZOOMIN_FROM: 60, ZOOMIN_FADE_MS: 120,
   };
-  const neonOutlineAss = _hexToAss(A.NEON_COLOR);
-  // Neon ALWAYS draws a thick glow, even when the outline toggle is off — the
-  // canvas preview forces the stroke for neon too. So base the neon border on
-  // the font's natural outline width (canvasPx*0.04), NOT on outlineW (which is
-  // 0 when the user disabled the outline → would collapse neon to a 1px hairline
-  // and mismatch the preview's thick glow).
-  const neonBaseW = Math.max(1, Math.round(canvasPx * 0.04));
-  const neonBord = Math.max(neonBaseW + 1, Math.round(neonBaseW * A.NEON_BORD_MUL));
-  // yScale is 100 now (no metric correction), so fy() is the identity — kept so
-  // the animation tag builders below read uniformly and stay correct if a scale
-  // is ever reintroduced.
+  // yScale is 100 now (no metric correction), so fy() is the identity.
   const fy = (n) => Math.round(Number(n) * yScale / 100);
-  const waveAss = A.WAVE_COLORS.map(_hexToAss);
+  const rainAss = A.RAIN_COLORS.map(_hexToAss);
   const phraseCx = Math.round(((style.x ?? 50) / 100) * outWidth);
   const phraseCy = Math.round(((style.y ?? 85) / 100) * outHeight);
   const glowBordBase = outlineW;
-  const glowBordBig = Math.max(glowBordBase + 1, Math.round(outlineW * A.GLOW_MUL));
+  const glowBordBig = Math.max(glowBordBase + 1, Math.round(outlineW * A.GPULSE_MUL));
 
   const layout = subL._layout;
   if (layout && Array.isArray(layout.segments) && layout.segments.length) {
@@ -3652,60 +3680,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let baseStartNum = segStartNum;
         let baseOv = `{\\an5\\pos(${cx},${cy})\\c${base}}`;
         let highOv = `{\\an5\\pos(${cx},${cy})\\c${high}}`;
-        if (anim === 'pop') {
-          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx${A.POP_SCALE}\\fscy${fy(A.POP_SCALE)}\\t(0,${A.POP_MS},\\fscx100\\fscy${yScale})}`;
-        } else if (anim === 'type') {
-          baseStart = wStart; baseStartNum = wStartNum;  // reveal the word at its own time
-        } else if (anim === 'rise') {
+        if (anim === 'slideup') {
+          // Word rises OFFSET px from below + fades in, revealed at its own start time.
           baseStart = wStart; baseStartNum = wStartNum;
-          const mv = `\\move(${cx},${cy + A.RISE_OFFSET},${cx},${cy},0,${A.RISE_MS})\\fad(${A.RISE_FADE_MS},0)`;
+          const mv = `\\move(${cx},${cy + A.SLIDE_OFFSET},${cx},${cy},0,${A.SLIDE_MS})\\fad(${A.SLIDE_FADE_MS},0)`;
           baseOv = `{\\an5${mv}\\c${base}}`;
           highOv = `{\\an5${mv}\\c${high}}`;
-        } else if (anim === 'scale') {
-          const sX = Math.round(phraseCx + (A.SCALE_FROM / 100) * (cx - phraseCx));
-          const sY = Math.round(phraseCy + (A.SCALE_FROM / 100) * (cy - phraseCy));
-          baseOv = `{\\an5\\move(${sX},${sY},${cx},${cy},0,${A.SCALE_MS})\\fad(${A.SCALE_FADE_MS},0)\\fscx${A.SCALE_FROM}\\fscy${fy(A.SCALE_FROM)}\\t(0,${A.SCALE_MS},\\fscx100\\fscy${yScale})\\c${base}}`;
-          // The highlight must ride the SAME phrase scale-in. If the word lights
-          // up mid-animation, pick the animation up partway (p0); once the phrase
-          // has settled it's just static.
-          const p0 = Math.max(0, Math.min(1, ((wStartNum - segStartNum) * 1000) / A.SCALE_MS));
-          if (p0 < 1) {
-            const scNow = Math.round(A.SCALE_FROM + (100 - A.SCALE_FROM) * p0);
-            const hX = Math.round(phraseCx + (scNow / 100) * (cx - phraseCx));
-            const hY = Math.round(phraseCy + (scNow / 100) * (cy - phraseCy));
-            const remMs = Math.max(1, Math.round(A.SCALE_MS * (1 - p0)));
-            const fadeRem = Math.max(0, Math.round(A.SCALE_FADE_MS - (wStartNum - segStartNum) * 1000));
-            const fadeTag = fadeRem > 0 ? `\\fad(${fadeRem},0)` : '';
-            highOv = `{\\an5\\move(${hX},${hY},${cx},${cy},0,${remMs})${fadeTag}\\fscx${scNow}\\fscy${fy(scNow)}\\t(0,${remMs},\\fscx100\\fscy${yScale})\\c${high}}`;
-          }
-        } else if (anim === 'zoomout') {
-          // Phrase scales 140% → 100% around its anchor, fading in. Same math
-          // as 'scale' but with SCALE_FROM > 100 (starts BIGGER, shrinks in).
-          const sX = Math.round(phraseCx + (A.ZOUT_FROM / 100) * (cx - phraseCx));
-          const sY = Math.round(phraseCy + (A.ZOUT_FROM / 100) * (cy - phraseCy));
-          baseOv = `{\\an5\\move(${sX},${sY},${cx},${cy},0,${A.ZOUT_MS})\\fad(${A.ZOUT_FADE_MS},0)\\fscx${A.ZOUT_FROM}\\fscy${fy(A.ZOUT_FROM)}\\t(0,${A.ZOUT_MS},\\fscx100\\fscy${yScale})\\c${base}}`;
-          // Highlight rides the same phrase animation — partial when it lights
-          // up mid-anim, static once the phrase has settled (p0 ≥ 1).
-          const p0 = Math.max(0, Math.min(1, ((wStartNum - segStartNum) * 1000) / A.ZOUT_MS));
-          if (p0 < 1) {
-            const scNow = Math.round(A.ZOUT_FROM + (100 - A.ZOUT_FROM) * p0);
-            const hX = Math.round(phraseCx + (scNow / 100) * (cx - phraseCx));
-            const hY = Math.round(phraseCy + (scNow / 100) * (cy - phraseCy));
-            const remMs = Math.max(1, Math.round(A.ZOUT_MS * (1 - p0)));
-            const fadeRem = Math.max(0, Math.round(A.ZOUT_FADE_MS - (wStartNum - segStartNum) * 1000));
-            const fadeTag = fadeRem > 0 ? `\\fad(${fadeRem},0)` : '';
-            highOv = `{\\an5\\move(${hX},${hY},${cx},${cy},0,${remMs})${fadeTag}\\fscx${scNow}\\fscy${fy(scNow)}\\t(0,${remMs},\\fscx100\\fscy${yScale})\\c${high}}`;
-          }
-        } else if (anim === 'bam') {
-          // 3-piece overshoot: 150% → 85% → 100% via chained \t (linear pieces).
-          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx${A.BAM_FROM}\\fscy${fy(A.BAM_FROM)}\\t(0,${A.BAM_MS1},\\fscx${A.BAM_MID}\\fscy${fy(A.BAM_MID)})\\t(${A.BAM_MS1},${A.BAM_MS2},\\fscx100\\fscy${yScale})}`;
-        } else if (anim === 'blurfocus') {
-          // Word starts blurred and snaps into focus via \blur ramp.
-          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\blur${A.BLUR_PX}\\t(0,${A.BLUR_MS},\\blur0)}`;
-        } else if (anim === 'glow') {
+        } else if (anim === 'punch') {
+          // Overshoot 150% → 90% → 100% via chained \t (linear pieces) on the active word.
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx${A.PUNCH_FROM}\\fscy${fy(A.PUNCH_FROM)}\\t(0,${A.PUNCH_MS1},\\fscx${A.PUNCH_MID}\\fscy${fy(A.PUNCH_MID)})\\t(${A.PUNCH_MS1},${A.PUNCH_MS2},\\fscx100\\fscy${yScale})}`;
+        } else if (anim === 'flip') {
+          // Vertical open: scaleY 0 → 100, revealed at its own start time.
+          baseStart = wStart; baseStartNum = wStartNum;
+          const fl = `\\fscy0\\t(0,${A.FLIP_MS},\\fscy${yScale})`;
+          baseOv = `{\\an5\\pos(${cx},${cy})${fl}\\c${base}}`;
+          highOv = `{\\an5\\pos(${cx},${cy})${fl}\\c${high}}`;
+        } else if (anim === 'glowpulse') {
           // Outline width pulses base → big → base → big → base (~2 cycles).
-          const halfMs = Math.round(A.GLOW_MS / 2);
-          const cycle = A.GLOW_MS;
+          const halfMs = Math.round(A.GPULSE_MS / 2);
+          const cycle = A.GPULSE_MS;
           const pulses = [
             `\\t(0,${halfMs},\\bord${glowBordBig})`,
             `\\t(${halfMs},${cycle},\\bord${glowBordBase})`,
@@ -3713,61 +3706,52 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             `\\t(${cycle + halfMs},${2 * cycle},\\bord${glowBordBase})`,
           ].join('');
           highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\bord${glowBordBase}${pulses}}`;
-        } else if (anim === 'colorwave') {
-          // Highlight cycles through the WAVE palette via chained \t \c, starting
-          // the FIRST transition at 0 (matches the canvas preview which lerps
-          // from t=0 — not after one full period).
-          const T = A.WAVE_MS;
+        } else if (anim === 'rainbow') {
+          // Active word cycles the palette via chained \t \c, first transition at 0.
+          const T = A.RAIN_MS;
           const transitions = [
-            `\\t(0,${T},\\c${waveAss[1]})`,
-            `\\t(${T},${2 * T},\\c${waveAss[2]})`,
-            `\\t(${2 * T},${3 * T},\\c${waveAss[3]})`,
-            `\\t(${3 * T},${4 * T},\\c${waveAss[0]})`,
+            `\\t(0,${T},\\c${rainAss[1]})`,
+            `\\t(${T},${2 * T},\\c${rainAss[2]})`,
+            `\\t(${2 * T},${3 * T},\\c${rainAss[3]})`,
+            `\\t(${3 * T},${4 * T},\\c${rainAss[0]})`,
           ].join('');
-          highOv = `{\\an5\\pos(${cx},${cy})\\c${waveAss[0]}${transitions}}`;
-        } else if (anim === 'neon') {
-          // Thick cyan outline + 6-stage alpha flicker via instant-\t toggles
-          // (t,t+1 ramp = effectively a jump cut for libass).
-          const flick = [
-            `\\t(50,51,\\1a&HFF&\\3a&HFF&)`,
-            `\\t(70,71,\\1a&H00&\\3a&H00&)`,
-            `\\t(100,101,\\1a&HFF&\\3a&HFF&)`,
-            `\\t(120,121,\\1a&H00&\\3a&H00&)`,
-            `\\t(160,170,\\1a&H8C&\\3a&H8C&)`,
-            `\\t(170,180,\\1a&H00&\\3a&H00&)`,
-          ].join('');
-          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\3c${neonOutlineAss}\\bord${neonBord}${flick}}`;
-        } else if (anim === 'typewriter') {
-          // Identical to 'type' for the words — reveal each at its own start time.
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${rainAss[0]}${transitions}}`;
+        } else if (anim === 'typeon') {
+          // Reveal each word at its own start time + a quick fade-in.
           baseStart = wStart; baseStartNum = wStartNum;
-        } else if (anim === 'shake') {
-          // 5-stage rotation jitter via chained \t \frz. Each \t interpolates
-          // linearly from the prior \frz value to the new one.
-          const st = A.SHAKE_STAGES;
-          const shakes = st.map(([t0, t1, deg]) => `\\t(${t0},${t1},\\frz${deg})`).join('');
-          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}${shakes}}`;
-        } else if (anim === 'bounce') {
-          // Phase 1 (0..D): drop from cy-OFFSET → cy + scale (80,140)→(100,100)
-          // Phase 2 (D..D+S): impact squash → (HIT_FSCX, HIT_FSCY)
-          // Phase 3 (D+S..D+S+T): settle → (100, 100)
-          const D = A.BOUNCE_DROP_MS, S = A.BOUNCE_SQUASH_MS, T = A.BOUNCE_SETTLE_MS;
-          const O = A.BOUNCE_OFFSET;
-          const mv = `\\move(${cx},${cy - O},${cx},${cy},0,${D})`;
-          const scales = [
-            `\\t(0,${D},\\fscx100\\fscy${yScale})`,
-            `\\t(${D},${D + S},\\fscx${A.BOUNCE_HIT_FSCX}\\fscy${fy(A.BOUNCE_HIT_FSCY)})`,
-            `\\t(${D + S},${D + S + T},\\fscx100\\fscy${yScale})`,
-          ].join('');
+          const fd = `\\fad(${A.TYPEON_FADE_MS},0)`;
+          baseOv = `{\\an5\\pos(${cx},${cy})${fd}\\c${base}}`;
+          highOv = `{\\an5\\pos(${cx},${cy})${fd}\\c${high}}`;
+        } else if (anim === 'drop') {
+          // Fall DROP_OFFSET px from above (0..DROP_MS), then squash settle on scaleY.
           baseStart = wStart; baseStartNum = wStartNum;
-          baseOv = `{\\an5${mv}\\fscx${A.BOUNCE_FROM_FSCX}\\fscy${fy(A.BOUNCE_FROM_FSCY)}\\fad(80,0)${scales}\\c${base}}`;
-          highOv = `{\\an5${mv}\\fscx${A.BOUNCE_FROM_FSCX}\\fscy${fy(A.BOUNCE_FROM_FSCY)}\\fad(80,0)${scales}\\c${high}}`;
+          const mv = `\\move(${cx},${cy - A.DROP_OFFSET},${cx},${cy},0,${A.DROP_MS})`;
+          const squash = `\\t(${A.DROP_MS},${A.DROP_MS + A.DROP_SQUASH_MS},\\fscy${fy(A.DROP_SQUASH_FSCY)})\\t(${A.DROP_MS + A.DROP_SQUASH_MS},${A.DROP_MS + 2 * A.DROP_SQUASH_MS},\\fscy${yScale})`;
+          baseOv = `{\\an5${mv}\\fad(80,0)${squash}\\c${base}}`;
+          highOv = `{\\an5${mv}\\fad(80,0)${squash}\\c${high}}`;
+        } else if (anim === 'zoomin') {
+          // Whole phrase scales ZOOMIN_FROM% → 100% around its anchor, fading in.
+          const sX = Math.round(phraseCx + (A.ZOOMIN_FROM / 100) * (cx - phraseCx));
+          const sY = Math.round(phraseCy + (A.ZOOMIN_FROM / 100) * (cy - phraseCy));
+          baseOv = `{\\an5\\move(${sX},${sY},${cx},${cy},0,${A.ZOOMIN_MS})\\fad(${A.ZOOMIN_FADE_MS},0)\\fscx${A.ZOOMIN_FROM}\\fscy${fy(A.ZOOMIN_FROM)}\\t(0,${A.ZOOMIN_MS},\\fscx100\\fscy${yScale})\\c${base}}`;
+          // Highlight rides the same phrase scale-in — partial if it lights up mid-anim.
+          const p0 = Math.max(0, Math.min(1, ((wStartNum - segStartNum) * 1000) / A.ZOOMIN_MS));
+          if (p0 < 1) {
+            const scNow = Math.round(A.ZOOMIN_FROM + (100 - A.ZOOMIN_FROM) * p0);
+            const hX = Math.round(phraseCx + (scNow / 100) * (cx - phraseCx));
+            const hY = Math.round(phraseCy + (scNow / 100) * (cy - phraseCy));
+            const remMs = Math.max(1, Math.round(A.ZOOMIN_MS * (1 - p0)));
+            const fadeRem = Math.max(0, Math.round(A.ZOOMIN_FADE_MS - (wStartNum - segStartNum) * 1000));
+            const fadeTag = fadeRem > 0 ? `\\fad(${fadeRem},0)` : '';
+            highOv = `{\\an5\\move(${hX},${hY},${cx},${cy},0,${remMs})${fadeTag}\\fscx${scNow}\\fscy${fy(scNow)}\\t(0,${remMs},\\fscx100\\fscy${yScale})\\c${high}}`;
+          }
         }
 
         // The base (Layer 0) must NOT overlap this word's highlight window — else
         // the static base shows THROUGH the animated highlight whenever the anim
-        // scales it below 100% (bam), rotates it (shake), blurs it (blurfocus) or
-        // flickers its alpha (neon), looking like a 2nd static subtitle underneath
-        // (the preview draws each word once, so it never doubled). So we emit the
+        // scales it (punch overshoot) or squashes its scaleY (drop settle), looking
+        // like a 2nd static subtitle underneath (the preview draws each word once, so
+        // it never doubled). So we emit the
         // base only BEFORE the highlight (carrying any entrance animation) and a
         // STATIC rest-base AFTER it — the highlight alone owns [wStart, wEnd].
         const wEndNum = Math.max(wStartNum + 0.02, Number(w.end) || 0);
@@ -3777,28 +3761,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lines.push(`Dialogue: 1,${wStart},${wEnd},Default,,0,0,0,,${highOv}${txt}`);
         if (segEndNum > wEndNum + 0.001) {
           lines.push(`Dialogue: 0,${wEnd},${segEnd},Default,,0,0,0,,{\\an5\\pos(${cx},${cy})\\c${base}}${txt}`);
-        }
-
-        // Typewriter cursor: blinking | sits after each word from word.end until
-        // the next word begins (or seg.end for last). Blinks 250 on / 250 off.
-        if (anim === 'typewriter') {
-          const nextW = segWords[wi + 1];
-          const cursorStartNum = Number(w.end) || 0;
-          const cursorEndNum = nextW ? (Number(nextW.start) || cursorStartNum) : Number(seg.end) || cursorStartNum;
-          if (cursorEndNum > cursorStartNum + 0.05) {
-            const cursorPadPx = Math.round(canvasPx * A.TYPE_CURSOR_PAD);
-            const cursorX = cx + Math.round(wPx / 2) + cursorPadPx;
-            // 250ms on / 250ms off, chained \t toggles. ~6 cycles covers 3s of
-            // typical word-gap (libass clamps stale tags after event end).
-            const blink = [];
-            for (let k = 1; k <= 12; k++) {
-              const t = k * 250;
-              const off = (k % 2 === 1) ? `\\1a&HFF&\\3a&HFF&` : `\\1a&H00&\\3a&H00&`;
-              blink.push(`\\t(${t},${t + 1},${off})`);
-            }
-            const cursorOv = `{\\an5\\pos(${cursorX},${cy})\\c${high}${blink.join('')}}`;
-            lines.push(`Dialogue: 1,${_assTime(cursorStartNum)},${_assTime(cursorEndNum)},Default,,0,0,0,,${cursorOv}|`);
-          }
         }
       }
     }

@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Strata Decode Bench — P2-6 (WebCodecs Tier A)</title>
+  <style>
+    body { background:#0c0d12; color:#cdd6e0; font:13px ui-monospace,Consolas,monospace; margin:0; padding:12px; }
+    h1 { font-size:14px; color:#8ad; margin:0 0 8px; }
+    #verdict { font-size:16px; padding:8px 10px; border-radius:6px; margin:8px 0; background:#15171f; }
+    #verdict.ok { color:#6f6; } #verdict.warn { color:#fd6; } #verdict.bad { color:#f77; }
+    canvas { border:1px solid #2a2d3a; height:420px; image-rendering:pixelated; background:#000; }
+    #log { white-space:pre-wrap; line-height:1.45; margin-top:10px; color:#9aa4b2; }
+  </style>
+</head>
+<body>
+  <h1>Strata Decode Bench — P2-6 · WebCodecs decode.js → Compositor (Tier A, 0-copy)</h1>
+  <div id="verdict">booting…</div>
+  <canvas id="cg"></canvas>
+  <div id="log"></div>
+  <script>
+    // classic script (runs at parse time) — surface any import-time / runtime error to the launcher.
+    window.addEventListener('error', (e) => { console.log('@@PAGEERR@@ ' + (e.message || (e.error && e.error.message)) + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')); });
+    window.addEventListener('unhandledrejection', (e) => { console.log('@@PAGEERR@@ rejection: ' + ((e.reason && e.reason.message) || e.reason)); });
+    console.log('[html] parsed, error listeners set');
+  </script>
+  <script type="module" src="/proto/decode-bench.js"></script>
+</body>
+</html>

@@ -45,6 +45,13 @@ contextBridge.exposeInMainWorld('strata', {
   getRecovery: () => ipcRenderer.invoke('editor:getRecovery'),
   resolveRecovery: (accepted) => ipcRenderer.invoke('editor:resolveRecovery', !!accepted),
   filesExist: (paths) => ipcRenderer.invoke('files:exist', paths),
+  // Phase 2 Tier A: read raw bytes of a media file for the renderer's WebCodecs decoder
+  // (mediabunny demuxes a Blob; fetch('file://') is blocked in the renderer).
+  readFileBytes: (path) => ipcRenderer.invoke('file:readBytes', path),
+  // Phase 2 engineExport — stream compositor-rendered RGBA frames to ffmpeg (rawvideo → H.264).
+  engineExportBegin: (meta) => ipcRenderer.invoke('engine:export-begin', meta),
+  engineExportFrame: (buf) => ipcRenderer.invoke('engine:export-frame', buf),
+  engineExportFinish: () => ipcRenderer.invoke('engine:export-finish'),
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
   previewProxyPath: (n) => ipcRenderer.invoke('editor:previewProxyPath', n),
   cancelPreview: () => ipcRenderer.invoke('editor:cancelPreview'),
