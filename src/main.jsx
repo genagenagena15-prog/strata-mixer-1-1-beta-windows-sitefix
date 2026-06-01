@@ -8,7 +8,7 @@ import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
-import { TEXT_STYLES, TEXT_STYLE_TYPE, TRANSITIONS } from './engine/effects/index.js';
+import { TEXT_STYLES, TEXT_STYLE_TYPE, TRANSITIONS, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
@@ -3448,69 +3448,33 @@ function Editor({ state, setState }) {
         const outlineColor = st.outlineColor || '#000000';
         const olMode = (st.outlineMode === 'none' || st.outline === false) ? 'none' : 'external';
         const olT = (st.outlineWidth != null && st.outlineWidth !== '') ? Math.max(0, Number(st.outlineWidth)) : Math.max(2, Math.round(fs * 0.04));
-        const anim = st.anim || 'slideup';
-        // GPU emissive text style (effects/textStyles.js) — 0/none = plain (opaque _drawLayer path).
+        // Sub-animations — the ported pack set (effects/subAnims.js). TRANSFORM anims (pop/punch/
+        // slide/zoom/flip/shake/bounce/jelly) → quad scale + px offset (offset baked into d.x/d.y,
+        // scale via d.scaleX/scaleY; rotation v1-skipped — only rotatein used it). PIXEL anims
+        // (fill/wave/typewriter/blur-in) live in FS_TEXT (u_anim) and ride the GPU style pass.
         const gpuStyleType = st.gpuStyle ? (TEXT_STYLE_TYPE[st.gpuStyle] || 0) : 0;
         const gpuIntensity = st.gpuIntensity != null ? Number(st.gpuIntensity) : 1;
-        const segStart = Number(segL.start) || 0;
-        const Wp = outWidth, Hp = outHeight;
-        let phraseScale = 1, phraseAlpha = 1;
-        const phraseCx = ((st.x ?? 50) / 100) * Wp, phraseCy = ((st.y ?? 85) / 100) * Hp;
-        if (anim === 'zoomin') {
-          const tau = (T - segStart) * 1000;
-          const p = Math.max(0, Math.min(1, tau / SUB_ANIM.ZOOMIN_MS));
-          phraseScale = SUB_ANIM.ZOOMIN_FROM + (1 - SUB_ANIM.ZOOMIN_FROM) * p;
-          phraseAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.ZOOMIN_FADE_MS));
-        }
+        const animA = TEXT_ANIM_TYPE[st.anim] || 0;
+        const animPixel = isPixelAnim(animA);
         const draws = [];
         for (const w of segL.words) {
-          const appeared = T >= w.start;
-          if ((anim === 'slideup' || anim === 'flip' || anim === 'typeon' || anim === 'drop') && !appeared) continue;
           const isActive = T >= w.start && T <= w.end;
-          const tau = (T - w.start) * 1000;
-          let wScale = 1, dy = 0, wAlpha = 1, wBlur = 0, wOutlineMul = 1, wDynColor = null;
-          let wScaleX = 1, wScaleY = 1, neonOutlineColor = null;
-          if (anim === 'slideup') {
-            dy = SUB_ANIM.SLIDE_OFFSET * Math.max(0, 1 - tau / SUB_ANIM.SLIDE_MS);
-            wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.SLIDE_FADE_MS));
-          } else if (anim === 'punch' && isActive) {
-            if (tau < SUB_ANIM.PUNCH_MS1) wScale = SUB_ANIM.PUNCH_FROM + (SUB_ANIM.PUNCH_MID - SUB_ANIM.PUNCH_FROM) * (tau / SUB_ANIM.PUNCH_MS1);
-            else if (tau < SUB_ANIM.PUNCH_MS2) wScale = SUB_ANIM.PUNCH_MID + (1 - SUB_ANIM.PUNCH_MID) * ((tau - SUB_ANIM.PUNCH_MS1) / (SUB_ANIM.PUNCH_MS2 - SUB_ANIM.PUNCH_MS1));
-          } else if (anim === 'flip') {
-            wScaleY = Math.max(0, Math.min(1, tau / SUB_ANIM.FLIP_MS));
-          } else if (anim === 'glowpulse' && isActive) {
-            const ph = (tau / SUB_ANIM.GPULSE_MS) % 1; const tri = ph < 0.5 ? ph * 2 : (1 - ph) * 2;
-            wOutlineMul = 1 + tri * (SUB_ANIM.GPULSE_MUL - 1);
-          } else if (anim === 'rainbow' && isActive) {
-            const pal = SUB_ANIM.RAIN_COLORS; const idxF = tau / SUB_ANIM.RAIN_MS;
-            const idx = Math.floor(idxF) % pal.length; const next = (idx + 1) % pal.length;
-            wDynColor = lerpHex(pal[idx], pal[next], idxF - Math.floor(idxF));
-          } else if (anim === 'typeon') {
-            wAlpha = Math.max(0, Math.min(1, tau / SUB_ANIM.TYPEON_FADE_MS));
-          } else if (anim === 'drop') {
-            if (tau < SUB_ANIM.DROP_MS) { const p = tau / SUB_ANIM.DROP_MS; dy = -SUB_ANIM.DROP_OFFSET * (1 - p); wAlpha = Math.min(1, p * 1.5); }
-            else if (tau < SUB_ANIM.DROP_MS + SUB_ANIM.DROP_SQUASH_MS) { const p = (tau - SUB_ANIM.DROP_MS) / SUB_ANIM.DROP_SQUASH_MS; wScaleY = (SUB_ANIM.DROP_SQUASH_FSCY + (100 - SUB_ANIM.DROP_SQUASH_FSCY) * p) / 100; }
-          }
-          const color = isActive ? (wDynColor || highlightColor) : baseColor;
-          const outline = olMode === 'none' ? 0 : olT * wOutlineMul;
-          const oColor = neonOutlineColor || outlineColor;
+          const tWord = Math.max(0, T - w.start);   // sec since this word activated (demo timing — tune later)
+          const tr = (animA && !animPixel) ? animTransform(animA, tWord) : { sx: 1, sy: 1, ox: 0, oy: 0, rot: 0 };
+          const dxPx = tr.ox * fs, dyPx = tr.oy * fs;   // clip-space offset → px via font size
+          const color = isActive ? highlightColor : baseColor;
+          const outline = olMode === 'none' ? 0 : olT;
           let d;
           if (gpuStyleType > 0) {
-            // GPU style: rasterize a glyph-ALPHA (white) word — the FS_TEXT shader paints colour/glow.
-            d = rasterizeWord(w.text, { cx: w.cx, cy: w.cy + dy, w: w.w }, { fontSize: fs }, fcss, true);
-            d.style = gpuStyleType; d.base = hexToRgb01(color); d.acc = hexToRgb01(highlightColor); d.intensity = gpuIntensity;
+            // GPU style: glyph-ALPHA word; FS_TEXT paints colour/glow (+ pixel anim via u_anim).
+            d = rasterizeWord(w.text, { cx: w.cx + dxPx, cy: w.cy + dyPx, w: w.w }, { fontSize: fs }, fcss, true);
+            d.style = gpuStyleType; d.base = hexToRgb01(color); d.acc = hexToRgb01(highlightColor);
+            d.intensity = gpuIntensity; d.anim = animPixel ? animA : 0;
           } else {
-            d = rasterizeWord(w.text, { cx: w.cx, cy: w.cy + dy, w: w.w }, { fontSize: fs, color, outlineColor: oColor, outline, blur: wBlur }, fcss);
+            d = rasterizeWord(w.text, { cx: w.cx + dxPx, cy: w.cy + dyPx, w: w.w }, { fontSize: fs, color, outlineColor, outline }, fcss);
           }
-          let scaleX = wScale * wScaleX, scaleY = wScale * wScaleY;
-          if (phraseScale !== 1) {
-            scaleX *= phraseScale; scaleY *= phraseScale;
-            const ncx = phraseCx + (w.cx - phraseCx) * phraseScale;
-            const ncy = phraseCy + ((w.cy + dy) - phraseCy) * phraseScale;
-            d.x += (ncx - w.cx); d.y += (ncy - (w.cy + dy));
-          }
-          d.opacity = wAlpha * phraseAlpha;
-          d.scaleX = scaleX; d.scaleY = scaleY;
+          d.opacity = 1;
+          d.scaleX = tr.sx; d.scaleY = tr.sy;
           draws.push(d);
         }
         return draws;
@@ -6526,8 +6490,8 @@ function Editor({ state, setState }) {
                 <div className="sub-style-head">Оформление</div>
                     <div className="ed-prop-row">
                       <span className="ed-prop-label">Анимация</span>
-                      <select className="ed-font-sel" value={st.anim || 'slideup'} onChange={e => updStyle('anim', e.target.value)}>
-                        {SUB_ANIMS.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                      <select className="ed-font-sel" value={st.anim || 'none'} onChange={e => updStyle('anim', e.target.value)}>
+                        {TEXT_ANIMS.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                       </select>
                     </div>
                     <div className="ed-prop-row">
