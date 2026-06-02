@@ -1029,6 +1029,55 @@ ipcMain.handle('files:exist', async (_e, paths) => {
 ipcMain.handle('file:readBytes', async (_e, p) => {
   try { return await fs.promises.readFile(p); } catch { return null; }
 });
+// Chroma-key eyedropper fallback for PACKAGED builds: webSecurity:true taints the
+// renderer canvas so it can't read a file:// video's pixels. Extract ONE pixel at
+// source (x,y) of the frame at time t via ffmpeg → "#rrggbb". In dev the renderer
+// reads the pixel directly (webSecurity:false) and never calls this.
+ipcMain.handle('chroma:sample-pixel', async (_e, payload) => {
+  try {
+    const { file, t, x, y } = payload || {};
+    if (!file) return { ok: false };
+    const ffmpeg = findFfmpeg();
+    const px = Math.max(0, Math.round(Number(x) || 0));
+    const py = Math.max(0, Math.round(Number(y) || 0));
+    const ss = Math.max(0, Number(t) || 0);
+    const args = ['-v', 'error', '-nostdin', '-ss', ss.toFixed(3), '-i', file,
+      '-frames:v', '1', '-vf', `crop=1:1:${px}:${py},format=rgb24`, '-f', 'rawvideo', '-'];
+    return await new Promise((resolve) => {
+      const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      const chunks = [];
+      proc.stdout.on('data', d => chunks.push(d));
+      proc.on('error', () => resolve({ ok: false }));
+      proc.on('close', () => {
+        const buf = Buffer.concat(chunks);
+        if (buf.length >= 3) resolve({ ok: true, hex: '#' + [buf[0], buf[1], buf[2]].map(v => v.toString(16).padStart(2, '0')).join('') });
+        else resolve({ ok: false });
+      });
+    });
+  } catch { return { ok: false }; }
+});
+// Build an ffmpeg `volume` expression (piecewise-linear in t = TIMELINE seconds) from a clip's
+// keyframe envelope. keys = [{t (clip-relative sec), v (0..1)}]; clipStartSec offsets to the timeline.
+// Used after adelay (stream t == timeline t). Returns null when there's nothing to automate.
+function buildVolEnvExpr(keys, clipStartSec) {
+  if (!Array.isArray(keys) || keys.length === 0) return null;
+  const pts = keys
+    .map(k => ({ t: (Number(clipStartSec) || 0) + Math.max(0, Number(k.t) || 0), v: Math.max(0, Math.min(2, Number(k.v))) }))
+    .filter(p => isFinite(p.t) && isFinite(p.v))
+    .sort((a, b) => a.t - b.t);
+  if (!pts.length) return null;
+  let expr = pts[pts.length - 1].v.toFixed(4);                 // after last point → hold
+  for (let i = pts.length - 1; i > 0; i--) {
+    const a = pts[i - 1], b = pts[i];
+    const seg = (b.t - a.t) > 1e-4
+      ? `(${a.v.toFixed(4)}+(t-${a.t.toFixed(4)})*${((b.v - a.v) / (b.t - a.t)).toFixed(6)})`
+      : b.v.toFixed(4);
+    expr = `if(lt(t,${b.t.toFixed(4)}),${seg},${expr})`;
+  }
+  expr = `if(lt(t,${pts[0].t.toFixed(4)}),${pts[0].v.toFixed(4)},${expr})`;  // before first → hold
+  return expr;
+}
+
 // Phase 2 engineExport — receive compositor-rendered RGBA frames + spawn ffmpeg (rawvideo → H.264 +
 // optional main-source audio). A NEW, default-off path; the existing video:edit filtergraph is untouched.
 let _engExp = null;
@@ -1053,7 +1102,11 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
     const vol = volumeCurve(s.volume != null ? Number(s.volume) : 100).toFixed(4);
     const at = []; let r = sp; while (r > 2) { at.push('atempo=2.0'); r /= 2; } while (r < 0.5) { at.push('atempo=0.5'); r *= 2; } at.push(`atempo=${r.toFixed(4)}`);
     const tempo = (Math.abs(sp - 1) > 1e-3) ? (',' + at.join(',')) : '';
-    filter.push(`[${i + 1}:a]atrim=${ts.toFixed(3)}:${te.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delay}:all=1,volume=${vol}[au${i}]`);
+    // Volume automation (keyframe envelope) → applied AFTER adelay where stream t == timeline t.
+    const envExpr = buildVolEnvExpr(s.volKeys, delay / 1000);
+    const envFilt = envExpr ? `,volume='${envExpr}':eval=frame` : '';
+    const baseVol = envExpr ? '1' : vol;   // envelope present → it's the SOLE level (ignore base «Громкость %»)
+    filter.push(`[${i + 1}:a]atrim=${ts.toFixed(3)}:${te.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delay}:all=1,volume=${baseVol}${envFilt}[au${i}]`);
     mix.push(`[au${i}]`);
   });
   const hasAudio = mix.length > 0;
@@ -1064,7 +1117,11 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
     args.push('-filter_complex', filter.join(';'));
   }
   args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p');
-  if (hasAudio) args.push('-map', '0:v', '-map', '[auFinal]', '-c:a', 'aac', '-b:a', '192k', '-shortest');
+  // NO '-shortest': the video comes from the rawvideo pipe and its EOF sets the output length.
+  // The audio mix can be SHORTER (e.g. the longest clip has no audio track). With '-shortest'
+  // ffmpeg finalised when the shorter audio ended and stopped reading the pipe → the render's
+  // stdin.write backpressure awaited a 'drain' that never came → the whole export deadlocked (~79%).
+  if (hasAudio) args.push('-map', '0:v', '-map', '[auFinal]', '-c:a', 'aac', '-b:a', '192k');
   else args.push('-map', '0:v', '-an');
   args.push(outPath);
   let stderr = '';
@@ -1072,24 +1129,34 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
   ff.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-4000); });
   ff.on('error', () => {});
   const drains = [];
-  ff.stdin.on('drain', () => { const r = drains.splice(0); r.forEach((fn) => fn()); });
-  ff.stdin.on('error', () => {});
-  _engExp = { ff, drains, getErr: () => stderr };
+  let exited = false;
+  // Wake EVERY pending backpressure waiter on 'drain' OR when ffmpeg closes its input / dies —
+  // otherwise a frame awaiting a 'drain' that never comes (ffmpeg stopped reading) hangs forever.
+  const flushDrains = () => { const r = drains.splice(0); r.forEach((fn) => fn()); };
+  ff.stdin.on('drain', flushDrains);
+  ff.stdin.on('error', flushDrains);
+  ff.stdin.on('close', flushDrains);
+  ff.on('close', flushDrains);
+  ff.on('exit', () => { exited = true; flushDrains(); });
+  _engExp = { ff, drains, getErr: () => stderr, isDead: () => exited || !ff.stdin.writable };
   return { ok: true };
 });
 ipcMain.handle('engine:export-frame', async (_e, buf) => {
-  if (!_engExp) return false;
+  if (!_engExp || _engExp.isDead()) return false;   // ffmpeg gone → tell the renderer to stop the loop
   try {
     const ok = _engExp.ff.stdin.write(Buffer.from(buf));
     if (!ok) await new Promise((r) => _engExp.drains.push(r));
-    return true;
+    return !_engExp.isDead();
   } catch { return false; }
 });
 ipcMain.handle('engine:export-finish', async () => {
   if (!_engExp) return { ok: false, error: 'no export in progress' };
   const { ff, getErr } = _engExp; _engExp = null;
   try { ff.stdin.end(); } catch {}
-  const code = await new Promise((r) => ff.on('close', r));
+  // If ffmpeg already exited (errored mid-stream), don't await a 'close' that already fired.
+  const code = (ff.exitCode != null || ff.signalCode != null)
+    ? ff.exitCode
+    : await new Promise((r) => ff.on('close', r));
   return code === 0 ? { ok: true } : { ok: false, error: 'ffmpeg ' + code + ': ' + getErr().slice(-400) };
 });
 ipcMain.handle('editor:resolveRecovery', (_e, accepted) => {
@@ -1200,9 +1267,12 @@ ipcMain.handle('image:pick', async () => {
 
 ipcMain.handle('media:pick', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Импорт медиа',
+    title: 'Импорт медиа или проекта',
     properties: ['openFile', 'multiSelections'],
-    filters: [{ name: 'Медиа', extensions: ['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac'] }]
+    filters: [
+      { name: 'Медиа и проекты', extensions: ['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac', 'smproj'] },
+      { name: 'Проект Strata (.smproj)', extensions: ['smproj'] },
+    ]
   });
   if (result.canceled) return [];
   return result.filePaths;
@@ -1531,6 +1601,17 @@ ipcMain.handle('project:open', async () => {
     const file = result.filePaths[0];
     // Shared loader handles both ZIP bundles (extract media to cache + rewrite
     // paths) and legacy plain-JSON projects.
+    return await loadProjectFile(file);
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+});
+
+// Open a project from a KNOWN path (no dialog) — used when a .smproj is chosen via the
+// «Импорт» media picker or dropped onto the window. Same shared loader as project:open.
+ipcMain.handle('project:open-path', async (_e, file) => {
+  try {
+    if (!file) return { ok: false, error: 'no path' };
     return await loadProjectFile(file);
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
@@ -2212,7 +2293,18 @@ ipcMain.handle('video:edit', async (_event, payload) => {
             : '';
           const huePart = ccH !== 0 ? `,hue=h=${ccH.toFixed(2)}` : '';
           const ccPart = cmPart + eqPart + huePart;
-          filterParts.push(`[${idx}:v]trim=start=${ovSrc}:end=${(ovSrc + ovDur * ovSp).toFixed(3)},setpts=(PTS-STARTPTS)/${ovSp}+${layer.startTime || 0}/TB,scale=${scaleW}:${scaleH}${ccPart},format=rgba[vov${i}]`);
+          // Chroma key («Удалить фон»): drop the keyed colour to transparent so the
+          // layer below shows through. Tier-A export bakes this in the GL compositor;
+          // this ffmpeg `chromakey` is the Tier-B / mp3-webm fallback. Maps the UI
+          // sliders to similarity/blend (approximate — engine export is exact).
+          let chromaPart = '';
+          if (layer.chromaKey && layer.chromaKey.color) {
+            const hex = String(layer.chromaKey.color).replace('#', '').slice(0, 6).padStart(6, '0');
+            const sim = Math.max(0.01, Math.min(1, (layer.chromaKey.threshold != null ? layer.chromaKey.threshold : 45) / 100 * 0.5));
+            const blend = Math.max(0, Math.min(1, (layer.chromaKey.smoothness != null ? layer.chromaKey.smoothness : 30) / 100 * 0.4));
+            chromaPart = `,chromakey=0x${hex}:${sim.toFixed(3)}:${blend.toFixed(3)}`;
+          }
+          filterParts.push(`[${idx}:v]trim=start=${ovSrc}:end=${(ovSrc + ovDur * ovSp).toFixed(3)},setpts=(PTS-STARTPTS)/${ovSp}+${layer.startTime || 0}/TB,scale=${scaleW}:${scaleH}${ccPart}${chromaPart},format=rgba[vov${i}]`);
           filterParts.push(`${videoStream}[vov${i}]overlay=${x}:${y}:${enable}[vvidov${i}]`);
           videoStream = `[vvidov${i}]`;
         } else if (layer.type === 'text') {
@@ -2421,7 +2513,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
         while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
         atParts.push(`atempo=${atRem.toFixed(4)}`);
-        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}:all=1,volume=${oVol.toFixed(4)}[auVov${i}]`);
+        const oEnv = buildVolEnvExpr(layer.volKeys, oDelay / 1000);
+        const oEnvF = oEnv ? `,volume='${oEnv}':eval=frame` : '';
+        const oBaseVol = oEnv ? '1' : oVol.toFixed(4);   // envelope present → sole level (ignore base)
+        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}:all=1,volume=${oBaseVol}${oEnvF}[auVov${i}]`);
         mixInputs.push(`[auVov${i}]`);
       });
       audioLayers.forEach((layer, i) => {
@@ -2433,7 +2528,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const vol = volumeCurve(layer.volume ?? 100);
         const delayMs = Math.round(aStart * 1000);
         const aSrc = Number(layer.srcStart || 0);
-        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${vol.toFixed(4)}[auLayer${i}]`);
+        const aEnv = buildVolEnvExpr(layer.volKeys, delayMs / 1000);
+        const aEnvF = aEnv ? `,volume='${aEnv}':eval=frame` : '';
+        const aBaseVol = aEnv ? '1' : vol.toFixed(4);   // envelope present → sole level (ignore base)
+        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${aBaseVol}${aEnvF}[auLayer${i}]`);
         mixInputs.push(`[auLayer${i}]`);
       });
       // Always pass the final audio through aresample to absorb tiny PTS

@@ -44,7 +44,8 @@ export async function renderExportFrames(spec, onFrame) {
       };
       comp.renderFrame(frame);
       const raw = comp.readPixels(W, H);                  // GL order: row 0 = bottom
-      await onFrame(flipRows(raw, W, H), i);              // → top-down for ffmpeg rawvideo
+      const accepted = await onFrame(flipRows(raw, W, H), i);  // → top-down for ffmpeg rawvideo
+      if (accepted === false) break;                      // ffmpeg stopped reading (closed/died) → stop, don't hang
       rendered++;
       if (spec.onProgress) spec.onProgress(rendered, total);
     }

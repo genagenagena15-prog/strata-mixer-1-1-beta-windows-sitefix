@@ -33,24 +33,24 @@ export function animTransform(a, tWord) {
   return { sx, sy, ox, oy, rot };
 }
 
-// Which anims are pixel-shader anims (handled by u_anim in FS_TEXT) vs transform anims.
-export const PIXEL_ANIMS = new Set([2, 3, 10, 11]); // fill, wave, typewriter, blur-in
+// Pixel-shader anims (fill / wave / typewriter / blur-in) were REMOVED from the subtitle
+// animation picker (not in TEXT_ANIMS below). PIXEL_ANIMS is empty → isPixelAnim() is always
+// false → getTextDraw never routes a subtitle through the FS_TEXT pixel path. The FS_TEXT
+// u_anim branches in textStyles.js are left in place (unreachable, harmless).
+export const PIXEL_ANIMS = new Set();
 export const isPixelAnim = (a) => PIXEL_ANIMS.has(a);
 
 // UI-picker metadata (pack §4). `a` = the u_anim / animTransform selector.
+// NOTE: pixel anims fill(2)/wave(3)/typewriter(10)/blur-in(11) intentionally removed.
 export const TEXT_ANIMS = [
   { id: 'none',       a: 0,  name: 'Нет' },
   { id: 'pop',        a: 1,  name: 'Pop / подскок' },
-  { id: 'fill',       a: 2,  name: 'Заливка (караоке)' },
-  { id: 'wave',       a: 3,  name: 'Волна' },
   { id: 'punch',      a: 4,  name: 'Punch' },
   { id: 'slideup',    a: 5,  name: 'Slide-up' },
   { id: 'slideside',  a: 6,  name: 'Slide сбоку' },
   { id: 'zoomin',     a: 7,  name: 'Zoom-in' },
   { id: 'rotatein',   a: 8,  name: 'Rotate-in' },
   { id: 'flip',       a: 9,  name: 'Flip' },
-  { id: 'typewriter', a: 10, name: 'Typewriter' },
-  { id: 'blurin',     a: 11, name: 'Blur-in' },
   { id: 'shake',      a: 12, name: 'Shake' },
   { id: 'bouncedrop', a: 13, name: 'Bounce-drop' },
   { id: 'jelly',      a: 14, name: 'Jelly' },

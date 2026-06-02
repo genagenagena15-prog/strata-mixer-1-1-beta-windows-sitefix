@@ -48,6 +48,35 @@ void main(){
   frag = vec4(clamp(c, 0.0, 1.0), t.a * uOpacity);
 }`;
 
+// Chroma key ("Удалить фон"): same as FS_LAYER but pixels whose CHROMA (Cb/Cr) is close to the
+// key colour get alpha→0, revealing the layer below (the keyed layer is drawn with the normal
+// src-over blend, so transparent areas show whatever the scene already holds). Keying on Cb/Cr
+// (not RGB) is brightness-independent and mirrors ffmpeg's `chromakey` (YUV) used on the Tier-B
+// export path → preview==export. a = smoothstep(thresh, thresh+smooth, dist): 0 = keyed out (the
+// background colour), 1 = fully kept; the band in between feathers the edge. CC applied after.
+const FS_CHROMA = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform float uOpacity;
+uniform float uB, uC, uS, uH;   // CSS-filter cc (same as FS_LAYER)
+uniform vec3 uKey;              // key colour rgb 0..1
+uniform float uThresh;         // chroma distance below which a pixel is fully keyed out
+uniform float uSmooth;         // feather band width above uThresh
+out vec4 frag;
+${CC_GLSL}
+vec2 chroma(vec3 c){
+  float y = dot(c, vec3(0.299, 0.587, 0.114));
+  return vec2(c.b - y, c.r - y);   // (Cb, Cr) up to scale
+}
+void main(){
+  vec4 t = texture(uTex, vUv);
+  float d = distance(chroma(t.rgb), chroma(uKey));
+  float a = smoothstep(uThresh, uThresh + max(uSmooth, 1e-4), d);
+  vec3 c = applyCC(t.rgb, uB, uC, uS, uH);
+  frag = vec4(clamp(c, 0.0, 1.0), t.a * a * uOpacity);
+}`;
+
 const FS_BLIT = `#version 300 es
 precision highp float;
 in vec2 vUv; uniform sampler2D uTex; out vec4 frag;
@@ -101,6 +130,29 @@ uniform sampler2D uTex;
 uniform vec2 uRes;
 out vec4 frag;
 void main(){ frag = texture(uTex, gl_FragCoord.xy / uRes); }`;
+
+// Drop shadow / outer glow tint pass ("Эффекты слоя"): take a BLURRED SILHOUETTE (uTex — only its
+// ALPHA channel matters, RGB is ignored) and paint it as a SOLID-coloured shadow, sampled by screen
+// position shifted by uOffset (= dx,dy in backing px, y already flipped for FBO y-up), so the shadow
+// lands offset from the layer. Output rgb = uColor (the shadow/glow colour), alpha = blurredAlpha ×
+// uOpacity. Composited over the scene with a normal src-over blend (shadow) or additive (glow). Used
+// BEFORE the layer itself is drawn → the layer sits on top of its own shadow, like Photoshop.
+const FS_SHADOW = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;   // blurred silhouette (alpha = shape coverage)
+uniform vec2 uRes;
+uniform vec2 uOffset;     // shadow shift in backing px (x right, y already flipped to FBO y-up)
+uniform vec3 uColor;      // shadow/glow rgb 0..1
+uniform float uOpacity;   // 0..1 overall shadow strength
+out vec4 frag;
+void main(){
+  vec2 uv = (gl_FragCoord.xy - uOffset) / uRes;
+  float a = texture(uTex, uv).a;
+  // sampling outside the silhouette texture must read 0 (CLAMP_TO_EDGE could smear an edge value
+  // across the offset gap) → hard-zero anything outside [0,1].
+  if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) a = 0.0;
+  frag = vec4(uColor, a * uOpacity);
+}`;
 
 // Mask stamp: draw the FULL composite (uFull, sampled by screen pos) inside this mask's shape.
 // alpha = inside the shape (rect / ellipse / rounded-rect, ~1px AA). Multiple masks union.
@@ -179,8 +231,22 @@ const VS_TEXTQUAD = `#version 300 es
 layout(location=0) in vec2 aPos;
 uniform vec4 uRect;
 uniform int uFlip;
+uniform float uRot;
+uniform float uAspect;
 out vec2 v_uv;
-void main(){ v_uv = vec2(aPos.x, uFlip==1 ? 1.0 - aPos.y : aPos.y); gl_Position = vec4(mix(uRect.xy, uRect.zw, aPos), 0.0, 1.0); }`;
+void main(){
+  v_uv = vec2(aPos.x, uFlip==1 ? 1.0 - aPos.y : aPos.y);
+  vec2 ndc = mix(uRect.xy, uRect.zw, aPos);
+  if(uRot != 0.0){
+    vec2 c = (uRect.xy + uRect.zw) * 0.5;
+    vec2 d = ndc - c;
+    vec2 q = vec2(d.x * uAspect, d.y);
+    float cs = cos(uRot), sn = sin(uRot);
+    d = vec2((q.x*cs - q.y*sn) / uAspect, q.x*sn + q.y*cs);
+    ndc = c + d;
+  }
+  gl_Position = vec4(ndc, 0.0, 1.0);
+}`;
 
 function hexToRgb(hex) {
   const h = (hex || '#000000').replace('#', '');
@@ -200,9 +266,11 @@ export class Compositor {
     this.gl = getGL(canvas);
     const gl = this.gl;
     this.progLayer = makeProgram(gl, VS_QUAD, FS_LAYER);
+    this.progChroma = makeProgram(gl, VS_QUAD, FS_CHROMA);  // green-screen / chroma key
     this.progBlit = makeProgram(gl, VS_QUAD, FS_BLIT);
     this.progGauss = makeProgram(gl, VS_QUAD, FS_GAUSS);
     this.progCopyRect = makeProgram(gl, VS_QUAD, FS_COPYRECT);
+    this.progShadow = makeProgram(gl, VS_QUAD, FS_SHADOW);   // drop shadow / outer glow tint
     this.progMask = makeProgram(gl, VS_QUAD, FS_MASKSTAMP);
     this.progMaskedVideo = makeProgram(gl, VS_QUAD, FS_MASKEDVIDEO);
     this.progScreen = makeProgram(gl, VS_QUAD, FS_MUL);
@@ -253,8 +321,15 @@ export class Compositor {
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     const t = frame.time;
+    // Occlusion culling: if some layer is a guaranteed opaque full-frame cover (a solid rect
+    // that will actually paint this frame), every layer BELOW it is hidden and need not be
+    // drawn (or even touched). Find the TOPMOST such cover; skip everything under it. Pure
+    // optimisation — when in doubt _coverIdx returns -1 and nothing is skipped (draw it all).
+    const coverIdx = this._coverIdx(frame, W, H, t);
     let maskInitDone = false;
-    for (const layer of frame.layers) {
+    for (let li = 0; li < frame.layers.length; li++) {
+      const layer = frame.layers[li];
+      if (li < coverIdx) continue;   // fully occluded by the cover at coverIdx (which is drawn on top)
       if (layer.hidden) continue;
       // time-gate (mirrors renderFrameRef)
       if (layer.type === 'mainVideo') {
@@ -266,42 +341,97 @@ export class Compositor {
 
       if (layer.type === 'mainVideo' || layer.type === 'image' || layer.type === 'videoOverlay') {
         const src = frame.getSource(layer);
-        if (!srcReady(src)) continue;
         const rec = this._texFor(layer.id);
-        uploadElement(gl, rec.tex, src);
+        // Keep the LAST uploaded frame when the live source isn't ready: rapid scrubbing /
+        // seeks briefly drop a <video>'s readyState below 2, and returning null here would
+        // flash the layer to BLACK until the seek settles. Only skip on the very first load.
+        if (srcReady(src)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; }
+        else if (!rec.hasFrame) continue;
         const b = frame.getPx(layer);
         if (!b || b.w <= 0 || b.h <= 0) continue;
         const rect = pxRectToNDC(b.x, b.y, b.w, b.h, W, H);
         const opacity = layer.type === 'image' ? (layer.opacity ?? 100) / 100 : 1;
         const cc = frame.getCC ? frame.getCC(layer) : null;
-        this._drawLayer(rec.tex, rect, opacity, cc);
+        const rot = -(layer.angle || 0) * Math.PI / 180, aspect = W / H;   // +angle = clockwise (matches CSS box + canvas2d)
+        const hasChroma = !!(layer.chromaKey && layer.chromaKey.color);
+        // Layer effects (shadow / glow) — only for image|videoOverlay overlays, NOT the mainVideo
+        // full-frame background (a shadow there is invisible). Silhouette = the layer's own alpha
+        // shape (chroma cut-out if keyed, else the opaque rect), so the shadow follows the visible
+        // form. Drawn BEFORE the layer → layer sits on top of its shadow.
+        if (layer.type !== 'mainVideo') {
+          const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow);
+          if (sh || gl2) {
+            const sil = () => {
+              if (hasChroma) this._drawChromaLayer(rec.tex, rect, opacity, null, layer.chromaKey, rot, aspect);
+              else this._drawLayer(rec.tex, rect, opacity, null, rot, aspect);
+            };
+            if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);   // outer glow (centred, additive)
+            if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);    // drop shadow
+          }
+        }
+        // Chroma key («Удалить фон»): key out the colour → reveals the scene below it.
+        if (hasChroma) this._drawChromaLayer(rec.tex, rect, opacity, cc, layer.chromaKey, rot, aspect);
+        else this._drawLayer(rec.tex, rect, opacity, cc, rot, aspect);
       } else if (layer.type === 'blur') {
         this._blur(frame, layer, bw, bh);
       } else if (layer.type === 'mask') {
         if (!maskInitDone) { this._captureFullAndResetBase(frame, bw, bh); maskInitDone = true; }
         this._stampMask(frame, layer, bw, bh);
       } else if (layer.type === 'maskedVideo') {
+        // Shadow / glow follow the cut-out SILHOUETTE (the masked-video shape rendered into scratchB).
+        const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow);
+        if (sh || gl2) {
+          const sil = (fbo) => this._drawMaskedVideo(frame, layer, bw, bh, fbo);
+          if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);
+          if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);
+        }
         this._drawMaskedVideo(frame, layer, bw, bh);
       } else if (layer.type === 'text' || layer.type === 'subtitles') {
         // text/subtitles are rasterized (textRaster) by the caller into 1+ draws; we just
         // composite each as a textured quad. Same raster feeds preview AND export → no libass.
         const draws = frame.getTextDraw ? frame.getTextDraw(layer, t) : null;
+        // Rotate a single TEXT layer around its centre. Subtitles are multi-word draws,
+        // each with its own rect — rotating each around its own centre would spin words
+        // in place, so subtitle rotation is left out of v1 (rot stays 0).
+        const trot = layer.type === 'text' ? -(layer.angle || 0) * Math.PI / 180 : 0;
+        const tasp = frame.W / frame.H;
+        // per-draw output rect (offset+scale) — shared by the real draw and the shadow silhouette.
+        const drawRect = (d) => {
+          let dx = d.x, dy = d.y, dw = d.w, dh = d.h;
+          const sx = d.scaleX != null ? d.scaleX : 1, sy = d.scaleY != null ? d.scaleY : 1;
+          if (sx !== 1 || sy !== 1) { const ccx = d.x + d.w / 2, ccy = d.y + d.h / 2; dw = d.w * sx; dh = d.h * sy; dx = ccx - dw / 2; dy = ccy - dh / 2; }
+          return pxRectToNDC(dx, dy, dw, dh, frame.W, frame.H);
+        };
+        // Layer shadow / glow for text|subtitles — ONE pass over the whole layer's glyph silhouette
+        // (every word/line draw as a plain alpha quad), so the shadow sits under all the glyphs.
+        if (draws && draws.length) {
+          const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow);
+          if (sh || gl2) {
+            const sil = () => {
+              for (let di = 0; di < draws.length; di++) {
+                const d = draws[di]; if (!d || !d.source) continue;
+                const rec = this._texFor(layer.id + '#' + di);
+                uploadElement(gl, rec.tex, d.source);
+                this._drawLayer(rec.tex, drawRect(d), d.opacity != null ? d.opacity : 1, null, trot, tasp);
+              }
+            };
+            if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);
+            if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);
+          }
+        }
         if (draws) {
           for (let di = 0; di < draws.length; di++) {
             const d = draws[di];
             if (!d || !d.source) continue;
             const rec = this._texFor(layer.id + '#' + di);
             uploadElement(gl, rec.tex, d.source);
-            // optional per-draw scale around the draw's own centre (subtitle pop/bam/bounce/scale anims).
-            let dx = d.x, dy = d.y, dw = d.w, dh = d.h;
-            const sx = d.scaleX != null ? d.scaleX : 1, sy = d.scaleY != null ? d.scaleY : 1;
-            if (sx !== 1 || sy !== 1) { const ccx = d.x + d.w / 2, ccy = d.y + d.h / 2; dw = d.w * sx; dh = d.h * sy; dx = ccx - dw / 2; dy = ccy - dh / 2; }
-            const r2 = pxRectToNDC(dx, dy, dw, dh, frame.W, frame.H);
-            if (d.style != null && d.style > 0) {
-              // GPU emissive style (neon/fire/…): d.source is a glyph-ALPHA raster, recoloured in-shader.
-              this._drawTextStyled(rec.tex, d, r2, (d.source && d.source.width) || d.w, (d.source && d.source.height) || d.h, t);
+            const r2 = drawRect(d);
+            if (d.style != null && (d.style > 0 || (d.anim != null && d.anim > 0))) {
+              // FS_TEXT pass: GPU style (neon/fire/…) OR a PIXEL anim (fill/wave/type/blur, via u_anim)
+              // even at plain style 0. d.source is a glyph-ALPHA raster, recoloured/animated in-shader.
+              this._drawTextStyled(rec.tex, d, r2, (d.source && d.source.width) || d.w, (d.source && d.source.height) || d.h, t, trot, tasp);
             } else {
-              this._drawLayer(rec.tex, r2, d.opacity != null ? d.opacity : 1);
+              this._drawLayer(rec.tex, r2, d.opacity != null ? d.opacity : 1, null, trot, tasp);
             }
           }
         }
@@ -328,7 +458,59 @@ export class Compositor {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  _drawLayer(tex, rect, opacity, cc) {
+  // Occlusion culling — index of the TOPMOST layer that is an opaque full-frame cover (a solid
+  // rectangle that will actually paint this frame). Layers below it are invisible. Returns -1 when
+  // there is no such cover, so the caller draws everything (unchanged behaviour). SAFE-by-default:
+  // any uncertainty (not ready, rotated, chroma-keyed, not covering the frame, transparent) → the
+  // layer is NOT treated as a cover, so we never hide something that should be visible.
+  _coverIdx(frame, W, H, t) {
+    const layers = frame.layers;
+    for (let i = layers.length - 1; i >= 0; i--) {
+      if (this._isFullCover(frame, layers[i], W, H, t)) return i;
+    }
+    return -1;
+  }
+
+  // True ONLY if `layer` is a guaranteed opaque, full-frame, axis-aligned cover that WILL draw this
+  // frame — i.e. it paints a solid rectangle over the whole canvas with no holes:
+  //  • type ∈ {mainVideo, image, videoOverlay} (solid rects; mask/maskedVideo/blur/text/subtitles/
+  //    transition/zoom never qualify — they reveal or transform what's below);
+  //  • not hidden, and inside its time window (else it doesn't draw at all → can't occlude);
+  //  • opaque: image needs opacity===100; video is always opaque;
+  //  • no chroma key (chromaKey.color punches transparent holes → reveals the layer below);
+  //  • not rotated (!layer.angle — a rotated rect leaves the frame corners uncovered);
+  //  • its rect (frame.getPx) covers the ENTIRE frame: x<=0 && y<=0 && x+w>=W && y+h>=H, w>0,h>0;
+  //  • has a real frame to draw (source ready OR a cached texture from a previous frame) — otherwise
+  //    the layer itself draws nothing this frame and would expose the layers below it.
+  _isFullCover(frame, layer, W, H, t) {
+    if (!layer || layer.hidden) return false;
+    const ty = layer.type;
+    if (ty !== 'mainVideo' && ty !== 'image' && ty !== 'videoOverlay') return false;
+    // same time-gate the draw loop uses — a gated-out layer never paints
+    if (ty === 'mainVideo') {
+      if (!(t >= frame.videoStart && t <= frame.videoEnd)) return false;
+    } else {
+      const ls = layer.startTime || 0, le = layer.endTime !== undefined ? layer.endTime : frame.dur;
+      if (t < ls || t > le) return false;
+    }
+    // opacity: image can be semi-transparent; video is always opaque
+    if (ty === 'image' && (layer.opacity ?? 100) !== 100) return false;
+    // chroma key cuts holes; rotation leaves corners empty → not a solid full cover
+    if (layer.chromaKey && layer.chromaKey.color) return false;
+    if (layer.angle) return false;
+    // must cover the whole frame
+    const b = frame.getPx(layer);
+    if (!b || !(b.w > 0) || !(b.h > 0)) return false;
+    if (!(b.x <= 0 && b.y <= 0 && b.x + b.w >= W && b.y + b.h >= H)) return false;
+    // must have something to draw (live source ready, or a texture kept from a prior frame —
+    // matches the renderFrame "keep last frame during scrub" behaviour)
+    const src = frame.getSource ? frame.getSource(layer) : null;
+    if (srcReady(src)) return true;
+    const rec = this.texCache.get(layer.id);
+    return !!(rec && rec.hasFrame);
+  }
+
+  _drawLayer(tex, rect, opacity, cc, rot, aspect) {
     const gl = this.gl, p = this.progLayer;
     gl.useProgram(p);
     gl.bindVertexArray(this.quad);
@@ -346,6 +528,37 @@ export class Compositor {
     gl.uniform1f(p.u.uH, cc ? cc.h : 0);
     gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
     gl.uniform1i(p.u.uFlip, 1);
+    gl.uniform1f(p.u.uRot, rot || 0);            // ALWAYS set (progLayer is shared with _drawSnapshot/_flash)
+    gl.uniform1f(p.u.uAspect, aspect || 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // Chroma-key draw: like _drawLayer but keys out ck.color (Cb/Cr distance). The transparent
+  // pixels src-over-blend into the scene already drawn below → the layer beneath shows through,
+  // exactly like a mask cut-out. ck = {color:'#rrggbb', threshold 0..100, smoothness 0..100}.
+  _drawChromaLayer(tex, rect, opacity, cc, ck, rot, aspect) {
+    const gl = this.gl, p = this.progChroma;
+    gl.useProgram(p);
+    gl.bindVertexArray(this.quad);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(p.u.uTex, 0);
+    gl.uniform1f(p.u.uOpacity, opacity);
+    gl.uniform1f(p.u.uB, cc ? cc.b : 1);
+    gl.uniform1f(p.u.uC, cc ? cc.c : 1);
+    gl.uniform1f(p.u.uS, cc ? cc.s : 1);
+    gl.uniform1f(p.u.uH, cc ? cc.h : 0);
+    const rgb = hexToRgb(ck.color);
+    gl.uniform3f(p.u.uKey, rgb[0], rgb[1], rgb[2]);
+    // slider 0..100 → chroma-distance units (cbcr space ~0..1.4). Defaults match main.jsx.
+    gl.uniform1f(p.u.uThresh, Math.max(0, (ck.threshold != null ? ck.threshold : 45) / 100 * 0.8));
+    gl.uniform1f(p.u.uSmooth, Math.max(0, (ck.smoothness != null ? ck.smoothness : 30) / 100 * 0.5));
+    gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
+    gl.uniform1i(p.u.uFlip, 1);
+    gl.uniform1f(p.u.uRot, rot || 0);
+    gl.uniform1f(p.u.uAspect, aspect || 1);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -353,14 +566,14 @@ export class Compositor {
   // (white-on-transparent; d.source from rasterizeWord(...,alphaOnly=true)) at `rect`, ADDITIVELY
   // over the scene, recolouring/glowing per d.style/base/acc/intensity/anim. Used for the 9 pack
   // styles (neon/fire/chrome/…); plain text keeps the opaque _drawLayer path.
-  _drawTextStyled(tex, d, rect, texW, texH, time) {
+  _drawTextStyled(tex, d, rect, texW, texH, time, rot, aspect) {
     const gl = this.gl, p = this.progText;
     gl.useProgram(p); gl.bindVertexArray(this.quad);
     gl.enable(gl.BLEND);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE);   // additive emissive over video
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.uniform1i(p.u.u_text, 0);
-    gl.uniform1f(p.u.u_time, time || 0);
+    gl.uniform1f(p.u.u_time, (d.animTime != null ? d.animTime : time) || 0);
     gl.uniform1f(p.u.u_intensity, d.intensity != null ? d.intensity : 1);
     gl.uniform1i(p.u.u_style, d.style | 0);
     gl.uniform1i(p.u.u_anim, d.anim | 0);
@@ -370,6 +583,8 @@ export class Compositor {
     gl.uniform2f(p.u.u_texel, 1 / Math.max(1, texW), 1 / Math.max(1, texH));
     gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
     gl.uniform1i(p.u.uFlip, 1);
+    gl.uniform1f(p.u.uRot, rot || 0);
+    gl.uniform1f(p.u.uAspect, aspect || 1);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -443,9 +658,9 @@ export class Compositor {
     const mv = frame.layers.find(l => l.type === 'mainVideo');
     if (mv && !mv.hidden && frame.time >= frame.videoStart && frame.time <= frame.videoEnd) {
       const src = frame.getSource(mv);
-      if (srcReady(src)) {
-        const rec = this._texFor(mv.id);
-        uploadElement(gl, rec.tex, src);
+      const rec = this._texFor(mv.id);
+      if (srcReady(src)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; }   // else keep last (scrub)
+      if (rec.hasFrame) {
         const b = frame.getPx(mv);
         if (b && b.w > 0 && b.h > 0) this._drawLayer(rec.tex, pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H), 1);
       }
@@ -480,18 +695,25 @@ export class Compositor {
   // maskedVideo ("Вырезка"): stamp THIS layer's own video into its dest rect, clipped to the shape.
   // srcCrop → sub-rect of the source pixels (the slice that was under the mask at Apply time); else
   // cover-fit the whole video into the rect. Mirrors renderFrameRef ≈5115 (clip shape + drawImage).
-  _drawMaskedVideo(frame, layer, bw, bh) {
+  // targetFbo defaults to the scene accumulator; the shadow pass passes a scratch FBO to capture the
+  // cut-out SILHOUETTE (its alpha shape) without touching the scene.
+  _drawMaskedVideo(frame, layer, bw, bh, targetFbo) {
     const gl = this.gl;
     const src = frame.getSource(layer);
-    if (!srcReady(src)) return;
     const b = frame.getPx(layer);
     if (!b || b.w <= 0 || b.h <= 0) return;
-    // dims source: DOM video (videoWidth) / image (naturalWidth) / canvas (width) / VideoFrame
-    // (displayWidth|codedWidth — a VideoFrame has NO .videoWidth).
-    const srcW = src.videoWidth || src.naturalWidth || src.displayWidth || src.codedWidth || src.width || 1;
-    const srcH = src.videoHeight || src.naturalHeight || src.displayHeight || src.codedHeight || src.height || 1;
     const rec = this._texFor(layer.id);
-    uploadElement(gl, rec.tex, src);
+    // Keep the last frame during scrubbing/seeks (see renderFrame note) instead of vanishing.
+    // dims source: DOM video (videoWidth) / image (naturalWidth) / canvas (width) / VideoFrame
+    // (displayWidth|codedWidth — a VideoFrame has NO .videoWidth). Cached on the record so a
+    // not-ready frame can still map its UVs from the last known size.
+    if (srcReady(src)) {
+      rec.srcW = src.videoWidth || src.naturalWidth || src.displayWidth || src.codedWidth || src.width || 1;
+      rec.srcH = src.videoHeight || src.naturalHeight || src.displayHeight || src.codedHeight || src.height || 1;
+      uploadElement(gl, rec.tex, src);
+      rec.hasFrame = true;
+    } else if (!rec.hasFrame) return;
+    const srcW = rec.srcW || 1, srcH = rec.srcH || 1;
     // UV sub-rect: srcCrop (clamped exactly like canvas2d) or cover-fit centred.
     let u0, v0, uSize, vSize;
     if (layer.srcCrop) {
@@ -514,7 +736,7 @@ export class Compositor {
     const rect = pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H);
     const cc = frame.getCC ? frame.getCC(layer) : null;
     const p = this.progMaskedVideo;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targetFbo || this.scene.fbo);
     gl.viewport(0, 0, bw, bh);
     gl.enable(gl.BLEND);
     gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -531,7 +753,99 @@ export class Compositor {
     gl.uniform1f(p.u.uH, cc ? cc.h : 0);
     gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
     gl.uniform1i(p.u.uFlip, 1);
+    gl.uniform1f(p.u.uRot, -(layer.angle || 0) * Math.PI / 180);
+    gl.uniform1f(p.u.uAspect, frame.W / frame.H);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // Normalize a layer's shadow/glow descriptor → {color, blur, dx, dy, opacity} or null if it would
+  // be invisible (no spec, or blur<=0 AND dx==0 AND dy==0 AND opacity<=0 → nothing to draw). Shared
+  // by drop shadow (layer.shadow) and outer glow (layer.glow). Returns null = zero overhead, the
+  // caller skips the whole shadow pass.
+  _shadowParams(fx) {
+    if (!fx) return null;
+    const blur = +fx.blur || 0;
+    const dx = +fx.dx || 0, dy = +fx.dy || 0;
+    const opacity = fx.opacity != null ? +fx.opacity : 1;
+    if (opacity <= 0) return null;
+    if (blur <= 0 && dx === 0 && dy === 0) return null;   // invisible: no spread, no offset
+    return { color: fx.color || '#000000', blur, dx, dy, opacity };
+  }
+
+  // Drop shadow / outer glow for a single layer — runs BEFORE the layer's own draw so the layer sits
+  // ON TOP of its shadow (Photoshop semantics). Parametrized so PHASE 3 (outer glow) reuses it: glow
+  // = same call with dx=dy=0 (centred) + additive=true. Mechanism (reuses the FBO + separable-gauss
+  // infra, scratchB/scratchC are transient so the scene FBO and the mask snapshot in scratchA survive):
+  //   1. SILHOUETTE: drawSilhouette(scratchB.fbo) renders the layer's ALPHA shape (glyphs / rect /
+  //      cut-out) into a transparent scratchB. Its RGB is irrelevant — the tint pass discards it.
+  //   2. BLUR: separable gaussian by `blur` px (scratchB → scratchC → scratchB). Skipped when blur≈0
+  //      (a crisp offset shadow).
+  //   3. TINT + OFFSET + COMPOSITE: progShadow paints the blurred alpha as a solid `color`, shifted by
+  //      (dx,dy) px, alpha = blurredAlpha × opacity, over the scene (src-over for shadow / additive for
+  //      glow). Sampled by screen pos so the offset is exact.
+  // Leaves the scene FBO bound (+ full viewport) so the caller can immediately draw the real layer.
+  _drawLayerShadow(frame, fx, drawSilhouette, bw, bh, additive) {
+    const gl = this.gl;
+    const S = bw / frame.W;
+    this.scratchB.resize(bw, bh);
+    this.scratchC.resize(bw, bh);
+
+    // 1. silhouette → scratchB (cleared transparent first)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchB.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    drawSilhouette(this.scratchB.fbo);   // draws the layer's alpha shape into the bound scratchB
+
+    // 2. separable gaussian over scratchB by `blur` px (skip when negligible → crisp offset shadow)
+    const sigma = Math.max(0.5, (fx.blur || 0) * S);
+    if ((fx.blur || 0) * S > 0.5) {
+      const radius = Math.min(180, Math.ceil(sigma * 3));
+      gl.disable(gl.BLEND);
+      gl.useProgram(this.progGauss); gl.bindVertexArray(this.quad);
+      gl.uniform1f(this.progGauss.u.uSigma, sigma);
+      gl.uniform1i(this.progGauss.u.uRadius, radius);
+      gl.uniform4f(this.progGauss.u.uRect, -1, -1, 1, 1);
+      gl.uniform1i(this.progGauss.u.uFlip, 0);
+      // H: scratchB → scratchC
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchC.fbo); gl.viewport(0, 0, bw, bh);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchB.tex);
+      gl.uniform1i(this.progGauss.u.uTex, 0);
+      gl.uniform2f(this.progGauss.u.uStep, 1 / bw, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      // V: scratchC → scratchB
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchB.fbo);
+      gl.bindTexture(gl.TEXTURE_2D, this.scratchC.tex);
+      gl.uniform2f(this.progGauss.u.uStep, 0, 1 / bh);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // 3. tint + offset + composite scratchB → scene
+    const rgb = hexToRgb(fx.color);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.enable(gl.BLEND);
+    // progShadow outputs STRAIGHT alpha (rgb=uColor, a=coverage×opacity). src-over (shadow) matches
+    // _drawLayer's blend exactly; additive (glow) uses SRC_ALPHA,ONE so light is added in proportion
+    // to coverage (= premultiply-on-blend), like _drawTextStyled's emissive pass — no solid colour wash.
+    if (additive) gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    else gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    const p = this.progShadow;
+    gl.useProgram(p); gl.bindVertexArray(this.quad);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchB.tex);
+    gl.uniform1i(p.u.uTex, 0);
+    gl.uniform2f(p.u.uRes, bw, bh);
+    // full-screen quad (FS_SHADOW samples by gl_FragCoord, so VS_QUAD just needs to cover the frame).
+    gl.uniform4f(p.u.uRect, -1, -1, 1, 1);
+    gl.uniform1i(p.u.uFlip, 0);
+    gl.uniform1f(p.u.uRot, 0);
+    // dy is screen y-down (top-left origin) but the FBO is y-up → flip dy for the screen-pos sampler.
+    gl.uniform2f(p.u.uOffset, (fx.dx || 0) * S, -(fx.dy || 0) * S);
+    gl.uniform3f(p.u.uColor, rgb[0], rgb[1], rgb[2]);
+    gl.uniform1f(p.u.uOpacity, fx.opacity != null ? fx.opacity : 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // scene stays bound (full viewport) so the caller draws the real layer right on top.
   }
 
   // snapshot the scene FBO → scratchA (in FBO orientation, row0 = bottom).
@@ -572,6 +886,7 @@ export class Compositor {
     gl.uniform1f(p.u.uB, 1); gl.uniform1f(p.u.uC, 1); gl.uniform1f(p.u.uS, 1); gl.uniform1f(p.u.uH, 0);
     gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
     gl.uniform1i(p.u.uFlip, 0);
+    gl.uniform1f(p.u.uRot, 0);   // progLayer is shared with _drawLayer (which may have left a rotation set)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -725,6 +1040,34 @@ export class Compositor {
     gl.uniform1i(this.progBlit.u.uFlip, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.activeTexture(gl.TEXTURE0); // restore default active unit
+  }
+
+  // Preview-only: render transition `fxType` between two DISTINCT sources (A→B) straight to the
+  // screen at `progress`. Unlike _transitionGPU (self-effect, one composite), this shows a real
+  // A→B wipe/fade — used by the effect-preview hover card. Caller sets the canvas size first.
+  renderTransitionPreview(fxType, srcA, srcB, progress, strength, time) {
+    const gl = this.gl;
+    const bw = this.canvas.width, bh = this.canvas.height;
+    // FLIP_Y on upload — these source canvases are top-down but the FX program samples in FBO
+    // (bottom-up) orientation; flipping here keeps A/B upright instead of upside-down.
+    const upFlip = (tex, src) => { gl.bindTexture(gl.TEXTURE_2D, tex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); };
+    const recA = this._texFor('__prevA'); upFlip(recA.tex, srcA);
+    const recB = this._texFor('__prevB'); upFlip(recB.tex, srcB);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, bw, bh);
+    gl.disable(gl.BLEND);
+    const p = this.progFX;
+    gl.useProgram(p); gl.bindVertexArray(this.quad);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, recA.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, recB.tex);
+    gl.uniform1i(p.u.u_from, 0);
+    gl.uniform1i(p.u.u_to, 1);
+    gl.uniform1f(p.u.u_progress, progress);
+    gl.uniform1f(p.u.u_strength, strength);
+    gl.uniform1f(p.u.u_time, time);
+    gl.uniform1i(p.u.u_type, fxType);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   // transition layer (time-windowed) — engineMode parity for the 6 NEW transition kinds

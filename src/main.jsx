@@ -8,7 +8,7 @@ import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
-import { TEXT_STYLES, TEXT_STYLE_TYPE, TRANSITIONS, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
+import { TEXT_STYLES, TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
@@ -202,13 +202,161 @@ function hexToRgb01(hex) {
   const n = parseInt(s || 'ffffff', 16);
   return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
 }
+// [r,g,b] 0..255 → "#rrggbb" (chroma-key eyedropper picks a colour off the preview).
+function rgbToHex(r, g, b) {
+  const h = (v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+  return `#${h(r)}${h(g)}${h(b)}`;
+}
+
+// Two distinct frames for the transition hover card so it shows a real A→B (not a self-effect):
+// A = orange, B = violet, each with its letter. Built once, lazily.
+let _effPrevAB = null;
+function effPrevFrame(label, top, bottom) {
+  const cv = document.createElement('canvas'); cv.width = 360; cv.height = 640;
+  const x = cv.getContext('2d');
+  const g = x.createLinearGradient(0, 0, 0, 640);
+  g.addColorStop(0, top); g.addColorStop(1, bottom);
+  x.fillStyle = g; x.fillRect(0, 0, 360, 640);
+  x.fillStyle = 'rgba(255,255,255,.95)'; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.font = 'bold 260px sans-serif'; x.fillText(label, 180, 330);
+  return cv;
+}
+function effPrevAB() {
+  if (_effPrevAB) return _effPrevAB;
+  _effPrevAB = { a: effPrevFrame('A', '#ff9a2e', '#e85d1b'), b: effPrevFrame('B', '#9b5bff', '#6a2bd0') };
+  return _effPrevAB;
+}
 
 // Legacy old→new effect migration REMOVED — the transition/subtitle sets it
 // mapped into were deleted (pivoting to the GPU effects pack). Kept as an identity
 // passthrough so the project-load call sites stay unchanged; old projects still
 // open fine, their removed effects simply no-op until the pack lands.
+// Old projects can carry effect ids that were since removed (the interim transition/sub-anim
+// sets, and the oldest shake/whippan/zoom kinds). Those no longer map to anything → the effect
+// silently does nothing. Remap any UNKNOWN id to the FIRST current effect so the project still
+// shows an effect where one was applied. Valid current ids pass through untouched.
 function migrateLegacyLayers(layers) {
-  return Array.isArray(layers) ? layers : [];
+  if (!Array.isArray(layers)) return [];
+  const FIRST_TRANSITION = (TRANSITIONS[0] && TRANSITIONS[0].id) || 'rgbrush';
+  const firstAnim = TEXT_ANIMS.find(a => a.id !== 'none');
+  const FIRST_ANIM = (firstAnim && firstAnim.id) || 'pop';
+  return layers.map(l => {
+    if (!l || typeof l !== 'object') return l;
+    // Transition layer: unknown/removed kind → first current transition.
+    if (l.type === 'transition' && (!l.kind || TRANSITION_TYPE[l.kind] == null)) {
+      return { ...l, kind: FIRST_TRANSITION };
+    }
+    // Subtitle entrance animation (style.anim): unknown/removed id → first current anim ('none' kept).
+    if (l.type === 'subtitles' && l.style && l.style.anim != null && l.style.anim !== 'none'
+        && TEXT_ANIM_TYPE[l.style.anim] === undefined) {
+      return { ...l, style: { ...l.style, anim: FIRST_ANIM } };
+    }
+    return l;
+  });
+}
+
+// ── Volume automation (keyframe envelope) ────────────────────────────────────
+// A clip's volume over time: layer.volKeys = [{ t, v }] — t = sec from clip start, v = 0..1
+// (1 = the clip's base volume, 0 = silent). Kept sorted by t. Empty = constant (layer.volume).
+// Applied in BOTH preview (per-frame gain) and export (ffmpeg volume expression) → render == preview.
+// (Audio-bearing layer types are checked via the component-scope LAYER_HAS_AUDIO(type) helper.)
+function volKeysOf(layer) { return (layer && Array.isArray(layer.volKeys)) ? layer.volKeys : []; }
+function volFactorAt(keys, tRel) {
+  if (!keys || !keys.length) return 1;
+  const n = keys.length;
+  if (tRel <= keys[0].t) return keys[0].v;
+  if (tRel >= keys[n - 1].t) return keys[n - 1].v;
+  for (let i = 1; i < n; i++) {
+    if (tRel <= keys[i].t) {
+      const a = keys[i - 1], b = keys[i];
+      return a.v + (b.v - a.v) * ((tRel - a.t) / Math.max(1e-4, b.t - a.t));
+    }
+  }
+  return keys[n - 1].v;
+}
+// Perceptual fader taper for the volume envelope: equal vertical movement ≈ equal perceived
+// loudness change, so dragging is GENTLE around unity (fine control) and only reaches the
+// extremes near the very top/bottom. P>1 = gentler near 1.0. p: 0=top(loud)…0.5=middle(1.0)…
+// 1=bottom(silent). gain: 0..vmax (1 = original level). Stored value stays the gain, so the
+// envelope/export consume it unchanged — only the drag↔position mapping is curved.
+const VOL_CURVE_P = 2.5;
+function volPosToGain(p, vmax) {
+  const x = (0.5 - Math.max(0, Math.min(1, p))) * 2;   // +1 top … 0 middle … -1 bottom
+  return x >= 0 ? (1 + Math.pow(x, VOL_CURVE_P) * (vmax - 1)) : (1 - Math.pow(-x, VOL_CURVE_P));
+}
+function volGainToPos(v, vmax) {
+  if (v >= 1) return 0.5 - Math.pow((v - 1) / Math.max(1e-6, vmax - 1), 1 / VOL_CURVE_P) / 2;
+  return 0.5 + Math.pow(Math.max(0, 1 - v), 1 / VOL_CURVE_P) / 2;
+}
+// Waveform fill path in a 0..100 × 0..100 box (centre line = 50), top mirrored to bottom.
+function waveformPath100(peaks) {
+  const n = peaks && peaks.length; if (!n) return '';
+  let up = 'M0 50', dn = '';
+  for (let i = 0; i < n; i++) { const x = ((i / (n - 1)) * 100).toFixed(2), a = Math.min(1, peaks[i]) * 46; up += ` L${x} ${(50 - a).toFixed(2)}`; }
+  for (let i = n - 1; i >= 0; i--) { const x = ((i / (n - 1)) * 100).toFixed(2), a = Math.min(1, peaks[i]) * 46; dn += ` L${x} ${(50 + a).toFixed(2)}`; }
+  return up + dn + 'Z';
+}
+// Per-clip volume editor: a waveform + a draggable keyframe line drawn over the timeline clip.
+// Click empty area → add a point; drag a point (up/down = volume, left/right = time); dbl-click → remove.
+function VolumeEnvelope({ layer, clipDur, peaks, onChange }) {
+  const ref = React.useRef(null);
+  const dragRef = React.useRef(null);
+  const keys = volKeysOf(layer);
+  const cd = Math.max(0.01, clipDur);
+  // `peaks` cover the WHOLE source file, but a trimmed/sped-up clip only plays a
+  // sub-range of it. Slice the wave to exactly what THIS clip plays (srcStart →
+  // srcStart+clipDur*speed) so the peaks line up with what you actually hear at
+  // each point — otherwise a volume point sits where it LOOKS loud but the sound
+  // changes elsewhere. No-op for a full, untrimmed clip.
+  const wavePeaks = React.useMemo(() => {
+    if (!peaks || typeof peaks === 'string' || peaks.length < 2) return peaks;
+    const fileDur = Number(layer.srcDuration) || 0;
+    if (!fileDur) return peaks;
+    const srcStart = Math.max(0, Number(layer.srcStart) || 0);
+    const speed = Math.max(0.1, (layer.speed || 100) / 100);
+    const consumed = cd * speed;                                   // source seconds this clip plays
+    const i0 = Math.max(0, Math.floor((srcStart / fileDur) * peaks.length));
+    const i1 = Math.min(peaks.length, Math.ceil(((srcStart + consumed) / fileDur) * peaks.length));
+    return (i1 - i0 >= 2) ? peaks.slice(i0, i1) : peaks;
+  }, [peaks, layer.srcDuration, layer.srcStart, layer.speed, cd]);
+  const PAD = 7;                                        // % vertical inset (so handle dots aren't clipped at the edges)
+  const VMAX = 2;                                       // range 0..200% → 100% sits in the MIDDLE (drag up = louder, down = quieter)
+  const yPct = (v) => PAD + volGainToPos(v, VMAX) * (100 - 2 * PAD);   // perceptual: v=2→top, v=1→middle, v=0→bottom
+  const sortK = (ks) => ks.slice().sort((a, b) => a.t - b.t);
+  const fromEvent = (e) => {
+    const r = ref.current.getBoundingClientRect();
+    const t = Math.max(0, Math.min(cd, ((e.clientX - r.left) / Math.max(1, r.width)) * cd));
+    const yp = ((e.clientY - r.top) / Math.max(1, r.height)) * 100;
+    const p = Math.max(0, Math.min(1, (yp - PAD) / (100 - 2 * PAD)));
+    const v = Math.max(0, Math.min(VMAX, volPosToGain(p, VMAX)));
+    return { t, v };
+  };
+  const onMove = (e) => { if (dragRef.current == null) return; const { t, v } = fromEvent(e); const ks = keys.slice(); ks[dragRef.current] = { t, v }; onChange(sortK(ks)); };
+  const onUp = (e) => { if (dragRef.current != null) { dragRef.current = null; try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {} } };
+  // The line ALWAYS spans the full clip width: held flat at the first point's value before it, and at
+  // the last point's value after it (matches volFactorAt's clamping). Empty → flat 100% across.
+  const sorted = sortK(keys);
+  const lineKeys = sorted.length
+    ? [{ t: 0, v: sorted[0].v }, ...sorted, { t: cd, v: sorted[sorted.length - 1].v }]
+    : [{ t: 0, v: 1 }, { t: cd, v: 1 }];
+  const poly = lineKeys.map(k => `${((k.t / cd) * 100).toFixed(2)},${yPct(k.v).toFixed(2)}`).join(' ');
+  return (
+    <div ref={ref} className="etl-volenv" onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}
+      onPointerDown={(e) => { if (e.target === ref.current || (e.target.classList && e.target.classList.contains('etl-volenv-svg'))) { e.stopPropagation(); const { t, v } = fromEvent(e); onChange(sortK([...keys, { t, v }])); } }}>
+      <svg className="etl-volenv-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
+        {wavePeaks && typeof wavePeaks !== 'string' && <path className="etl-volenv-wave" d={waveformPath100(wavePeaks)} />}
+        <line className="etl-volenv-mid" x1="0" y1={yPct(1)} x2="100" y2={yPct(1)} vectorEffect="non-scaling-stroke" />
+        <polyline className="etl-volenv-line" points={poly} vectorEffect="non-scaling-stroke" />
+      </svg>
+      {keys.map((k, i) => (
+        <div key={i} className="etl-volenv-pt" style={{ left: `${(k.t / cd) * 100}%`, top: `${yPct(k.v)}%` }}
+          title={`${Math.round(k.v * 100)}%`}
+          onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); dragRef.current = i; try { e.currentTarget.setPointerCapture(e.pointerId); } catch {} }}
+          onPointerMove={onMove} onPointerUp={onUp}
+          onDoubleClick={(e) => { e.stopPropagation(); onChange(keys.filter((_, j) => j !== i)); }} />
+      ))}
+    </div>
+  );
 }
 
 const nav = [
@@ -585,6 +733,32 @@ function playNotifChime() {
       osc.start(now + t); osc.stop(now + t + 0.55);
     });
     setTimeout(() => { try { ctx.close(); } catch {} }, 1400);
+  } catch {}
+}
+// Soft, barely-there variant of the render-done chime — for the "save project?" prompt.
+// Same gentle two-note rise but ~1/3 the volume, a slower attack, and a low-pass for warmth
+// so it reads as a quiet nudge, not an alert.
+function playSoftChime() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 1400; lp.Q.value = 0.5;
+    lp.connect(ctx.destination);
+    [[587.33, 0], [784, 0.12]].forEach(([freq, t]) => {   // D5 → G5, gentle
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + t);
+      gain.gain.exponentialRampToValueAtTime(0.06, now + t + 0.05);    // soft peak, slower attack
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + t + 0.45);
+      osc.connect(gain); gain.connect(lp);
+      osc.start(now + t); osc.stop(now + t + 0.5);
+    });
+    setTimeout(() => { try { ctx.close(); } catch {} }, 1300);
   } catch {}
 }
 
@@ -1130,9 +1304,8 @@ function CompactHeader({ active, files, formatText, totalOutput, settings }) {
     return <div className="compact-header slim editor-header">
       <h1>{titles.editor}</h1>
       <div className="editor-header-actions">
-        <button className="ed-file-btn" onClick={fire('strata:editor-open-project')} title="Открыть проект (Ctrl+O)">Открыть проект</button>
-        <button className="ed-file-btn" onClick={fire('strata:editor-save-project')} title="Сохранить проект (Ctrl+S)">Сохранить проект</button>
-        <button className="btn primary ed-header-save-btn" data-onb="save" onClick={fire('strata:editor-save')} title="Сохранить готовое видео">Сохранить</button>
+        <button className="ed-file-btn ed-save-proj-btn" onClick={fire('strata:editor-save-project')} title="Сохранить как проект (Ctrl+S)">Сохранить как проект</button>
+        <button className="btn primary ed-header-save-btn" data-onb="save" onClick={fire('strata:editor-save')} title="Сохранить готовое видео">Сохранить как видео</button>
       </div>
     </div>;
   }
@@ -1811,6 +1984,70 @@ function Editor({ state, setState }) {
   // Which family owns a given fontFile (for the weight selector).
   const famOfFile = (file) => systemFonts.find(fam => (fam.variants || []).some(v => v.file === file)) || null;
 
+  // «Эффекты слоя» — reusable Photoshop-style drop-shadow + outer-glow block,
+  // shown in the Свойства panel for text / image / videoOverlay / maskedVideo.
+  // The engine reads layer.shadow / layer.glow directly (no plumbing needed).
+  const renderLayerFx = (l) => {
+    if (!l) return null;
+    const sh = l.shadow, gl = l.glow;
+    const shOn = !!sh, glOn = !!gl;
+    return (
+      <div className="ed-prop-block ed-prop-sel">
+        <div className="ed-prop-head">✨ Эффекты слоя</div>
+
+        {/* Тень */}
+        <div className="ed-prop-row">
+          <span className="ed-prop-label">Тень</span>
+          <select className="ed-font-sel" value={shOn ? 'on' : 'off'}
+            onChange={e => toggleLayerFx(l.id, 'shadow', e.target.value === 'on')}>
+            <option value="on">Есть</option>
+            <option value="off">Нет</option>
+          </select>
+        </div>
+        {shOn && (
+          <>
+            <div className="ed-prop-row">
+              <span className="ed-prop-label">Цвет тени</span>
+              <input type="color" className="ed-color-inp" value={sh.color || '#000000'}
+                onChange={e => updLayerFx(l.id, 'shadow', 'color', e.target.value)} />
+            </div>
+            <Slider label="Размытие, px" value={Math.round(+sh.blur || 0)} min="0" max="50"
+              onChange={v => updLayerFx(l.id, 'shadow', 'blur', v)} />
+            <Slider label="Смещение X, px" value={Math.round(+sh.dx || 0)} min="-50" max="50"
+              onChange={v => updLayerFx(l.id, 'shadow', 'dx', v)} />
+            <Slider label="Смещение Y, px" value={Math.round(+sh.dy || 0)} min="-50" max="50"
+              onChange={v => updLayerFx(l.id, 'shadow', 'dy', v)} />
+            <Slider label="Непрозрачность, %" value={Math.round((sh.opacity != null ? +sh.opacity : 0.5) * 100)}
+              min="0" max="100" onChange={v => updLayerFx(l.id, 'shadow', 'opacity', v / 100)} />
+          </>
+        )}
+
+        {/* Внешнее свечение */}
+        <div className="ed-prop-row">
+          <span className="ed-prop-label">Свечение</span>
+          <select className="ed-font-sel" value={glOn ? 'on' : 'off'}
+            onChange={e => toggleLayerFx(l.id, 'glow', e.target.value === 'on')}>
+            <option value="on">Есть</option>
+            <option value="off">Нет</option>
+          </select>
+        </div>
+        {glOn && (
+          <>
+            <div className="ed-prop-row">
+              <span className="ed-prop-label">Цвет свечения</span>
+              <input type="color" className="ed-color-inp" value={gl.color || '#ffffff'}
+                onChange={e => updLayerFx(l.id, 'glow', 'color', e.target.value)} />
+            </div>
+            <Slider label="Размер, px" value={Math.round(+gl.blur || 0)} min="0" max="50"
+              onChange={v => updLayerFx(l.id, 'glow', 'blur', v)} />
+            <Slider label="Непрозрачность, %" value={Math.round((gl.opacity != null ? +gl.opacity : 0.8) * 100)}
+              min="0" max="100" onChange={v => updLayerFx(l.id, 'glow', 'opacity', v / 100)} />
+          </>
+        )}
+      </div>
+    );
+  };
+
   // Load every text layer's font file into the browser under a deterministic
   // family id (fontIdFor). The preview then renders with the exact same physical
   // file FFmpeg uses, so preview and output fonts always match.
@@ -1988,10 +2225,16 @@ function Editor({ state, setState }) {
   // Main process requests it via 'project:save-prompt-request' IPC and waits
   // for the user's choice via the response handler below.
   const [savePromptState, setSavePromptState] = useState(null);
+  // Small loading overlay shown while opening a project / importing files. Set via
+  // showLoading (debounced ~120ms so quick imports don't flash) and cleared by hideLoading.
+  const [loadingMsg, setLoadingMsg] = useState(null);
+  const loadTimerRef = useRef(null);
   useEffect(() => {
     if (!window.strata?.onSavePromptRequest) return;
     return window.strata.onSavePromptRequest((payload) => {
       setSavePromptState(payload || { message: 'Сохранить проект?', detail: '' });
+      // soft audible nudge (respects the notification mute toggle)
+      try { if (localStorage.getItem(NOTIF_MUTE_KEY) !== '1') playSoftChime(); } catch {}
     });
   }, []);
   const answerSavePrompt = (choice) => {
@@ -2076,9 +2319,18 @@ function Editor({ state, setState }) {
     const startX = e.clientX, startY = e.clientY;
     const startPanX = previewPanRef.current.x, startPanY = previewPanRef.current.y;
     let moved = false;
+    const z = previewZoom;
+    const el = canvasRef.current;
+    // Clamp the pan so the (zoomed) canvas can't fly out of the editor now that the
+    // preview wrap no longer clips. At zoom 1 a small slack lets edge handles be nudged
+    // into view; beyond that, pan is bounded by how much the zoomed canvas overflows.
+    const limX = el ? (el.offsetWidth * Math.max(0, z - 1)) / 2 + 40 : 1e5;
+    const limY = el ? (el.offsetHeight * Math.max(0, z - 1)) / 2 + 40 : 1e5;
     const onMove = (ev) => {
       if (Math.abs(ev.clientX - startX) > 3 || Math.abs(ev.clientY - startY) > 3) moved = true;
-      setPreviewPan({ x: startPanX + (ev.clientX - startX), y: startPanY + (ev.clientY - startY) });
+      const nx = Math.max(-limX, Math.min(limX, startPanX + (ev.clientX - startX)));
+      const ny = Math.max(-limY, Math.min(limY, startPanY + (ev.clientY - startY)));
+      setPreviewPan({ x: nx, y: ny });
     };
     const onUp = () => {
       window.removeEventListener('pointermove', onMove);
@@ -2151,6 +2403,16 @@ function Editor({ state, setState }) {
   const compRef = useRef(null);
   const [engineMode, setEngineMode] = useState(false);
   const engineModeRef = useRef(false);
+  const [engineErr, setEngineErr] = useState(null);   // last GL-compositor exception (on-screen diagnostic)
+  // Effect-preview hover card: a tiny live Compositor that loops the hovered effect (transition/style/anim).
+  const [effPreview, setEffPreview] = useState(null);  // { kind:'transition'|'style'|'anim', id, x, y } | null
+  const effPrevCanvasRef = useRef(null);
+  const effPrevCompRef = useRef(null);
+  const animReplayRef = useRef(0);   // wall-clock ms of the last anim change → replay entrance on preview
+  // Volume automation (per-clip keyframe envelope): toggle + waveform-peaks cache (file → Float32Array).
+  const [volEnvMode, setVolEnvMode] = useState(false);
+  const wavePeaksRef = useRef(new Map());
+  const [waveTick, setWaveTick] = useState(0);
   // Phase 2 Tier A (WebCodecs 0-copy): detected tier + one VideoSource per video layer. When the
   // source isn't ready yet, getSource falls back to the DOM <video> so the picture never blanks.
   const engineTierRef = useRef(null);          // 'A' | 'B' (null until probed)
@@ -2183,6 +2445,11 @@ function Editor({ state, setState }) {
   const [proxyDbg, setProxyDbg] = useState('');
   const proxyDbgRef = useRef('');
   const videoOverlayRefs = useRef({});
+  // Chroma-key eyedropper: when set to a layer id, the preview shows a crosshair
+  // catcher and the next click samples that layer's video colour. scratch = 1×1
+  // canvas reused to read the picked pixel back.
+  const [chromaPickId, setChromaPickId] = useState(null);
+  const chromaScratchRef = useRef(null);
   const videoRevRef = useRef(null);
   const audioLayerRefs = useRef({});
   // Parallel <audio> tags that play the audio track from each videoOverlay
@@ -2249,6 +2516,27 @@ function Editor({ state, setState }) {
     el.volume = 1; // native volume must stay at 1 — gain node owns the level
     if (ctx.state === 'suspended') { try { ctx.resume(); } catch {} }
   }
+  // Volume with the keyframe envelope applied at the current playhead. setTargetAtTime eases each
+  // (≈4 Hz) update so ramps sound smooth (no zipper). Empty envelope → plain base volume.
+  const applyClipVolume = (el, layer) => {
+    if (!el) return;
+    const base = layer.volume ?? 100;
+    const keys = volKeysOf(layer);
+    if (!keys.length) { setBoostedVolume(el, base); return; }   // no envelope → plain base (unchanged)
+    // Envelope present: ensure the gain node exists ONCE, then drive ONLY the enveloped gain each tick.
+    // Calling setBoostedVolume every tick would slam the gain back to FULL base before the ramp lands,
+    // so the audio would never actually drop where the line is lowered (the "звук не меняется" bug).
+    let node = gainNodesRef.current.get(el);
+    if (!node) { setBoostedVolume(el, base); node = gainNodesRef.current.get(el); }
+    const clipStart = layer.type === 'mainVideo' ? videoStart : (layer.startTime || 0);
+    // Envelope is the SOLE level when present — it IGNORES the layer's «Громкость %» (base) so the
+    // two don't multiply. The envelope value is the ABSOLUTE gain (1 = original, 2 = +6 dB, 0 = silent).
+    const g = volFactorAt(keys, currentTime - clipStart);
+    const ctx = getAudioCtx();
+    if (node && ctx) { node.gain.gain.setTargetAtTime(g, ctx.currentTime, 0.05); el.volume = 1; }
+    else if (node) { node.gain.gain.value = g; }
+    else { el.volume = Math.max(0, Math.min(1, g)); }
+  };
   const imgCacheRef = useRef(new Map());
   const renderFrameRef = useRef(null);
   const subtitleLayoutsRef = useRef(new Map());
@@ -2584,7 +2872,7 @@ function Editor({ state, setState }) {
     const numStrength = Math.max(0, Math.min(100, Number(strength) || 50));
     const duration = 0.4;
     const params = transitionParams(k, numStrength);
-    const cx = nearestClipBoundary();
+    const cx = Math.max(0, Math.min(dur, currentTime));   // centre the effect on the playhead
     const half = duration / 2;
     const ls = Math.max(0, Math.min(dur - duration, cx - half));
     addLayer({
@@ -2779,7 +3067,7 @@ function Editor({ state, setState }) {
           fontFamily: fontFam,
           fontFile: sysFont?.file || '',
           fontSize: fsDefault,
-          anim: 'none',
+          anim: 'pop',
           color: '#ffffff',
           outlineColor: '#000000',
           highlightColor: '#ff9a1f',
@@ -2867,7 +3155,19 @@ function Editor({ state, setState }) {
   async function addMediaPaths(paths) {
     const list = (paths || []).filter(Boolean);
     if (!list.length) return;
+    // A Strata project (.smproj) chosen via «Импорт» or dropped here → OPEN it as a project
+    // instead of trying to add it as a media clip.
+    const proj = list.find(p => /\.smproj$/i.test(p));
+    if (proj) {
+      if (window.strata?.openProjectPath) {
+        showLoading('Открываю проект…');
+        try { await applyOpenedProject(await window.strata.openProjectPath(proj)); } finally { hideLoading(); }
+      } else alert('Чтобы открывать проект через «Импорт», перезапусти программу (npm run dev).');
+      return;
+    }
 
+    showLoading(list.length > 1 ? `Импортирую файлы (${list.length})…` : 'Импортирую файл…');
+    try {
     // Pre-build skeletons keeping the original index so the user sees the
     // same order they dropped the files in.
     const skeletons = list.map(p => {
@@ -2926,6 +3226,8 @@ function Editor({ state, setState }) {
     // Background: kick off proxy generation for any HEVC/AV1 videos so the
     // preview "just plays" without the user seeing codec errors.
     added.filter(l => l.type === 'videoOverlay').forEach(l => ensureProxy(l.id, l.file));
+    await waitForTimelineMediaReady(added);   // keep the overlay until the new clips decode their first frame
+    } finally { hideLoading(); }
   }
   function onEditorDrop(e) {
     e.preventDefault();
@@ -2968,9 +3270,38 @@ function Editor({ state, setState }) {
     }
   }
 
+  const showLoading = (msg) => { clearTimeout(loadTimerRef.current); loadTimerRef.current = setTimeout(() => setLoadingMsg(msg), 120); };
+  const hideLoading = () => { clearTimeout(loadTimerRef.current); setLoadingMsg(null); };
+  // Resolve once every media layer's element has decoded its first frame (readyState ≥ 2 /
+  // image loaded), or after timeoutMs (safety so a slow / HEVC-proxy file can't hang the
+  // loading overlay forever). Polls because the elements mount a tick after setState.
+  function waitForTimelineMediaReady(layers, timeoutMs = 12000) {
+    return new Promise((resolve) => {
+      const start = performance.now();
+      const ready = (l) => {
+        if (!l || l.hidden || l._missing) return true;
+        if (l.type === 'mainVideo') return (videoRef.current?.readyState ?? 0) >= 2;
+        if (l.type === 'videoOverlay' || l.type === 'maskedVideo') return (videoOverlayRefs.current[l.id]?.readyState ?? 0) >= 2;
+        if (l.type === 'audio') return (audioLayerRefs.current[l.id]?.readyState ?? 0) >= 2;
+        if (l.type === 'image') { const img = imgCacheRef.current.get(l.file); return !!(img && img.complete && img.naturalWidth > 0); }
+        return true;   // text / subtitles / blur / zoom / transition — nothing to decode
+      };
+      const tick = () => {
+        if ((layers || []).every(ready) || (performance.now() - start) > timeoutMs) resolve();
+        else setTimeout(tick, 150);
+      };
+      setTimeout(tick, 80);   // let React mount the freshly-set media elements first
+    });
+  }
   async function openProject() {
     if (!window.strata?.openProject) return;
-    const res = await window.strata.openProject();
+    showLoading('Открываю проект…');
+    try { await applyOpenedProject(await window.strata.openProject()); }
+    finally { hideLoading(); }
+  }
+  // Apply an opened-project result ({ ok, data:{state} }) — shared by the «Открыть» dialog,
+  // the «Импорт» button / drag-drop (when a .smproj is chosen there) and OS double-click.
+  async function applyOpenedProject(res) {
     if (!res) return;
     if (!res.ok) {
       if (!res.canceled) alert('Не удалось открыть проект: ' + (res.error || 'формат не распознан'));
@@ -3018,6 +3349,9 @@ function Editor({ state, setState }) {
         ensureProxy(l.id, l.file);
       }
     });
+    // Hold the loading overlay until the timeline media has actually decoded its first frame
+    // (so clips aren't shown black for a couple seconds right after the project opens).
+    await waitForTimelineMediaReady(restored.layers);
   }
 
   // Save-request bridge: when the main process needs the renderer to save
@@ -3364,7 +3698,7 @@ function Editor({ state, setState }) {
           const aDrift = playing ? 0.35 : 0.12;
           if (Math.abs(aEl.currentTime - t) > aDrift) aEl.currentTime = t;
           try { aEl.playbackRate = spd; } catch {}
-          setBoostedVolume(aEl, l.volume ?? 100);
+          applyClipVolume(aEl, l);
           if (playing && inRange && !l.reversed && !l.muted) {
             if (aEl.paused) aEl.play().catch(() => {});
           } else if (!aEl.paused) aEl.pause();
@@ -3377,12 +3711,16 @@ function Editor({ state, setState }) {
         // Loose during playback (native sync) / tight while scrubbing — avoids
         // reseek stutter when a re-render briefly stalls the RAF loop.
         if (Math.abs(el.currentTime - t) > (playing ? 0.35 : 0.12)) el.currentTime = t;
-        setBoostedVolume(el, l.volume ?? 100);
+        applyClipVolume(el, l);
         // Speaker toggle (muted) silences audio; the eye (hidden) never touches it.
         if (playing && inRange && !l.muted) { if (el.paused) el.play().catch(() => {}); }
         else { if (!el.paused) el.pause(); }
       }
     });
+    // Main video carries its own audio through videoRef — apply its volume envelope too, but ONLY when
+    // it actually has keyframes (so the normal main-video audio path stays untouched otherwise).
+    const mvAudioL = layers.find(l => l.type === 'mainVideo');
+    if (mvAudioL && videoRef.current && !mvAudioL.muted && volKeysOf(mvAudioL).length) applyClipVolume(videoRef.current, mvAudioL);
     // Also depend on layers — when the user trims a clip start, srcStart
     // changes mid-render; without re-running this sync the underlying
     // <video> stays seeked to the old position and preview keeps showing
@@ -3408,15 +3746,126 @@ function Editor({ state, setState }) {
   // With (timeOverride, forExport) it serves an ARBITRARY time t for offscreen EXPORT. forExport ⇒
   // video sources MUST come from the WebCodecs VideoSource at t (no DOM fallback — the DOM <video>
   // isn't seeked to t); also full-res (backingScale 1). Preview calls it with no args (t=currentTime).
+  // ── Effect-preview hover cards ───────────────────────────────────────────
+  // Pin a floating card next to the hovered chip; the rAF effect below loops the REAL effect through a
+  // dedicated mini-Compositor (its own GL context, independent of engineMode → previews always work).
+  const showEffPrev = (kind, id, e, extra) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const cardW = 172, cardH = 285;
+    let x = r.right + 10, y = r.top - 8;
+    if (x + cardW > window.innerWidth - 8) x = r.left - cardW - 10;
+    if (x < 8) x = 8;
+    y = Math.max(8, Math.min(y, window.innerHeight - cardH - 8));
+    setEffPreview({ kind, id, x, y, fcss: (extra && extra.fcss) || null, color: (extra && extra.color) || null, outlineColor: (extra && extra.outlineColor) || null, outline: (extra && extra.outline) });
+  };
+  const hideEffPrev = () => setEffPreview(null);
+  useEffect(() => {
+    if (!effPreview) return;
+    const canvas = effPrevCanvasRef.current; if (!canvas) return;
+    let comp = effPrevCompRef.current;
+    try { if (!comp) { comp = new Compositor(canvas); effPrevCompRef.current = comp; } } catch { return; }
+    const W = canvas.width, H = canvas.height;
+    const spec = effPreview;
+    let raf = 0; const t0 = performance.now();
+    const loop = () => {
+      const t = (performance.now() - t0) / 1000;
+      try {
+        if (spec.kind === 'transition') {
+          // real A→B: frame A (orange) → frame B (violet), progress looping.
+          const fxType = TRANSITION_TYPE[spec.id];
+          if (fxType != null) { const ab = effPrevAB(); comp.renderTransitionPreview(fxType, ab.a, ab.b, (t % 1.8) / 1.8, 1.1, t); }
+        } else if (spec.kind === 'anim') {
+          // Faithful mini-preview: SELECTED font + style, the live preview frame behind, text low on
+          // screen like real subtitles, entrance looping.
+          const animA = TEXT_ANIM_TYPE[spec.id] || 0;
+          const animPixel = animA && isPixelAnim(animA);
+          const loopT = t % 1.7;
+          const tr = (animA && !animPixel) ? animTransform(animA, loopT) : { sx: 1, sy: 1, ox: 0, oy: 0, rot: 0 };
+          const fs = Math.round(W * 0.18), fcss = spec.fcss || 'bold sans-serif';
+          const cx = W / 2, cy = H * 0.80;                       // low on screen, like subtitles
+          const color = spec.color || '#ffffff', outlineColor = spec.outlineColor || '#000000';
+          const outline = spec.outline != null ? spec.outline : Math.max(2, Math.round(fs * 0.08));
+          let d;
+          if (animPixel) {
+            const word = rasterizeWord('Текст', { cx, cy, w: W * 0.92 }, { fontSize: fs }, fcss, true);
+            d = word && { ...word, opacity: 1, scaleX: 1, scaleY: 1, style: 0, base: hexToRgb01(color), acc: hexToRgb01(color), intensity: 1, anim: animA };
+          } else {
+            const word = rasterizeWord('Текст', { cx: cx + tr.ox * fs, cy: cy + tr.oy * fs, w: W * 0.92 }, { fontSize: fs, color, outlineColor, outline }, fcss);
+            d = word && { ...word, opacity: 1, scaleX: tr.sx, scaleY: tr.sy };
+          }
+          // Background = current frame of the bottom-most video layer (its DOM <video> holds the frame
+          // and is reliably sampleable; the GL preview canvas is preserveDrawingBuffer:false → unreadable).
+          let bg = null;
+          for (const l of layers) {
+            if (l.type !== 'videoOverlay' && l.type !== 'maskedVideo' && l.type !== 'mainVideo') continue;
+            const ls = l.startTime || 0, le = l.endTime != null ? l.endTime : dur;
+            const inR = l.type === 'mainVideo' ? true : (currentTimeRef.current >= ls && currentTimeRef.current <= le);
+            const el = (l.type === 'mainVideo') ? videoRef.current : videoOverlayRefs.current[l.id];
+            if (inR && el && el.readyState >= 2 && el.videoWidth) { bg = el; break; }
+          }
+          comp.renderFrame({
+            W, H, bgColor: '#0e0f14',
+            layers: [{ id: 'bg', type: 'mainVideo' }, { id: 'sb', type: 'subtitles', startTime: 0, endTime: 9 }],
+            time: loopT, videoStart: 0, videoEnd: 9, dur: 9,
+            getPx: () => ({ x: 0, y: 0, w: W, h: H }),
+            getSource: (l) => l.type === 'mainVideo' ? bg : null,
+            getTextDraw: (l) => (l.type === 'subtitles' && d) ? [d] : [], getCC: () => null,
+          });
+        }
+      } catch { /* a bad preview frame must never break the editor */ }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [effPreview]);
+  useEffect(() => () => { try { effPrevCompRef.current?.dispose?.(); } catch {} }, []);
+
+  // Lazily decode an audio/video file → downsampled peaks for the timeline waveform. Cached per file.
+  const ensureWave = (file) => {
+    if (!file) return null;
+    const m = wavePeaksRef.current;
+    const cur = m.get(file);
+    if (cur !== undefined) return (cur instanceof Float32Array) ? cur : null;
+    m.set(file, null);   // mark in-flight so we decode once
+    (async () => {
+      try {
+        const ctx = getAudioCtx(); if (!ctx) { m.delete(file); return; }
+        // fetch('file://') is BLOCKED in the renderer → read the bytes over IPC instead.
+        if (!window.strata || !window.strata.readFileBytes) { m.set(file, 'err'); return; }
+        const bytes = await window.strata.readFileBytes(file);
+        if (!bytes || !bytes.byteLength) { m.set(file, 'err'); return; }
+        const ab = bytes.buffer.slice(bytes.byteOffset || 0, (bytes.byteOffset || 0) + bytes.byteLength);
+        const audio = await ctx.decodeAudioData(ab);
+        const ch = audio.getChannelData(0);
+        const N = 220, block = Math.max(1, Math.floor(ch.length / N)), peaks = new Float32Array(N);
+        for (let i = 0; i < N; i++) { let mx = 0; const s = i * block; for (let j = 0; j < block; j += 16) { const a = Math.abs(ch[s + j] || 0); if (a > mx) mx = a; } peaks[i] = mx; }
+        m.set(file, peaks); setWaveTick(x => x + 1);
+      } catch { m.set(file, 'err'); }
+    })();
+    return null;
+  };
+  const updateVolKeys = (id, keys) => set('layers', (ls) => ls.map(l => l.id === id ? { ...l, volKeys: keys } : l));
+
   const buildEngineFrame = (timeOverride, forExport) => {
-    const T = (timeOverride != null) ? timeOverride : currentTime;
+    // Time source: an explicit override (export) wins. During PREVIEW PLAYBACK read the main <video>'s
+    // OWN currentTime — it's precise on every read, whereas the React `currentTime` state only updates
+    // on the browser's ~4 Hz `timeupdate`, which would jerk the GL picture to ~4 fps. Paused/scrub →
+    // currentTimeRef (kept fresh; the render loop's stale closure still sees the live playhead).
+    let T;
+    if (timeOverride != null) T = timeOverride;
+    else if (playingRef.current && videoRef.current && !videoRef.current.paused && videoRef.current.readyState >= 2) T = videoRef.current.currentTime;
+    else T = currentTimeRef.current;
     return {
     W: outWidth, H: outHeight, bgColor, layers,
     time: T, videoStart, videoEnd, dur,
     backingScale: forExport ? 1 : drawScaleRef.current,
     getPx: getLayerPx,
     getSource: (l) => {
-      const wc = engineTierRef.current === 'A' && !l.reversed && (!l.speed || l.speed === 1);
+      // PREVIEW always samples the natively-playing / sync-seeked DOM <video> (reliable, hardware-
+      // decoded, already running for audio/clock). WebCodecs 0-copy (frameAt) is used ONLY for EXPORT,
+      // where no DOM element is seeked to t. This also avoids the intermittent BLACK frames the
+      // WebCodecs decoder can return on scrub/pause (which left the preview black).
+      const wc = forExport && engineTierRef.current === 'A' && !l.reversed && (!l.speed || l.speed === 1);
       if (l.type === 'mainVideo') {
         if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T); if (f) return f; } }
         if (forExport) return null;
@@ -3434,7 +3883,29 @@ function Editor({ state, setState }) {
       return null;
     },
     getTextDraw: (l) => {
-      if (l.type === 'text') { const d = rasterizeText(l, outWidth, outHeight, fontCss(l)); return d ? [d] : []; }
+      if (l.type === 'text') {
+        // Outline («Обводка»): when layer.outlineWidth>0 render through rasterizeWord (the SAME
+        // outline-capable rasterizer the subtitle path uses) so the stroke is pixel-identical to
+        // subtitles and lands in BOTH preview and export (one compositor.renderFrame path). The
+        // default (no outline) keeps rasterizeText — it carries the drop-shadow/align/opacity-bake
+        // look text layers always had, so appearance is unchanged unless an outline is added.
+        const ow = Math.max(0, Number(l.outlineWidth) || 0);
+        if (ow > 0) {
+          const fs = l.size || 48, text = l.text || '';
+          const fcss = fontCss(l);
+          const cxA = (l.x / 100) * outWidth, cyA = (l.y / 100) * outHeight;
+          const tw = measureTextCached(text, fcss, fs);
+          const align = l.align || 'center';
+          // rasterizeWord is centre-anchored at box.cx; offset cx to honour align like rasterizeText
+          // (anchor X = cxA, text sits left/centred/right of it).
+          const cx = align === 'left' ? cxA + tw / 2 : align === 'right' ? cxA - tw / 2 : cxA;
+          const d = rasterizeWord(text, { cx, cy: cyA, w: outWidth }, { fontSize: fs, color: l.color || '#ffffff', outlineColor: l.outlineColor || '#000000', outline: ow }, fcss);
+          // rasterizeWord doesn't bake opacity (rasterizeText did via globalAlpha) → apply per-draw.
+          d.opacity = (l.opacity ?? 100) / 100;
+          return [d];
+        }
+        const d = rasterizeText(l, outWidth, outHeight, fontCss(l)); return d ? [d] : [];
+      }
       if (l.type === 'subtitles') {
         const layout = subtitleLayoutsRef.current && subtitleLayoutsRef.current.get(l.id);
         if (!layout) return [];
@@ -3456,20 +3927,28 @@ function Editor({ state, setState }) {
         const gpuIntensity = st.gpuIntensity != null ? Number(st.gpuIntensity) : 1;
         const animA = TEXT_ANIM_TYPE[st.anim] || 0;
         const animPixel = isPixelAnim(animA);
+        // On an anim change we LOOP the entrance on a WALL CLOCK for a few seconds, so the change is
+        // unmistakably visible even while paused (animReplayRef stamped by updStyle('anim')).
+        const replayMs = animReplayRef.current > 0 ? (nowMs() - animReplayRef.current) : 1e9;
+        const replayActive = replayMs < 3800;
+        const replaySec = (replayMs % 1600) / 1000;   // loop the entrance every 1.6 s
         const draws = [];
         for (const w of segL.words) {
           const isActive = T >= w.start && T <= w.end;
-          const tWord = Math.max(0, T - w.start);   // sec since this word activated (demo timing — tune later)
+          const tWord = replayActive ? replaySec : Math.max(0, T - w.start);   // sec since this word activated
           const tr = (animA && !animPixel) ? animTransform(animA, tWord) : { sx: 1, sy: 1, ox: 0, oy: 0, rot: 0 };
           const dxPx = tr.ox * fs, dyPx = tr.oy * fs;   // clip-space offset → px via font size
           const color = isActive ? highlightColor : baseColor;
           const outline = olMode === 'none' ? 0 : olT;
           let d;
-          if (gpuStyleType > 0) {
-            // GPU style: glyph-ALPHA word; FS_TEXT paints colour/glow (+ pixel anim via u_anim).
+          if (gpuStyleType > 0 || animPixel) {
+            // FS_TEXT pass: GPU style (neon/…) OR a PIXEL anim (fill/wave/type/blur via u_anim) even at
+            // plain style 0. Glyph-ALPHA raster; FS_TEXT recolours/animates it.
             d = rasterizeWord(w.text, { cx: w.cx + dxPx, cy: w.cy + dyPx, w: w.w }, { fontSize: fs }, fcss, true);
             d.style = gpuStyleType; d.base = hexToRgb01(color); d.acc = hexToRgb01(highlightColor);
             d.intensity = gpuIntensity; d.anim = animPixel ? animA : 0;
+            // pixel anims animate off u_time; during the replay feed the wall clock so they move while paused.
+            if (animPixel && replayActive) d.animTime = replaySec;
           } else {
             d = rasterizeWord(w.text, { cx: w.cx + dxPx, cy: w.cy + dyPx, w: w.w }, { fontSize: fs, color, outlineColor, outline }, fcss);
           }
@@ -3504,18 +3983,18 @@ function Editor({ state, setState }) {
       const sp = Math.max(0.1, ((mv && mv.speed) || 100) / 100);
       const clipLen = Math.max(0.01, videoEnd - videoStart);
       const ss = Number((mv && mv.srcStart) || 0);
-      out.push({ file, trimStart: ss, trimEnd: ss + clipLen * sp, delayMs: Math.round(videoStart * 1000), speed: sp, volume: (mv && mv.volume) ?? 100 });
+      out.push({ file, trimStart: ss, trimEnd: ss + clipLen * sp, delayMs: Math.round(videoStart * 1000), speed: sp, volume: (mv && mv.volume) ?? 100, volKeys: (mv && mv.volKeys) || null });
     }
     for (const l of layers) {
       if ((l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file && !l.muted) {
         const sp = Math.max(0.1, (l.speed || 100) / 100);
         const oStart = l.startTime || 0, oEnd = Math.min(l.endTime ?? dur, dur), oLen = Math.max(0.1, oEnd - oStart);
         const ss = Number(l.srcStart || 0);
-        out.push({ file: l.file, trimStart: ss, trimEnd: ss + oLen * sp, delayMs: Math.round(oStart * 1000), speed: sp, volume: l.volume ?? 100 });
+        out.push({ file: l.file, trimStart: ss, trimEnd: ss + oLen * sp, delayMs: Math.round(oStart * 1000), speed: sp, volume: l.volume ?? 100, volKeys: l.volKeys || null });
       } else if (l.type === 'audio' && l.file && !l.muted) {
         const aStart = l.startTime || 0, aEnd = Math.min(l.endTime ?? dur, dur), aLen = Math.max(0.1, aEnd - aStart);
         const ss = Number(l.srcStart || 0);
-        out.push({ file: l.file, trimStart: ss, trimEnd: ss + aLen, delayMs: Math.round(aStart * 1000), speed: 1, volume: l.volume ?? 100 });
+        out.push({ file: l.file, trimStart: ss, trimEnd: ss + aLen, delayMs: Math.round(aStart * 1000), speed: 1, volume: l.volume ?? 100, volKeys: l.volKeys || null });
       }
     }
     return out;
@@ -3532,11 +4011,36 @@ function Editor({ state, setState }) {
     const setPct = (p) => { if (onPct) onPct(p); else { proxyDbgRef.current = 'EXP ' + p + '%'; setProxyDbg('EXP ' + p + '%'); } };
     setPct(0);
     let result = { ok: false, error: 'unknown' };
+    // Export-only WebCodecs sources: created + init'd HERE (not in preview) so the hardware decoders
+    // exist ONLY for the duration of this export, then disposed in finally. They must be ready before
+    // the first frame.getSource(l, true) — getSource only uses a source when `vs.ready` (else falls
+    // back to null for export), so we `await init()` every one up front (no race) and dispose them all
+    // afterwards. Preview never enters this path, so a 12-layer stack no longer spawns 12 decoders.
+    const exportSources = videoSourcesRef.current;
     try {
       const fps = 30;
       const durationSec = Math.max(0.2, (Number(dur) || 0) || (videoEnd - videoStart) || 1);
       const begin = await window.strata.engineExportBegin({ W: outWidth, H: outHeight, fps, outPath, audioSources: buildEngineAudioSources() });
       if (!begin || !begin.ok) { result = { ok: false, error: (begin && begin.error) || 'ffmpeg' }; if (!onPct) alert('Экспорт не запустился: ' + result.error); return result; }
+      // Prepare one VideoSource per (visible) video layer. Bytes come via preload IPC (fetch file://
+      // is blocked). init() does the demux + decoder config; failures are tolerated per-layer (that
+      // layer simply falls back to no source for export, same as before when a source wasn't ready).
+      const wantedSrc = new Map();
+      for (const l of layers) {
+        if (l.hidden) continue;
+        if ((l.type === 'mainVideo' || l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file) wantedSrc.set(l.id, l.file);
+      }
+      await Promise.all([...wantedSrc].map(async ([id, file]) => {
+        try {
+          if (!window.strata || !window.strata.readFileBytes) return;
+          const bytes = await window.strata.readFileBytes(file);
+          if (!bytes) return;
+          const vs = new VideoSource(new Blob([bytes]), { label: id });
+          vs._file = file;
+          await vs.init();
+          exportSources.set(id, vs);
+        } catch (e) { console.error('[engine-export] VideoSource init failed for', id, e); }
+      }));
       const spec = {
         W: outWidth, H: outHeight, fps, durationSec, bgColor, videoStart, videoEnd, layers,
         getPx: getLayerPx,
@@ -3550,9 +4054,15 @@ function Editor({ state, setState }) {
       result = (fin && fin.ok) ? { ok: true } : { ok: false, error: (fin && fin.error) || 'ошибка ffmpeg' };
       if (!onPct) { if (result.ok) alert('Готово (движок):\n' + outPath); else alert('Экспорт: ' + result.error); }
     } catch (e) { console.error('[engine-export]', e); try { await window.strata.engineExportFinish(); } catch {} result = { ok: false, error: e.message }; if (!onPct) alert('Экспорт через движок: ' + e.message); }
-    finally { engineExportingRef.current = false; proxyDbgRef.current = 'HD'; setProxyDbg('HD'); }
+    finally {
+      // Tear down the export-only WebCodecs decoders so they don't keep VRAM/decoders alive afterwards.
+      for (const vs of exportSources.values()) { try { vs.dispose && vs.dispose(); } catch {} }
+      exportSources.clear();
+      engineExportingRef.current = false; proxyDbgRef.current = 'HD'; setProxyDbg('HD');
+    }
     return result;
   }
+  const paintOnceRef = useRef(null);
   const paintOnce = () => {
     const draw = renderFrameRef.current;
     if (!draw) return;
@@ -3568,7 +4078,7 @@ function Editor({ state, setState }) {
           if (!compRef.current) compRef.current = new Compositor(gl);
           compRef.current.renderFrame(buildEngineFrame());
           return;
-        } catch (e) { engineModeRef.current = false; setEngineMode(false); console.error('[engine] disabled:', e); }
+        } catch (e) { engineModeRef.current = false; setEngineMode(false); setEngineErr(String((e && e.message) || e)); console.error('[engine] disabled:', e); }
       }
     }
     const canvas = previewCanvasRef.current;
@@ -3576,6 +4086,11 @@ function Editor({ state, setState }) {
     const fs = fsCanvasRef.current;   // fullscreen mirror, when open
     if (fs) draw(fs.getContext('2d'));
   };
+  // tick() below runs for the whole burst/playback and is created ONCE per loop start,
+  // so it would capture a STALE paintOnce (and thus stale layers/geometry). Point it at
+  // a ref that's refreshed every render → a continuous drag (loop never restarts) paints
+  // the LATEST mask/video position instead of needing an extra "poke" to refresh.
+  paintOnceRef.current = paintOnce;
   const ensureRenderLoop = () => {
     if (loopRunningRef.current) return;
     loopRunningRef.current = true;
@@ -3592,7 +4107,7 @@ function Editor({ state, setState }) {
       if (proxyDbgRef.current !== q) { proxyDbgRef.current = q; setProxyDbg(q); }
       // Keep going while playing OR within the post-change burst window.
       if (!playingRef.current && nowMs() > renderUntilRef.current) {
-        paintOnce();                  // one last settle paint (full res), then stop
+        paintOnceRef.current && paintOnceRef.current();   // one last settle paint (fresh), then stop
         loopRunningRef.current = false;
         return;
       }
@@ -3601,7 +4116,7 @@ function Editor({ state, setState }) {
       last = ts;
       const fullRes = drawScaleRef.current === 1;
       const t0 = nowMs();
-      paintOnce();
+      paintOnceRef.current && paintOnceRef.current();
       // Measure real full-res canvas paints during playback only (skip proxy /
       // idle / already-low frames). If a full frame is too slow to hold ~30fps
       // with audio headroom, drop to low for the rest of this play; the proxy
@@ -3641,6 +4156,27 @@ function Editor({ state, setState }) {
     kickRender();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineMode]);
+  // Safety net: a LOST WebGL2 context (GPU driver reset, memory pressure, too many
+  // GL contexts across a long dev session) makes the compositor silently paint BLACK
+  // without throwing — so paintOnce's try/catch can't catch it (the badge still says
+  // the engine is on while the user stares at black). Listen on the canvas and drop to
+  // the canvas2d path so a picture always comes back.
+  useEffect(() => {
+    const cv = glCanvasRef.current;
+    if (!cv) return;
+    const onLost = (ev) => {
+      try { ev.preventDefault(); } catch {}
+      compRef.current = null;
+      engineModeRef.current = false;
+      setEngineMode(false);
+      setEngineErr('GPU‑контекст потерян — включён безопасный режим (canvas2d)');
+      console.warn('[engine] WebGL context lost → canvas2d fallback');
+      kickRender();
+    };
+    cv.addEventListener('webglcontextlost', onLost);
+    return () => cv.removeEventListener('webglcontextlost', onLost);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Phase 2 Tier A: probe the tier once (async — WebCodecs hw check).
   useEffect(() => {
     let alive = true;
@@ -3654,40 +4190,19 @@ function Editor({ state, setState }) {
     }).catch(() => { if (alive) engineTierRef.current = 'B'; });
     return () => { alive = false; };
   }, []);
-  // Phase 2 Tier A: keep one VideoSource per video layer alive while engineMode is on — create on
-  // add / file-change, dispose on remove / engine-off. Bytes arrive via the preload IPC (fetch
-  // file:// is blocked). Until a source is ready, getSource uses the DOM <video> (no blank frame).
+  // Phase 2 Tier A: PREVIEW never uses WebCodecs VideoSource — it always samples the DOM <video>
+  // (see getSource: `wc` is false unless forExport). Creating a per-layer VideoSource here (hardware
+  // decoder + full in-RAM demux of every clip) just to keep them "warm" overloaded the GPU on stacks
+  // of ~12 video layers (decoder/VRAM exhaustion → WebGL context loss → black screen). So the engine
+  // sources are now created on demand ONLY for the duration of an export (runEngineExport) and
+  // disposed right after. This effect's sole job is a safety teardown: if any sources are still alive
+  // when the engine turns off or layers change, dispose them so nothing lingers.
   useEffect(() => {
     const map = videoSourcesRef.current;
     const tearDownAll = () => { for (const vs of map.values()) { try { vs.dispose && vs.dispose(); } catch {} } map.clear(); };
-    if (!engineMode) { tearDownAll(); return; }
-    const wanted = new Map();
-    for (const l of layers) {
-      if (l.hidden) continue;
-      if ((l.type === 'mainVideo' || l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file) wanted.set(l.id, l.file);
-    }
-    for (const [id, vs] of [...map]) {
-      if (wanted.get(id) !== (vs && vs._file)) { try { vs.dispose && vs.dispose(); } catch {} map.delete(id); }
-    }
-    if (engineTierRef.current === 'A') {
-      for (const [id, file] of wanted) {
-        if (map.has(id)) continue;
-        const placeholder = { ready: false, _file: file, frameAt: () => null, dispose: () => {} };
-        map.set(id, placeholder);
-        (async () => {
-          try {
-            if (!window.strata || !window.strata.readFileBytes) return;
-            const bytes = await window.strata.readFileBytes(file);
-            if (!bytes || map.get(id) !== placeholder) return;
-            const vs = new VideoSource(new Blob([bytes]), { label: id });
-            vs._file = file;
-            await vs.init();
-            if (map.get(id) === placeholder) { map.set(id, vs); kickRender(); }
-            else { try { vs.dispose(); } catch {} }
-          } catch (e) { console.error('[engine] VideoSource init failed for', id, e); if (map.get(id) === placeholder) map.delete(id); }
-        })();
-      }
-    }
+    // Don't yank sources out from under an in-flight export (runEngineExport owns their lifetime then).
+    if (engineExportingRef.current) return;
+    if (map.size) tearDownAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineMode, layers]);
   // Stop the loop on unmount.
@@ -3705,10 +4220,14 @@ function Editor({ state, setState }) {
     proxyDoneTokenRef.current = -1;
     proxyFilesRef.current = [];        // rendered proxies are now stale
     deactivateProxy();                 // drop back to the live canvas at once
-    setBuffered([]);
-    setBufferedHd([]);
-    setBufferedHdLive(null);
-    window.strata?.cancelPreview?.();
+    // Functional no-op when already empty → React bails out of the extra render pass.
+    // This effect fires on EVERY drag-move (layers changes); in engine mode the buffers
+    // are always empty, so without this guard each move paid a wasted second render +
+    // an IPC round-trip → visible drag lag.
+    setBuffered(b => (b && b.length ? [] : b));
+    setBufferedHd(b => (b && b.length ? [] : b));
+    setBufferedHdLive(v => (v == null ? v : null));
+    if (!engineModeRef.current) window.strata?.cancelPreview?.();   // no ffmpeg preview render to cancel in engine mode
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layers, totalDuration, outWidth, outHeight, bgColor]);
   // Pressing Play kicks the background buffer render. It runs to completion even
@@ -3795,6 +4314,8 @@ function Editor({ state, setState }) {
   }
   function proxyStep() {
     const pv = activeProxyVideo(); if (!pv) return;
+    if (engineModeRef.current) { if (proxyPlayRef.current) deactivateProxy(); return; }  // engine ON → never overlay the ffmpeg proxy; the compositor paints every frame
+
     const appT = currentTimeRef.current;
     const want = findReadyProxyFile(appT);
     if (!want) { if (proxyPlayRef.current) deactivateProxy(); return; }
@@ -4103,6 +4624,97 @@ function Editor({ state, setState }) {
     window.addEventListener('pointerup', up);
   }
 
+  // ── Chroma key («Удалить фон») ──────────────────────────────────────
+  // Merge one field into a layer's chromaKey object.
+  const updChroma = (id, key, val) => set('layers', ls => ls.map(x => x.id === id
+    ? { ...x, chromaKey: { ...(x.chromaKey || {}), [key]: val } } : x));
+  // Remove the key entirely (button «Сбросить» / toggle off) + exit pick mode.
+  const clearChroma = (id) => {
+    setChromaPickId(p => (p === id ? null : p));
+    set('layers', ls => ls.map(x => { if (x.id !== id) return x; const { chromaKey, ...rest } = x; return rest; }));
+  };
+  // Layer FX (Photoshop-style drop shadow / outer glow) — the engine reads
+  // layer.shadow = {color, blur, dx, dy, opacity} and layer.glow = {color, blur,
+  // dx:0, dy:0, opacity} as-is (compositor._shadowParams). `kind` = 'shadow' | 'glow'.
+  const LAYER_FX_DEFAULTS = {
+    shadow: { color: '#000000', blur: 8, dx: 4, dy: 4, opacity: 0.5 },
+    glow:   { color: '#ffffff', blur: 14, dx: 0, dy: 0, opacity: 0.8 },
+  };
+  const updLayerFx = (id, kind, key, val) => set('layers', ls => ls.map(x => x.id === id
+    ? { ...x, [kind]: { ...LAYER_FX_DEFAULTS[kind], ...(x[kind] || {}), [key]: val } } : x));
+  // Toggle on → seed sensible defaults; toggle off → drop the field entirely
+  // (engine treats a missing field as "no effect").
+  const toggleLayerFx = (id, kind, on) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    if (on) return { ...x, [kind]: { ...LAYER_FX_DEFAULTS[kind] } };
+    const { [kind]: _drop, ...rest } = x; return rest;
+  }));
+  // Eyedropper: a click on the preview while picking → sample the layer video's
+  // colour at that point and store it as the key. Renderer readback works in dev
+  // (webSecurity:false); a packaged build (webSecurity:true) taints the canvas, so
+  // we fall back to reading the pixel in the main process via ffmpeg.
+  async function sampleChromaAt(e, lid) {
+    const layer = layers.find(l => l.id === lid);
+    const r = canvasRef.current?.getBoundingClientRect();
+    const ov = videoOverlayRefs.current[lid];
+    if (!layer || !r) { setChromaPickId(null); return; }
+    const px = (e.clientX - r.left) / r.width * outWidth;
+    const py = (e.clientY - r.top) / r.height * outHeight;
+    const b = getLayerPx(layer);
+    const vw = (ov && ov.videoWidth) || 0, vh = (ov && ov.videoHeight) || 0;
+    let hex = null;
+    if (ov && vw && vh && ov.readyState >= 2 && b.w > 0 && b.h > 0) {
+      const sx = Math.max(0, Math.min(vw - 1, Math.round((px - b.x) / b.w * vw)));
+      const sy = Math.max(0, Math.min(vh - 1, Math.round((py - b.y) / b.h * vh)));
+      try {
+        const sc = chromaScratchRef.current || (chromaScratchRef.current = document.createElement('canvas'));
+        sc.width = 1; sc.height = 1;
+        const c2 = sc.getContext('2d', { willReadFrequently: true });
+        c2.clearRect(0, 0, 1, 1);
+        c2.drawImage(ov, sx, sy, 1, 1, 0, 0, 1, 1);
+        const d = c2.getImageData(0, 0, 1, 1).data;
+        hex = rgbToHex(d[0], d[1], d[2]);
+      } catch (err) {
+        try {
+          const res = await window.strata?.sampleVideoPixel?.({ file: layer._proxyFile || layer.file, t: ov.currentTime || 0, x: sx, y: sy });
+          if (res && res.ok && res.hex) hex = res.hex;
+        } catch {}
+      }
+    }
+    if (hex) updChroma(lid, 'color', hex);
+    setChromaPickId(null);
+  }
+
+  // Rotate a layer around its centre by dragging the rotate knob. Uses the DELTA of the
+  // pointer's angle around the centre (so the knob's exact offset doesn't matter); Shift
+  // snaps to 15°. rAF-coalesced like the move handler.
+  function makePreviewRotate(id) {
+    return (e) => {
+      e.stopPropagation(); e.preventDefault();
+      pushUndo();
+      setSelectedId(id); setSelectedIds(new Set());
+      const L = layers.find(l => l.id === id); if (!L) return;
+      const r = canvasRef.current?.getBoundingClientRect(); if (!r) return;
+      const b = getLayerPx(L);
+      const cx = r.left + ((b.x + b.w / 2) / outWidth) * r.width;
+      const cy = r.top + ((b.y + b.h / 2) / outHeight) * r.height;
+      const start = L.angle || 0;
+      const a0 = Math.atan2(e.clientY - cy, e.clientX - cx);
+      let pending = null, raf = 0;
+      const apply = () => {
+        raf = 0; const ev = pending; pending = null; if (!ev) return;
+        const a1 = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+        let na = start + (a1 - a0) * 180 / Math.PI;
+        if (ev.shiftKey) na = Math.round(na / 15) * 15;
+        na = ((na % 360) + 360) % 360;
+        set('layers', ls => ls.map(x => x.id === id ? { ...x, angle: Math.round(na * 10) / 10 } : x));
+      };
+      const move = (ev) => { pending = { clientX: ev.clientX, clientY: ev.clientY, shiftKey: ev.shiftKey }; if (!raf) raf = requestAnimationFrame(apply); };
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); if (raf) { cancelAnimationFrame(raf); raf = 0; } if (pending) apply(); };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    };
+  }
+
   function makePreviewDrag(id) {
     return (e) => {
       e.stopPropagation(); e.preventDefault();
@@ -4128,7 +4740,15 @@ function Editor({ state, setState }) {
       const startPos = {};
       layers.forEach(l => { if (groupIds.includes(l.id)) startPos[l.id] = readPos(l); });
       if (!startPos[id]) { const L = layers.find(l => l.id === id); if (L) startPos[id] = readPos(L); }
-      const move = (ev) => {
+      // rAF-coalesce: pointermove fires faster than the display refresh (120Hz+ mice)
+      // and each move does set('layers') → a full re-render of this large component.
+      // Without coalescing the re-renders queue up and the dragged object visibly lags
+      // the cursor. Apply at most ONE update per frame; the final position lands on up.
+      let pendingEv = null, rafId = 0;
+      const applyMove = () => {
+        rafId = 0;
+        const ev = pendingEv; pendingEv = null;
+        if (!ev) return;
         let pdx = ev.clientX - sx, pdy = ev.clientY - sy;
         // Shift constrains movement to a single axis (whichever the cursor has
         // travelled further along) so objects slide perfectly straight.
@@ -4147,7 +4767,15 @@ function Editor({ state, setState }) {
             : { ...x, x: nx, y: ny };
         }));
       };
-      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+      const move = (ev) => {
+        pendingEv = { clientX: ev.clientX, clientY: ev.clientY, shiftKey: ev.shiftKey };
+        if (!rafId) rafId = requestAnimationFrame(applyMove);
+      };
+      const up = () => {
+        window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up);
+        if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+        if (pendingEv) applyMove();   // flush the final cursor position
+      };
       window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
     };
   }
@@ -4183,8 +4811,13 @@ function Editor({ state, setState }) {
       const anchorCx = (nw) => hsign > 0 ? boxL + nw / 2 : hsign < 0 ? boxR - nw / 2 : startCx;
       const anchorCy = (nh) => vsign > 0 ? boxT + nh / 2 : vsign < 0 ? boxB - nh / 2 : startCy;
       const move = (ev) => {
-        const dxPx = ((ev.clientX - sx) / r.width) * W;
-        const dyPx = ((ev.clientY - sy) / r.height) * H;
+        const dxs = ((ev.clientX - sx) / r.width) * W;
+        const dys = ((ev.clientY - sy) / r.height) * H;
+        // Un-rotate the screen delta into the layer's local frame so a handle on a
+        // rotated object resizes along ITS axes (identity when angle = 0).
+        const ang = (L.angle || 0) * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
+        const dxPx = dxs * ca + dys * sa;
+        const dyPx = -dxs * sa + dys * ca;
         const keepAspect = ev.shiftKey;
         if (L.type === 'blur' || L.type === 'mask' || L.type === 'maskedVideo') {
           let nw = startW, nh = startH;
@@ -4721,6 +5354,7 @@ function Editor({ state, setState }) {
   // ahead while paused (YouTube-style). Invalidated (token bump) on any edit.
   async function buildPreviewProxy() {
     if (proxyRunningRef.current || exportingRef.current) return;
+    if (engineModeRef.current) return;   // engine ON → the GL compositor IS the live preview; no ffmpeg proxy (it has no GPU effects + its background render is the lag)
     const token = proxyTokenRef.current;
     if (proxyDoneTokenRef.current === token) return;   // both passes already done
     const { baseFile } = computeExportBase();
@@ -5051,7 +5685,10 @@ function Editor({ state, setState }) {
           const vid = layer.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current;
           if (vid && vid.readyState >= 2) {
             const b = getLayerPx(layer);
+            const a = layer.angle || 0; let rr = false;
+            if (a) { ctx.save(); const cx = b.x + b.w / 2, cy = b.y + b.h / 2; ctx.translate(cx, cy); ctx.rotate(a * Math.PI / 180); ctx.translate(-cx, -cy); rr = true; }
             try { ctx.drawImage(vid, b.x, b.y, b.w, b.h); } catch(e) {}
+            if (rr) ctx.restore();
           }
         }
         continue;
@@ -5063,7 +5700,10 @@ function Editor({ state, setState }) {
         if (img?.complete && img.naturalWidth > 0) {
           const b = getLayerPx(layer);
           ctx.globalAlpha = (layer.opacity || 100) / 100;
+          const a = layer.angle || 0; let rr = false;
+          if (a) { ctx.save(); const cx = b.x + b.w / 2, cy = b.y + b.h / 2; ctx.translate(cx, cy); ctx.rotate(a * Math.PI / 180); ctx.translate(-cx, -cy); rr = true; }
           try { ctx.drawImage(img, b.x, b.y, b.w, b.h); } catch(e) {}
+          if (rr) ctx.restore();
           ctx.globalAlpha = 1;
         }
       } else if (layer.type === 'blur') {
@@ -5310,6 +5950,8 @@ function Editor({ state, setState }) {
         const ov = videoOverlayRefs.current[layer.id];
         const b = getLayerPx(layer);
         let cache = videoFrameCacheRef.current.get(layer.id);
+        const a = layer.angle || 0; let rr = false;
+        if (a) { ctx.save(); const cx = b.x + b.w / 2, cy = b.y + b.h / 2; ctx.translate(cx, cy); ctx.rotate(a * Math.PI / 180); ctx.translate(-cx, -cy); rr = true; }
         // Per-video colour correction — applied to the whole video layer.
         const ccf = `brightness(${100 + (layer.ccB || 0)}%) contrast(${layer.ccC ?? 100}%) saturate(${layer.ccS ?? 100}%) hue-rotate(${layer.ccH ?? 0}deg)`;
         const hasCC = ccf !== 'brightness(100%) contrast(100%) saturate(100%) hue-rotate(0deg)';
@@ -5325,6 +5967,7 @@ function Editor({ state, setState }) {
           try { ctx.drawImage(cache, b.x, b.y, b.w, b.h); } catch(e) {}
         }
         if (hasCC) ctx.restore();
+        if (rr) ctx.restore();
       } else if (layer.type === 'maskedVideo') {
         const ov = videoOverlayRefs.current[layer.id];
         const b = getLayerPx(layer);
@@ -5530,6 +6173,14 @@ function Editor({ state, setState }) {
   };
 
   return <>
+    {loadingMsg && (
+      <div className="sm-loading-back">
+        <div className="sm-loading-box">
+          <span className="sm-loading-spinner" aria-hidden="true" />
+          <span className="sm-loading-text">{loadingMsg}</span>
+        </div>
+      </div>
+    )}
     {savePromptState && (
       <div className="sm-prompt-back" onClick={(e) => { if (e.target === e.currentTarget) answerSavePrompt('cancel'); }}>
         <div className="sm-prompt-modal" role="dialog" aria-modal="true">
@@ -5740,6 +6391,14 @@ function Editor({ state, setState }) {
         </div>
       </div>
     )}
+    {/* Effect-preview hover card — always mounted (canvas/Compositor stay alive across hovers),
+        shown/positioned only while hovering an effect chip. Portal → body so it can't be clipped. */}
+    {createPortal(
+      <div className="eff-prev-card" style={{ left: (effPreview ? effPreview.x : -9999), top: (effPreview ? effPreview.y : -9999), display: effPreview ? 'block' : 'none' }}>
+        <canvas ref={effPrevCanvasRef} width={150} height={267} className="eff-prev-canvas" />
+      </div>,
+      document.body
+    )}
     {saveDialogOpen && (
       <div className="editor-save-modal" onClick={e => { if (e.target === e.currentTarget) setSaveDialogOpen(false); }}>
         <div className="editor-save-modal-box save-fmt-dialog">
@@ -5843,6 +6502,13 @@ function Editor({ state, setState }) {
             <video key={`${l.id}-${l._proxyFile ? 'p' : 'o'}`}
               ref={el => { if (el) videoOverlayRefs.current[l.id] = el; else delete videoOverlayRefs.current[l.id]; }}
               src={fileUrl(l._proxyFile || l.file)} muted playsInline preload="auto"
+              // Repaint the moment a frame is actually decoded/seeked. Render-on-demand
+              // stops its burst ~650ms after a change; a video that finishes decoding
+              // AFTER that (e.g. on opening a project whose BASE is a video-overlay, so
+              // there's no mainVideo to drive paints) would otherwise leave the preview
+              // black (only the <audio> mirror is heard) until the user scrubs.
+              onLoadedData={() => kickRender()}
+              onSeeked={() => kickRender()}
               onError={() => {
                 // Silent safety net: if the proactive proxy didn't fire (e.g.
                 // a file that probed as supported but turned out to fail at
@@ -5980,7 +6646,9 @@ function Editor({ state, setState }) {
                   {/* Phase 2: WebGL2 compositor canvas — overlays the 2d one, shown only in engineMode. */}
                   <canvas ref={glCanvasRef}
                     style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', display: engineMode ? 'block' : 'none', pointerEvents:'none', zIndex:1 }} />
-                  {engineMode && <div style={{ position:'absolute', top:6, left:6, zIndex:4, padding:'2px 7px', borderRadius:6, background:'rgba(40,90,200,.85)', color:'#fff', font:'600 11px ui-monospace,monospace', pointerEvents:'none' }}>⚡ GL</div>}
+                  {/* ⚡ GL Tier badge removed — it was a dev/diagnostic indicator. The red
+                      error chip below stays so a real engine fault is still visible. */}
+                  {engineErr && <div style={{ position:'absolute', top:6, left:6, zIndex:5, maxWidth:'92%', padding:'2px 7px', borderRadius:6, background:'rgba(200,40,40,.92)', color:'#fff', font:'600 10px ui-monospace,monospace', pointerEvents:'none' }}>{engineErr}</div>}
                   {/* Phase 2 play-from-proxy: muted picture source that overlays
                       the canvas while a rendered proxy segment covers the playhead
                       (mp4 AR == project AR → objectFit:fill matches the canvas). */}
@@ -5991,6 +6659,14 @@ function Editor({ state, setState }) {
                       hairline on top to make the edge crisp. */}
                   <div aria-hidden="true" style={{ position:'absolute', inset:0, border:'1px solid rgba(255,255,255,.12)', pointerEvents:'none', zIndex:3 }} />
                 </div>
+                {/* Chroma-key eyedropper catcher — covers the project rect while
+                    picking; the next click samples the colour, then exits. */}
+                {chromaPickId != null && layers.some(l => l.id === chromaPickId && !l.hidden) && (
+                  <div className="ed-chroma-catcher"
+                    style={{ position:'absolute', inset:0, zIndex:20, cursor:'crosshair' }}
+                    title="Кликни по цвету фона на превью"
+                    onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); sampleChromaAt(e, chromaPickId); }} />
+                )}
                 {/* Invisible hit-area divs for interaction — sized to the real
                     on-canvas rectangle so the bounding box always wraps the
                     whole element. Corners stretch, edges resize proportionally.
@@ -6019,12 +6695,20 @@ function Editor({ state, setState }) {
                         left:`${b.x/outWidth*100}%`, top:`${b.y/outHeight*100}%`,
                         width:`${b.w/outWidth*100}%`, height:`${b.h/outHeight*100}%`,
                         cursor: isTextEditing ? 'text' : 'move', userSelect:'none', touchAction:'none', background:'transparent',
+                        transform: layer.angle ? `rotate(${layer.angle}deg)` : undefined, transformOrigin:'center center',
                         border: isSel ? '1px dashed rgba(255,255,255,.85)' : undefined,
                         boxShadow: isSel ? '0 0 0 1px rgba(0,0,0,.55)' : undefined }}>
                       {layer.reversed && <span className="ed-reversed-badge">⏪</span>}
                       {!isTextEditing && isSel && ['nw','n','ne','e','se','s','sw','w'].map(h =>
                         <div key={h} className={`preview-rh preview-rh-${h}`}
                           onPointerDown={makePreviewResize(layer.id, h)} />)}
+                      {/* Rotate handle — a stem + knob above the top edge. Drag to spin the
+                          layer around its centre; Shift snaps to 15°. */}
+                      {!isTextEditing && isSel && ['mainVideo','videoOverlay','image','text','maskedVideo'].includes(layer.type) && (
+                        <div className="preview-rotate" title="Вращать (Shift — шаг 15°, двойной клик — сброс)"
+                          onPointerDown={makePreviewRotate(layer.id)}
+                          onDoubleClick={(e)=>{ e.stopPropagation(); pushUndo(); set('layers', ls=>ls.map(x=>x.id===layer.id?{...x,angle:0}:x)); }}><span className="preview-rotate-stem" /></div>
+                      )}
                       {isTextEditing && (
                         <div className="text-inline-edit" contentEditable suppressContentEditableWarning
                           ref={el => {
@@ -6279,6 +6963,7 @@ function Editor({ state, setState }) {
               <Slider label="Прозрачность, %" value={sel.opacity} min="0" max="100" onChange={v=>updLayer(sel.id,'opacity',v)} />
             </div>
           )}
+          {sel?.type === 'image' && renderLayerFx(sel)}
 
           {/* Blur properties — size/position are dragged on the preview; the panel
               keeps only the shape picker + strength (+ corner radius for rounded). */}
@@ -6354,6 +7039,7 @@ function Editor({ state, setState }) {
               </div>
             );
           })()}
+          {sel?.type === 'maskedVideo' && renderLayerFx(sel)}
 
           {sel?.type === 'zoom' && (
             <div className="ed-prop-block ed-prop-sel">
@@ -6412,12 +7098,44 @@ function Editor({ state, setState }) {
               </div>
               <Slider label="Размер" value={sel.size} min="12" max="200" onChange={v=>updLayer(sel.id,'size',v)} />
               <Slider label="Прозрачность, %" value={sel.opacity} min="0" max="100" onChange={v=>updLayer(sel.id,'opacity',v)} />
+              {(() => {
+                const ow = Math.max(0, Number(sel.outlineWidth) || 0);   // 0 = no outline (default)
+                return (
+                  <>
+                    <div className="ed-prop-row">
+                      <span className="ed-prop-label">Обводка</span>
+                      <select className="ed-font-sel" value={ow > 0 ? 'on' : 'off'}
+                        onChange={e => updLayer(sel.id, 'outlineWidth', e.target.value === 'on' ? Math.max(2, Math.round((sel.size ?? 48) * 0.06)) : 0)}>
+                        <option value="on">Есть</option>
+                        <option value="off">Нет</option>
+                      </select>
+                    </div>
+                    {ow > 0 && (
+                      <>
+                        <div className="ed-prop-row">
+                          <span className="ed-prop-label">Цвет обводки</span>
+                          <input type="color" className="ed-color-inp"
+                            value={sel.outlineColor || '#000000'}
+                            onChange={e => updLayer(sel.id, 'outlineColor', e.target.value)} />
+                        </div>
+                        <Slider label="Толщина обводки" value={ow}
+                          min="1" max="40" onChange={v => updLayer(sel.id, 'outlineWidth', v)} />
+                      </>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           )}
+          {sel?.type === 'text' && renderLayerFx(sel)}
 
           {sel?.type === 'subtitles' && (() => {
             const st = sel.style || {};
-            const updStyle = (k, v) => set('layers', (ls) => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), [k]: v } } : l));
+            const updStyle = (k, v) => {
+              // Changing the animation → replay its entrance on the preview at once (even while paused).
+              if (k === 'anim') { animReplayRef.current = nowMs(); kickRender(4000); }
+              set('layers', (ls) => ls.map(l => l.id === sel.id ? { ...l, style: { ...(l.style || {}), [k]: v } } : l));
+            };
             const segs = Array.isArray(sel.segments) ? sel.segments : [];
             // Edit a single segment's text — we also rebuild the per-word array
             // so the karaoke highlight stays in sync. New words inherit the
@@ -6535,20 +7253,17 @@ function Editor({ state, setState }) {
 
                 {/* Оформление — always visible (no longer an accordion). */}
                 <div className="sub-style-head">Оформление</div>
-                    <div className="ed-prop-row">
+                    <div className="ed-sub-pickgroup">
                       <span className="ed-prop-label">Анимация</span>
-                      <select className="ed-font-sel" value={st.anim || 'none'} onChange={e => updStyle('anim', e.target.value)}>
-                        {TEXT_ANIMS.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-                      </select>
+                      <div className="ed-trans-chips ed-trans-chips-grid" onMouseLeave={hideEffPrev}>
+                        {TEXT_ANIMS.map(a => (
+                          <button key={a.id}
+                            className={`ed-trans-chip${(st.anim || 'none') === a.id ? ' active' : ''}`}
+                            onMouseEnter={a.id === 'none' ? hideEffPrev : (e) => showEffPrev('anim', a.id, e, { fcss: fontCss({ fontFamily: st.fontFamily, fontFile: st.fontFile }), color: st.color || '#ffffff', outlineColor: st.outlineColor || '#000000', outline: (st.outlineMode === 'none' || st.outline === false) ? 0 : undefined })}
+                            onClick={() => { updStyle('anim', a.id); hideEffPrev(); }}>{a.name}</button>
+                        ))}
+                      </div>
                     </div>
-                    <div className="ed-prop-row">
-                      <span className="ed-prop-label">Стиль (GPU)</span>
-                      <select className="ed-font-sel" value={st.gpuStyle || 'none'} onChange={e => updStyle('gpuStyle', e.target.value === 'none' ? '' : e.target.value)}>
-                        <option value="none">Нет</option>
-                        {TEXT_STYLES.filter(s => s.id !== 'plain').map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                      </select>
-                    </div>
-                    {st.gpuStyle && <Slider label="Сила стиля, %" value={Math.round((st.gpuIntensity ?? 1) * 100)} min="20" max="300" onChange={v => updStyle('gpuIntensity', v / 100)} />}
                     <Slider label="Межстрочное, %" value={st.lineHeight ?? 125} min="60" max="300" onChange={v => updStyle('lineHeight', v)} />
                     <div className="ed-prop-row">
                       <span className="ed-prop-label">Цвет текста</span>
@@ -6660,6 +7375,7 @@ function Editor({ state, setState }) {
               )}
             </div>
           )}
+          {sel?.type === 'videoOverlay' && renderLayerFx(sel)}
 
           {/* Audio layer properties */}
           {sel?.type === 'audio' && (
@@ -6718,6 +7434,32 @@ function Editor({ state, setState }) {
                           return {...s,layers,totalDuration:Math.max(s.totalDuration,maxEnd)};
                         })} />
                       )}
+                      {/* Green-screen / chroma key — keys a colour out of THIS video
+                          so the layer below shows through (like a mask cut-out). */}
+                      <div className="ed-effects-add">
+                        <button className={`ed-effect-btn ed-effect-btn-d${sel.chromaKey ? ' active' : ''}`}
+                          onClick={() => sel.chromaKey ? clearChroma(sel.id) : updLayer(sel.id, 'chromaKey', { color: '#16c60c', threshold: 45, smoothness: 30 })}>
+                          <span>Удалить фон (хромакей)</span>
+                          <small>убирает цвет фона — под ним видно нижний слой</small>
+                        </button>
+                      </div>
+                      {sel.chromaKey && (
+                        <div className="ed-chroma-panel">
+                          <div className="ed-chroma-row">
+                            <button type="button" className={`ed-chroma-pick${chromaPickId === sel.id ? ' active' : ''}`}
+                              onClick={() => setChromaPickId(p => p === sel.id ? null : sel.id)}
+                              title="Пипетка — кликни по цвету фона прямо на превью">
+                              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.12 2.12 0 0 1 3 3L18 9l-3-3z"/></svg>
+                              <span>{chromaPickId === sel.id ? 'Кликни по фону…' : 'Пипетка'}</span>
+                            </button>
+                            <span className="ed-chroma-swatch" style={{ background: sel.chromaKey.color || '#16c60c' }} title={sel.chromaKey.color} />
+                          </div>
+                          <Slider label="Допуск" value={sel.chromaKey.threshold ?? 45} min="0" max="100" onChange={v => updChroma(sel.id, 'threshold', v)} />
+                          <Slider label="Мягкость краёв" value={sel.chromaKey.smoothness ?? 30} min="0" max="100" onChange={v => updChroma(sel.id, 'smoothness', v)} />
+                          <button className="ed-cc-reset" onClick={() => { setChromaPickId(null); updLayer(sel.id, 'chromaKey', { color: '#16c60c', threshold: 45, smoothness: 30 }); }}>Сбросить настройки</button>
+                          <p className="ed-effects-hint">Нажми «Пипетка» и кликни по фону на превью. «Допуск» — сколько оттенков убрать, «Мягкость» — плавность краёв.</p>
+                        </div>
+                      )}
                     </>
                   );
                 })()}
@@ -6749,14 +7491,15 @@ function Editor({ state, setState }) {
                   <p className="ed-effects-hint ed-effects-hint-section">Используется для склейки двух разных видео, добавляется новым слоем.</p>
                   {/* GPU transitions (ported pack, curated 12). Adds a transition layer with the pack
                       kind → compositor _transitionGPU. Renders in engineMode (Ctrl+Shift+G) for now. */}
-                  <div className="ed-trans-chips ed-trans-chips-grid">
+                  <div className="ed-trans-chips ed-trans-chips-grid" onMouseLeave={hideEffPrev}>
                     {TRANSITIONS.map(t => (
-                      <button key={t.id} className="ed-trans-chip" onClick={() => addTransition(t.id, 50)}>
+                      <button key={t.id} className="ed-trans-chip"
+                        onMouseEnter={(e) => showEffPrev('transition', t.id, e)}
+                        onClick={() => { addTransition(t.id, 75); hideEffPrev(); }}>
                         {t.name}
                       </button>
                     ))}
                   </div>
-                  <p className="ed-effects-hint">Показываются в GPU-режиме (Ctrl+Shift+G), пока движок не выведен в дефолт.</p>
                 </div></div>
               </div>
             </div>
@@ -6769,7 +7512,16 @@ function Editor({ state, setState }) {
 
       {/* ── TIMELINE ── */}
       {(
-        <div className="ed-tl-section" data-onb="timeline">
+        <div className="ed-tl-section" data-onb="timeline"
+          onPointerDownCapture={(e) => {
+            // Clicking the timeline should drop focus off any text field so Spacebar
+            // toggles playback afterwards instead of typing a space into the field
+            // (mirrors the preview). Don't steal focus from a field being clicked INTO.
+            const tgt = e.target;
+            if (tgt && (/^(INPUT|TEXTAREA|SELECT)$/.test(tgt.tagName || '') || tgt.isContentEditable)) return;
+            const a = document.activeElement;
+            if (a && a !== document.body && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || '') || a.isContentEditable)) { try { a.blur(); } catch {} }
+          }}>
           {/* Timeline toolbar */}
           <div className="ed-tl-bar">
             <button
@@ -6777,10 +7529,11 @@ function Editor({ state, setState }) {
               onClick={generateSubtitlesLayer}
               disabled={!!subProgress || !hasAudioSrc}
               title={!hasAudioSrc ? 'Сначала добавь видео или аудио' : 'Автоматически распознать речь и добавить субтитры'}>
-              <span aria-hidden="true" style={{marginRight:6}}>✦</span>Субтитры
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><text x="11.5" y="13.5" textAnchor="middle" fontFamily="Arial, Helvetica, sans-serif" fontWeight="900" fontSize="15">Aa</text><rect x="2" y="17.4" width="20" height="2.7" rx="1.35"/><rect x="2" y="21.4" width="13.5" height="2.7" rx="1.35"/></svg>Субтитры
             </button>
             <button className="etl-add-btn" onClick={splitAtPlayhead} title="Разрезать клип под курсором по позиции воспроизведения (Ctrl+Shift+D)">✂ Разрезать</button>
             <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+клик по клипам на таймлайне для мультивыбора)">⛓ Объединить</button>
+            <button className={`etl-add-btn${volEnvMode ? ' etl-add-btn-on' : ''}`} onClick={() => setVolEnvMode(v => !v)} title="Уровень звука по секундам: на видео/аудио-клипах появится дорожка звука с линией — кликни чтобы поставить точку, тяни вниз чтобы тише. Применяется и в превью, и в рендере."><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><path fill="currentColor" d="M11 5 6 9H3v6h3l5 4V5z"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M15.5 8.5a5 5 0 0 1 0 7"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M18.5 6a8 8 0 0 1 0 12"/></svg>Уровень звука</button>
             <div style={{flex:1}} />
             <div className="ed-zoom">
               <span className="ed-zoom-lbl">Масштаб</span>
@@ -6868,10 +7621,11 @@ function Editor({ state, setState }) {
                 // Subtitle track expands when selected so each phrase can be
                 // dragged to fix its timing.
                 const isSubExpanded = layer.type === 'subtitles' && selectedId === layer.id;
+                const isVolExpanded = volEnvMode && LAYER_HAS_AUDIO(layer.type);   // taller row while editing volume
                 return (
                   <div key={layer.id}
                     data-layer-id={layer.id}
-                    className={`etl-track-row${(selectedId===layer.id||selectedIds.has(layer.id))?' etl-selected':''}${layer.hidden?' etl-hidden':''}${isSubExpanded?' etl-row-subs-expanded':''}`}
+                    className={`etl-track-row${(selectedId===layer.id||selectedIds.has(layer.id))?' etl-selected':''}${layer.hidden?' etl-hidden':''}${isSubExpanded?' etl-row-subs-expanded':''}${isVolExpanded?' etl-row-vol-expanded':''}`}
                     onClick={e=>{
                       // Ignore the synthetic click that immediately follows a drag
                       // (otherwise moving a group would clear the multi-selection).
@@ -6955,10 +7709,14 @@ function Editor({ state, setState }) {
                             ? <img src={LAYER_ICONS[layer.type]} alt="" />
                             : <span>{layer.type==='audio'?'♪':layer.type==='text'?'T':layer.type==='subtitles'?'✦':'▦'}</span>}
                         </span>
-                        {layer.type==='audio' && (
+                        {layer.type==='audio' && !volEnvMode && (
                           <div className="etl-waveform" aria-hidden="true">
                             {Array.from({length:36},(_,i)=><div key={i} className="etl-waveform-bar" style={{height:`${22+Math.sin(i*.9+1.2)*28+Math.cos(i*1.7)*18}%`}} />)}
                           </div>
+                        )}
+                        {volEnvMode && LAYER_HAS_AUDIO(layer.type) && (
+                          <VolumeEnvelope layer={layer} clipDur={(clEnd||0)-(clStart||0)}
+                            peaks={ensureWave(layer.type === 'mainVideo' ? file : layer.file)} onChange={(keys)=>updateVolKeys(layer.id, keys)} />
                         )}
                         {layer.type==='image' && layer.file && (
                           <img className="etl-clip-thumb" src={fileUrl(layer.file)} alt="" aria-hidden="true" />
@@ -7019,15 +7777,15 @@ function Editor({ state, setState }) {
                             })}
                           </div>;
                         })()}
-                        <div className="etl-clip-handle etl-clip-s"
+                        {layer.type !== 'transition' && <div className="etl-clip-handle etl-clip-s"
                           data-onb={(selectedId === layer.id && layer.type === 'videoOverlay') ? 'clipstart' : undefined}
-                          onPointerDown={makeClipHandleDrag(layer.id,true)} />
+                          onPointerDown={makeClipHandleDrag(layer.id,true)} />}
                         <span className="etl-clip-inner-label">{lName(layer)}</span>
                         {layer._missing && <span className="etl-clip-missing" title="Исходный файл не найден на диске — переместился или удалён">⚠ нет файла</span>}
                         {layer.type==='videoOverlay' && (layer.reversed || (layer.speed!=null&&layer.speed!==100) || (layer.ccB||0)!==0 || (layer.ccC!=null&&layer.ccC!==100) || (layer.ccS!=null&&layer.ccS!==100) || (layer.ccH||0)!==0) && (
                           <span className="etl-clip-fx" title="Применены эффекты">fx</span>
                         )}
-                        <div className="etl-clip-handle etl-clip-e" onPointerDown={makeClipHandleDrag(layer.id,false)} />
+                        {layer.type !== 'transition' && <div className="etl-clip-handle etl-clip-e" onPointerDown={makeClipHandleDrag(layer.id,false)} />}
                       </div>
                       )}
                     </div>

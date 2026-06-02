@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('strata', {
     return () => ipcRenderer.removeListener('project:save-progress', handler);
   },
   openProject: () => ipcRenderer.invoke('project:open'),
+  // Open a project from a known path (a .smproj chosen via «Импорт» / dropped in).
+  openProjectPath: (path) => ipcRenderer.invoke('project:open-path', path),
   onProjectOpen: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on('project:open-from-file', handler);
@@ -48,6 +50,9 @@ contextBridge.exposeInMainWorld('strata', {
   // Phase 2 Tier A: read raw bytes of a media file for the renderer's WebCodecs decoder
   // (mediabunny demuxes a Blob; fetch('file://') is blocked in the renderer).
   readFileBytes: (path) => ipcRenderer.invoke('file:readBytes', path),
+  // Chroma-key eyedropper fallback (packaged builds, where the renderer canvas is
+  // tainted): read one source pixel's colour via ffmpeg → { ok, hex }.
+  sampleVideoPixel: (payload) => ipcRenderer.invoke('chroma:sample-pixel', payload),
   // Phase 2 engineExport — stream compositor-rendered RGBA frames to ffmpeg (rawvideo → H.264).
   engineExportBegin: (meta) => ipcRenderer.invoke('engine:export-begin', meta),
   engineExportFrame: (buf) => ipcRenderer.invoke('engine:export-frame', buf),

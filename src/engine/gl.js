@@ -96,14 +96,28 @@ export function uploadElement(gl, tex, el, premultiply) {
 }
 
 // Shared quad vertex shader. uRect = (x0,y0,x1,y1) in NDC; uFlip flips V.
+// uRot (radians) rotates the quad around the rect centre — aspect-corrected via uAspect
+// (= W/H) so a square stays square. uRot defaults to 0 for every program that never sets
+// it (blit/blur/mask/…), so the rotation branch is a no-op there; only the layer draws
+// (which set uRot per call) ever rotate. → zero behaviour change for the existing paths.
 export const VS_QUAD = `#version 300 es
 layout(location=0) in vec2 aPos;
 uniform vec4 uRect;
 uniform int uFlip;
+uniform float uRot;
+uniform float uAspect;
 out vec2 vUv;
 void main(){
   vUv = vec2(aPos.x, uFlip==1 ? 1.0 - aPos.y : aPos.y);
   vec2 ndc = mix(uRect.xy, uRect.zw, aPos);
+  if(uRot != 0.0){
+    vec2 c = (uRect.xy + uRect.zw) * 0.5;
+    vec2 d = ndc - c;
+    vec2 q = vec2(d.x * uAspect, d.y);          // NDC → square (pixel-proportional) space
+    float cs = cos(uRot), sn = sin(uRot);
+    d = vec2((q.x*cs - q.y*sn) / uAspect, q.x*sn + q.y*cs);
+    ndc = c + d;
+  }
   gl_Position = vec4(ndc, 0.0, 1.0);
 }`;
 

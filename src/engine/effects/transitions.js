@@ -202,6 +202,33 @@ void main(){
     float pp=clamp(p+(hash(bi+floor(u_time*3.0))-0.5)*0.6*sin(p*3.14159), 0.0,1.0);
     col=mix(texture(u_from,q), texture(u_to,q), step(0.5,pp));
   }
+  else if(u_type==24){                                              // 24 RGB zoom rush — zoom-blur + chroma WHOOSH + 40° CW spin + swirl/ripple deform
+    vec2 c=uv-0.5;
+    float amp=sin(p*3.14159);                 // peaks hard mid-transition
+    float zf=1.0+p*p*7.0*S;                    // FROM rushes INTO the screen (big explosive zoom)
+    float zt=1.0+(1.0-p)*(1.0-p)*7.0*S;        // TO rushes OUT, resolving sharp
+    float ca=amp*S*0.24;                       // chromatic aberration (R out / B in, radial) — very strong
+    // rotation: 40° CLOCKWISE at the peak (resolves to 0), plus a radial SWIRL that twists the
+    // edges harder than the centre (deformation), and a sine RIPPLE wobble — all follow amp*S.
+    float rad=length(c);
+    float ang=radians(40.0)*amp + rad*0.6*amp*S;
+    float cs=cos(ang), sn=sin(ang);
+    mat2 R=mat2(cs, sn, -sn, cs);              // clockwise spin of the sampling
+    vec2 wave=vec2(sin(uv.y*11.0+u_time*4.0), sin(uv.x*11.0+u_time*4.0))*amp*S*0.015;
+    vec2 cc=R*c + wave;                        // rotated + swirled + rippled sample centre
+    vec2 dir=normalize(cc+vec2(1e-4));
+    vec2 sh=dir*amp*S*0.06;                     // push along the radius
+    vec4 a=vec4(0.0), b=vec4(0.0);
+    for(int i=0;i<18;i++){ float t=float(i)/17.0;
+      vec2 sa=cc/mix(1.0,zf,t)+0.5+sh*t;        // radial zoom-blur accumulation (FROM)
+      vec2 sb=cc/mix(1.0,zt,t)+0.5+sh*t;        // (TO)
+      a.r+=texture(u_from, sa+dir*ca*t).r; a.g+=texture(u_from, sa).g; a.b+=texture(u_from, sa-dir*ca*t).b;
+      b.r+=texture(u_to,   sb+dir*ca*t).r; b.g+=texture(u_to,   sb).g; b.b+=texture(u_to,   sb-dir*ca*t).b;
+    }
+    a/=18.0; b/=18.0; a.a=1.0; b.a=1.0;
+    col=mix(a, b, smoothstep(0.47,0.63,p));     // A-explosion holds through the midpoint, B emerges a touch later
+    col.rgb += amp*amp*0.22*S;                  // bright flash at the peak of the whoosh
+  }
   else { col=fade(uv,p); }
   fragColor=col;
 }`;
@@ -214,17 +241,13 @@ void main(){
 // still carries all 24 branches by u_type; only these ids are exposed/selectable. Types keep their
 // original numbers so the shader branches still match.
 export const TRANSITIONS = [
-  { id: 'flash',        type: 7,  name: 'Flash' },
+  { id: 'rgbrush',      type: 24, name: 'RGB zoom' },
   { id: 'zoomrush',     type: 14, name: 'Zoom rush' },
   { id: 'zoomspin',     type: 13, name: 'Zoom-spin whip' },
-  { id: 'spin360',      type: 15, name: 'Spin 360 blur' },
   { id: 'datamosh',     type: 10, name: 'Glitch' },
   { id: 'pixelate',     type: 5,  name: 'Pixelate' },
   { id: 'fireburn',     type: 9,  name: 'Fire burn' },
-  { id: 'liquidmelt',   type: 8,  name: 'Liquid melt' },
   { id: 'swirl',        type: 6,  name: 'Swirl' },
-  { id: 'kaleidoscope', type: 11, name: 'Kaleidoscope' },
-  { id: 'stretchwhip',  type: 16, name: 'Stretch whip' },
   { id: 'ripple',       type: 4,  name: 'Ripple' },
 ];
 export const TRANSITION_TYPE = Object.fromEntries(TRANSITIONS.map(t => [t.id, t.type]));
