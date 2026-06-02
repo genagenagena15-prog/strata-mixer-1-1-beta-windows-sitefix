@@ -440,7 +440,6 @@ function App() {
   const [active, setActive] = useState('home');
   const [files, setFiles] = useState([]);
   const [outputDir, setOutputDir] = useState('');
-  const [logs, setLogs] = useState([]);
   const [result, setResult] = useState(null);
   const [queueOpen, setQueueOpen] = useState(false);
   const [donateOpen, setDonateOpen] = useState(false);
@@ -495,9 +494,8 @@ function App() {
 
   useEffect(() => {
     const off1 = window.strata?.onProgress?.((d) => setProgress((p) => ({ ...p, ...d })));
-    const off2 = window.strata?.onLog?.((line) => setLogs((l) => [...l.slice(-150), line]));
     const off3 = window.strata?.onDone?.((d) => { setResult(d); if (!d.stopped && settings.sound) playDoneSound(); });
-    return () => { off1?.(); off2?.(); off3?.(); };
+    return () => { off1?.(); off3?.(); };
   }, [settings.sound]);
 
   const totalOutput = useMemo(() => files.length * Math.max(1, settings.copies) * (settings.format === 'facebook' ? 3 : 1), [files.length, settings.copies, settings.format]);
@@ -588,7 +586,7 @@ function App() {
   function clearFiles() { setFiles([]); setResult(null); }
   async function start(test = false) {
     if (!files.length) { setActive('home'); return; }
-    setLogs([]); setResult(null);
+    setResult(null);
     setProgress({ running: true, total: totalOutput, done: 0, percent: 0, currentPercent: 0, currentFile: '', stage: test ? 'Тест 10 секунд' : 'Подготовка файлов', eta: '—', speedText: '—' });
     const payloadSettings = { ...settings, preset: settings.format === 'facebook' ? 'fb' : settings.preset, previewTest: test };
     await window.strata.startProcessing({ files, outputDir, settings: payloadSettings, fileNames });
@@ -631,7 +629,7 @@ function App() {
               {active === 'transcribe' && <TranscribeView />}
               {active === 'format' && (
                 <Format settings={settings} applyFormat={applyFormat} update={update}>
-                  <Settings settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} logs={logs} embedded />
+                  <Settings settings={settings} update={update} outputDir={outputDir} chooseFolder={chooseFolder} embedded />
                 </Format>
               )}
               {active === 'unique' && (
