@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>engine perf + motion check</title></head>
+<body style="margin:0;background:#0c0d12">
+<canvas id="c" width="1080" height="1920" style="width:270px;height:480px"></canvas>
+<script type="module">
+import { Compositor } from '/src/engine/compositor.js';
+import { rasterizeWord } from '/src/engine/textRaster.js';
+import { TEXT_STYLE_TYPE, TRANSITION_TYPE, TEXT_ANIM_TYPE, animTransform, isPixelAnim, TEXT_ANIMS, TEXT_STYLES, TRANSITIONS } from '/src/engine/effects/index.js';
+
+const out = (o) => console.log('@@BENCH@@' + JSON.stringify(o));
+const W = 1080, H = 1920;
+
+// ── synthetic "video" sources (static — so any frame-to-frame change is the ENGINE, not the source)
+function patternCanvas(w, h, hueShift) {
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const x = cv.getContext('2d');
+  const g = x.createLinearGradient(0, 0, w, h);
+  g.addColorStop(0, `hsl(${(200 + hueShift) % 360},70%,45%)`);
+  g.addColorStop(1, `hsl(${(20 + hueShift) % 360},70%,35%)`);
+  x.fillStyle = g; x.fillRect(0, 0, w, h);
+  x.fillStyle = 'rgba(255,255,255,.15)';
+  for (let i = 0; i < 40; i++) x.fillRect((i * 53) % w, (i * 89) % h, 30, 30);
+  return cv;
+}
+const mvSrc = patternCanvas(540, 960, 0);
+const ovSrc = patternCanvas(480, 320, 120);
+
+// ── subtitle words (6, two rows) — rasterized EVERY frame like main.jsx getTextDraw
+const WORDS = ['МОТОР', 'КАМЕРА', 'СВЕТ', 'ДУБЛЬ', 'СНЯТО', 'ГОТОВО'];
+function buildWords() {
+  return WORDS.map((txt, i) => {
+    const row = i < 3 ? 0 : 1, col = i % 3;
+    return { text: txt, cx: 200 + col * 340, cy: 1480 + row * 150, w: 320, start: i * 0.2 };
+  });
+}
+const baseRGB = [1, 1, 1], accRGB = [0.2, 0.9, 1.0];
+
+// anim ids actually present (skip 'none')
+const animList = TEXT_ANIMS.filter(a => a.id !== 'none');
+const styleNeon = TEXT_STYLE_TYPE['neon'] || 1;
+const transKind = (TRANSITIONS[0] && TRANSITIONS[0].id) || Object.keys(TRANSITION_TYPE)[0];
+
+// getTextDraw mirroring main.jsx: alphaOnly raster + style + per-word anim (transform → scaleX/Y; pixel → u_anim)
+function makeGetTextDraw(words, withStyle, animEnabled) {
+  return (l, t) => {
+    if (l.type !== 'subtitles') return [];
+    const T = t;
+    const out = [];
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      const animA = animEnabled ? (TEXT_ANIM_TYPE[animList[i % animList.length].id] || 0) : 0;
+      const pix = animA && isPixelAnim(animA);
+      const tWord = Math.max(0, T - w.start);
+      const tr = (animA && !pix) ? animTransform(animA, tWord) : { sx: 1, sy: 1, ox: 0, oy: 0, rot: 0 };
+      const fs = 64;
+      const dxPx = tr.ox * fs, dyPx = tr.oy * fs;
+      const word = rasterizeWord(w.text, { cx: w.cx + dxPx, cy: w.cy + dyPx, w: w.w }, { fontSize: fs }, 'bold sans-serif', !!withStyle);
+      if (!word) continue;
+      const d = { ...word, opacity: 1, scaleX: tr.sx, scaleY: tr.sy };
+      if (withStyle) { d.style = styleNeon; d.base = baseRGB; d.acc = accRGB; d.intensity = 1.3; d.anim = pix ? animA : 0; }
+      out.push(d);
+    }
+    return out;
+  };
+}
+
+function makeFrame(layers, getTextDraw, time, backingScale) {
+  return {
+    W, H, bgColor: '#101014', layers, time, videoStart: 0, videoEnd: 9, dur: 9, backingScale,
+    getPx: (l) => {
+      if (l.type === 'mainVideo') return { x: 0, y: 0, w: W, h: H };
+      if (l.type === 'videoOverlay') return { x: 100, y: 200, w: 880, h: 600 };
+      return { x: 0, y: 0, w: W, h: H };
+    },
+    getSource: (l) => l.type === 'mainVideo' ? mvSrc : (l.type === 'videoOverlay' ? ovSrc : null),
+    getTextDraw, getCC: () => null,
+  };
+}
+
+// checksum a 24x24 centre patch of the live canvas → detects motion
+function patchSum(gl, cw, ch) {
+  const n = 24, x0 = Math.max(0, (cw >> 1) - 12), y0 = Math.max(0, (ch >> 1) - 12);
+  const buf = new Uint8Array(n * n * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.readPixels(x0, y0, n, n, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+  let s = 0; for (let i = 0; i < buf.length; i++) s = (s + buf[i] * (i % 7 + 1)) >>> 0;
+  return s;
+}
+
+function stats(arr) {
+  const a = arr.slice().sort((x, y) => x - y);
+  const q = (p) => a[Math.min(a.length - 1, Math.floor(p * a.length))];
+  return { median: +q(0.5).toFixed(2), p95: +q(0.95).toFixed(2), max: +a[a.length - 1].toFixed(2) };
+}
+
+async function runConfig(comp, gl, name, layers, getTextDraw, backingScale, frames) {
+  // warmup (compile shaders / warm caches) — not timed
+  for (let i = 0; i < 8; i++) { comp.renderFrame(makeFrame(layers, getTextDraw, i * 0.05, backingScale)); }
+  gl.finish();
+  const ms = [], sums = {};
+  for (let i = 0; i < frames; i++) {
+    const t = i * (5 / frames);              // advance 0..5s
+    const t0 = performance.now();
+    comp.renderFrame(makeFrame(layers, getTextDraw, t, backingScale));
+    gl.finish();                              // force GPU completion → honest total work
+    ms.push(performance.now() - t0);
+    const ti = Math.round(t);
+    if (ti <= 4 && sums['t' + ti] === undefined) sums['t' + ti] = patchSum(gl, comp.canvas.width, comp.canvas.height);
+  }
+  const st = stats(ms);
+  const uniq = new Set(Object.values(sums));
+  return { name, backingScale, ...st, fps: +(1000 / st.median).toFixed(1), framesDiffer: uniq.size > 1, distinctFrames: uniq.size, sampled: Object.keys(sums).length };
+}
+
+try {
+  const comp = new Compositor(document.getElementById('c'));
+  const gl = comp.gl;
+
+  // raster-only cost (the per-frame text expense main.jsx pays every paint)
+  const words = buildWords();
+  { for (let i = 0; i < 12; i++) rasterizeWord('РАЗОГРЕВ', { cx: 200, cy: 1500, w: 320 }, { fontSize: 64 }, 'bold sans-serif', true); }
+  const rN = 240; const r0 = performance.now();
+  for (let i = 0; i < rN; i++) { const w = words[i % words.length]; rasterizeWord(w.text, { cx: w.cx, cy: w.cy, w: w.w }, { fontSize: 64 }, 'bold sans-serif', true); }
+  const rasterMsPerWord = +((performance.now() - r0) / rN).toFixed(3);
+
+  const FRAMES = 90;
+  const results = [];
+
+  // base: video + overlay only
+  results.push(await runConfig(comp, gl, 'base(mv+ov)', [
+    { id: 'mv', type: 'mainVideo' }, { id: 'ov', type: 'videoOverlay', startTime: 0, endTime: 9 },
+  ], () => [], 1, FRAMES));
+
+  // + transition active the whole time (worst-case GPU)
+  results.push(await runConfig(comp, gl, '+transition', [
+    { id: 'mv', type: 'mainVideo' }, { id: 'ov', type: 'videoOverlay', startTime: 0, endTime: 9 },
+    { id: 'tr', type: 'transition', kind: transKind, strength: 60, startTime: 0, endTime: 9 },
+  ], () => [], 1, FRAMES));
+
+  // + 6 subtitle words, GPU neon style + per-word anim, rasterized every frame
+  results.push(await runConfig(comp, gl, '+6subs neon+anim', [
+    { id: 'mv', type: 'mainVideo' }, { id: 'ov', type: 'videoOverlay', startTime: 0, endTime: 9 },
+    { id: 'sb', type: 'subtitles', startTime: 0, endTime: 9 },
+  ], makeGetTextDraw(words, true, true), 1, FRAMES));
+
+  // FULL worst-case: video + overlay + transition + 6 styled animated subs, all at once
+  const fullLayers = [
+    { id: 'mv', type: 'mainVideo' }, { id: 'ov', type: 'videoOverlay', startTime: 0, endTime: 9 },
+    { id: 'sb', type: 'subtitles', startTime: 0, endTime: 9 },
+    { id: 'tr', type: 'transition', kind: transKind, strength: 60, startTime: 0, endTime: 9 },
+  ];
+  results.push(await runConfig(comp, gl, 'FULL(all)', fullLayers, makeGetTextDraw(words, true, true), 1, FRAMES));
+  // FULL at adaptive low-res (backingScale 0.5 — what lowResRef triggers under load)
+  results.push(await runConfig(comp, gl, 'FULL@0.5', fullLayers, makeGetTextDraw(words, true, true), 0.5, FRAMES));
+
+  out({ ok: 1, W, H, frames: FRAMES, words: WORDS.length, transKind, styleNeon, animCount: animList.length, rasterMsPerWord, results });
+} catch (e) {
+  out({ err: String((e && e.stack) || e) });
+}
+</script></body></html>

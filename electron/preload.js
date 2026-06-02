@@ -42,6 +42,14 @@ contextBridge.exposeInMainWorld('strata', {
     return () => ipcRenderer.removeListener('project:save-prompt-request', handler);
   },
   savePromptResponse: (choice) => ipcRenderer.send('project:save-prompt-response', choice),
+  // App-level "выйти?" confirm (works on any tab, unlike the editor-only save prompt). Renderer
+  // replies 'exit' | 'cancel'.
+  onExitConfirmRequest: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('app:exit-confirm-request', handler);
+    return () => ipcRenderer.removeListener('app:exit-confirm-request', handler);
+  },
+  exitConfirmResponse: (choice) => ipcRenderer.send('app:exit-confirm-response', choice),
   // Crash recovery: autosave the editor state; query/resolve a pending recovery.
   autosaveEditor: (state) => ipcRenderer.invoke('editor:autosave', state),
   getRecovery: () => ipcRenderer.invoke('editor:getRecovery'),

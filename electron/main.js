@@ -761,10 +761,12 @@ function createWindow() {
   // instead of quitting. A real quit goes through the tray menu / app.quit(),
   // which fires before-quit — the save-prompt lives there.
   mainWindow.on('close', (event) => {
-    if (!isQuitting) {
-      event.preventDefault();
-      mainWindow.hide();
-    }
+    if (isQuitting) return;            // a real quit is already underway → let it proceed
+    event.preventDefault();
+    // No more hide-to-tray: ✕ asks a styled in-app "выйти?" confirm, then quits FULLY (and installs
+    // any background-downloaded update on the way out). Keeping the app in the tray was why users
+    // never got updates — they never actually quit.
+    handleExitRequest();
   });
 
   // Tell the renderer whether the window is maximized/fullscreen, so the editor
@@ -946,6 +948,34 @@ ipcMain.handle('update:install', async () => {
   try { autoUpdater.quitAndInstall(true, true); } catch {}
   return true;
 });
+
+// Exit flow (no tray): ✕ / titlebar-close asks the user in a styled IN-APP modal before quitting
+// FULLY. Dirty project → the save prompt is the confirm (save / don't-save / cancel). Clean → a plain
+// "Выйти?" confirm (kind:'exit'). On confirm: quit, and if an update was downloaded in the background,
+// silently install it on the way out (no relaunch) so the NEXT launch is the new version. Cancel →
+// the window simply stays open (Strata no longer minimises to the tray).
+let exitInFlight = false;
+async function handleExitRequest() {
+  if (exitInFlight) return;
+  exitInFlight = true;
+  try {
+    let go;
+    if (rendererDirty) {
+      go = await maybePromptSaveProject('Сохранить проект перед выходом?', 'Strata Mixer закроется. Сохранить несохранённые изменения?');
+    } else {
+      const choice = await requestRendererExitConfirm('Выйти из Strata Mixer?', 'Программа закроется полностью.');
+      go = choice === 'exit';
+    }
+    if (!go) return;                 // stay open — NOT minimised to the tray
+    isQuitting = true;
+    _quitCleared = true;             // save already resolved → before-quit must not re-prompt
+    try { markCleanExit(); } catch {}
+    if (updateState && updateState.status === 'downloaded') {
+      try { autoUpdater.quitAndInstall(true, false); return; } catch {}   // install pending update, no relaunch
+    }
+    app.quit();
+  } finally { exitInFlight = false; }
+}
 // Roll back to the previous published version: find the release immediately
 // older than the one running, download its installer and run it (Windows) or
 // open the DMG (macOS). This is the "Скачать предыдущую версию" action.
@@ -1267,7 +1297,8 @@ app.whenReady().then(async () => {
   loadRecoveryAtStartup();   // crash recovery: was the previous exit un-clean?
   createSplashWindow();
   createWindow();
-  createTray();
+  // No tray: closing the window quits Strata fully (see handleExitRequest). Keeping it alive in the
+  // tray meant users never actually quit → background updates never installed.
   startUpdateAndNotificationCycle();
   pruneProxyCache();
 
@@ -1564,6 +1595,21 @@ function requestRendererSave() {
       ipcMain.removeListener('project:save-response', handler);
       resolve({ ok: false, error: String(e.message || e) });
     }
+  });
+}
+
+// Ask the ALWAYS-mounted App-level exit-confirm modal "Выйти?" and resolve 'exit' | 'cancel'. Kept
+// separate from the save prompt (which lives in the Editor view → only mounted on that tab) so that
+// closing works from ANY screen. 60 s safety timeout → 'cancel' if the renderer never answers.
+function requestRendererExitConfirm(message, detail) {
+  return new Promise((resolve) => {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    if (!win) return resolve('cancel');
+    const handler = (_e, choice) => { ipcMain.removeListener('app:exit-confirm-response', handler); clearTimeout(t); resolve(choice || 'cancel'); };
+    ipcMain.on('app:exit-confirm-response', handler);
+    const t = setTimeout(() => { ipcMain.removeListener('app:exit-confirm-response', handler); resolve('cancel'); }, 60000);
+    try { win.webContents.send('app:exit-confirm-request', { message, detail }); }
+    catch { ipcMain.removeListener('app:exit-confirm-response', handler); clearTimeout(t); resolve('cancel'); }
   });
 }
 

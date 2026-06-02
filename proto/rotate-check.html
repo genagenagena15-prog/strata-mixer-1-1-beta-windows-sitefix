@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>rotation engine check</title></head>
+<body style="margin:0;background:#222">
+<canvas id="gl" width="200" height="200"></canvas>
+<script type="module">
+import { Compositor } from '/src/engine/compositor.js';
+function done(o){ console.log('@@BENCH@@' + JSON.stringify(o)); try{window.close();}catch(e){} }
+const W = 200, H = 200;
+// source: left half RED, right half BLUE
+const src = document.createElement('canvas'); src.width = 100; src.height = 100;
+{ const c = src.getContext('2d'); c.fillStyle = '#ff0000'; c.fillRect(0,0,50,100); c.fillStyle = '#0000ff'; c.fillRect(50,0,50,100); }
+const layer = { id:'L', type:'image', x:50, y:50, size:50, aspect:1, opacity:100, startTime:0, endTime:10 };
+function getLayerPx(l){ const w=(l.size/100)*W, h=w/(l.aspect||1); return { w, h, x:(l.x/100)*W - w/2, y:(l.y/100)*H - h/2 }; }  // → {50,50,100,100}
+function frameFor(angle){ return { W,H, bgColor:'#000000', layers:[{...layer, angle}], time:1, videoStart:0, videoEnd:10, dur:10, backingScale:1, getPx:getLayerPx, getSource:()=>src, getCC:()=>null, getTextDraw:()=>null }; }
+function avg(buf, x, y, s){ // s×s box centred at (x,y) in TOP-LEFT coords; buf is row0=bottom
+  let r=0,g=0,b=0,n=0;
+  for(let dy=-s;dy<=s;dy++) for(let dx=-s;dx<=s;dx++){
+    const px=x+dx, py=y+dy; if(px<0||py<0||px>=W||py>=H) continue;
+    const row = H-1-py;          // flip to GL bottom-row-0
+    const i=(row*W+px)*4; r+=buf[i]; g+=buf[i+1]; b+=buf[i+2]; n++;
+  }
+  return [Math.round(r/n), Math.round(g/n), Math.round(b/n)];
+}
+(async()=>{
+  try {
+    const comp = new Compositor(document.getElementById('gl'));
+    comp.renderFrame(frameFor(0));
+    const a = comp.readPixels(W,H);
+    const s0 = { left: avg(a,75,100,8), right: avg(a,125,100,8), top: avg(a,100,75,8), bottom: avg(a,100,125,8) };
+    comp.renderFrame(frameFor(90));
+    const b = comp.readPixels(W,H);
+    const s90 = { left: avg(b,75,100,8), right: avg(b,125,100,8), top: avg(b,100,75,8), bottom: avg(b,100,125,8) };
+    done({ ok:true, angle0:s0, angle90:s90 });
+  } catch(e){ done({ ok:false, err:(e&&e.message||String(e)).slice(0,500) }); }
+})();
+</script></body></html>

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>rgbrush compare</title></head>
+<body style="margin:0;background:#000">
+<canvas id="gl" width="270" height="480"></canvas>
+<canvas id="out" width="270" height="480" style="position:absolute;left:0;top:0"></canvas>
+<script type="module">
+import { Compositor } from '/src/engine/compositor.js';
+const prog = parseFloat(new URLSearchParams(location.search).get('p') || '0.5');
+const str  = parseFloat(new URLSearchParams(location.search).get('s') || '1.5');
+function load(src){ return new Promise((res,rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=()=>rej(new Error('img '+src)); im.src=src; }); }
+(async()=>{
+  try {
+    const W=270, H=480;
+    const comp = new Compositor(document.getElementById('gl'));
+    const A = await load('/proto/ref/A.png');
+    const B = await load('/proto/ref/B.png');
+    comp.renderTransitionPreview(24, A, B, prog, str, prog);
+    const gl = comp.gl;
+    const buf = new Uint8Array(W*H*4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.readPixels(0,0,W,H,gl.RGBA,gl.UNSIGNED_BYTE,buf);   // valid right after draw (back buffer)
+    const out = document.getElementById('out'), ctx = out.getContext('2d');
+    const img = ctx.createImageData(W,H);
+    for(let y=0;y<H;y++){ const sy=H-1-y; for(let x=0;x<W;x++){ const d=(y*W+x)*4, s=(sy*W+x)*4; img.data[d]=buf[s]; img.data[d+1]=buf[s+1]; img.data[d+2]=buf[s+2]; img.data[d+3]=255; } }
+    ctx.putImageData(img,0,0);
+    console.log('@@BENCH@@' + out.toDataURL('image/png'));   // bench-electron.cjs writes this to last-bench.json
+  } catch(e){ console.log('@@ERR@@ '+(e&&e.message||e)); }
+})();
+</script></body></html>

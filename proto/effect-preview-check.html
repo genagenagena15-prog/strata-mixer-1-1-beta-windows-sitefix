@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>effect-preview check v2</title></head>
+<body style="margin:0;background:#0c0d12"><canvas id="c" width="150" height="267"></canvas>
+<script type="module">
+import { Compositor } from '/src/engine/compositor.js';
+import { rasterizeWord } from '/src/engine/textRaster.js';
+import { TEXT_ANIM_TYPE, animTransform, isPixelAnim, TEXT_ANIMS, TRANSITIONS, TRANSITION_TYPE } from '/src/engine/effects/index.js';
+const out = (o) => console.log('@@BENCH@@' + JSON.stringify(o));
+
+function solid(label, top, bottom) {
+  const cv = document.createElement('canvas'); cv.width = 360; cv.height = 640;
+  const x = cv.getContext('2d'); const g = x.createLinearGradient(0,0,0,640);
+  g.addColorStop(0, top); g.addColorStop(1, bottom); x.fillStyle=g; x.fillRect(0,0,360,640);
+  x.fillStyle='#fff'; x.font='bold 260px sans-serif'; x.textAlign='center'; x.textBaseline='middle'; x.fillText(label,180,330);
+  return cv;
+}
+const A = solid('A','#ff9a2e','#e85d1b'), B = solid('B','#9b5bff','#6a2bd0');
+const bg = solid('',' #2a6cc0','#123a70');
+
+function mean(gl,cw,ch){ const n=24,x0=(cw>>1)-12,y0=(ch>>1)-12,b=new Uint8Array(n*n*4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.readPixels(x0,y0,n,n,gl.RGBA,gl.UNSIGNED_BYTE,b);
+  let r=0,g=0,bl=0; for(let i=0;i<b.length;i+=4){r+=b[i];g+=b[i+1];bl+=b[i+2];} const k=b.length/4;
+  return {r:Math.round(r/k),g:Math.round(g/k),b:Math.round(bl/k)}; }
+function sumOf(m){ return m.r*7+m.g*13+m.b*17; }
+
+function animFrame(comp, animA, loopT){
+  const W=comp.canvas.width, H=comp.canvas.height;
+  const animPixel = animA && isPixelAnim(animA);
+  const tr = (animA && !animPixel) ? animTransform(animA, loopT) : {sx:1,sy:1,ox:0,oy:0,rot:0};
+  const fs = Math.round(W*0.20);
+  let d;
+  if (animPixel){ const word=rasterizeWord('Текст',{cx:W/2,cy:H/2,w:W*0.92},{fontSize:fs},'bold sans-serif',true);
+    d = word && {...word,opacity:1,scaleX:1,scaleY:1,style:0,base:[1,1,1],acc:[1,1,1],intensity:1,anim:animA}; }
+  else { const word=rasterizeWord('Текст',{cx:W/2+tr.ox*fs,cy:H/2+tr.oy*fs,w:W*0.92},{fontSize:fs,color:'#fff',outlineColor:'#000',outline:Math.max(2,Math.round(fs*0.08))},'bold sans-serif');
+    d = word && {...word,opacity:1,scaleX:tr.sx,scaleY:tr.sy}; }
+  comp.renderFrame({ W,H,bgColor:'#0e0f14',
+    layers:[{id:'bg',type:'mainVideo'},{id:'sb',type:'subtitles',startTime:0,endTime:9}],
+    time:loopT, videoStart:0, videoEnd:9, dur:9,
+    getPx:()=>({x:0,y:0,w:W,h:H}), getSource:(l)=> l.type==='mainVideo'?bg:null,
+    getTextDraw:(l)=> (l.type==='subtitles'&&d)?[d]:[], getCC:()=>null });
+}
+
+try {
+  const comp = new Compositor(document.getElementById('c')); const gl=comp.gl;
+  const W=comp.canvas.width,H=comp.canvas.height;
+  const tk = (TRANSITIONS[1]||TRANSITIONS[0]).id, fx = TRANSITION_TYPE[tk];
+  const tests=[];
+
+  // A→B transition: A(orange) at start, B(violet) at end
+  comp.renderTransitionPreview(fx, A, B, 0.02, 1.1, 0.1); const m0=mean(gl,W,H);
+  comp.renderTransitionPreview(fx, A, B, 0.98, 1.1, 0.9); const m1=mean(gl,W,H);
+  tests.push({ name:'transition '+tk, differ:sumOf(m0)!==sumOf(m1), startOrange:m0.r>m0.b, endViolet:m1.b>m1.r, m0, m1 });
+
+  // anim transform (pop) over the loop
+  const tA = TEXT_ANIMS.filter(a=>a.id!=='none').find(a=>!isPixelAnim(TEXT_ANIM_TYPE[a.id]||0));
+  animFrame(comp, TEXT_ANIM_TYPE[tA.id], 0.04); const a1=sumOf(mean(gl,W,H));
+  animFrame(comp, TEXT_ANIM_TYPE[tA.id], 0.45); const a2=sumOf(mean(gl,W,H));
+  tests.push({ name:'anim(transform) '+tA.id+' +bg', differ:a1!==a2 });
+
+  // anim pixel (fill) WITHOUT a GPU style → must still animate via the new compositor gate
+  const pA = TEXT_ANIMS.filter(a=>a.id!=='none').find(a=>isPixelAnim(TEXT_ANIM_TYPE[a.id]||0));
+  animFrame(comp, TEXT_ANIM_TYPE[pA.id], 0.1); const p1=sumOf(mean(gl,W,H));
+  animFrame(comp, TEXT_ANIM_TYPE[pA.id], 1.35); const p2=sumOf(mean(gl,W,H));
+  tests.push({ name:'anim(pixel,no-style) '+pA.id, differ:p1!==p2 });
+
+  out({ ok:1, allDiffer: tests.every(t=>t.differ), tests });
+} catch(e){ out({ err:String((e&&e.stack)||e) }); }
+</script></body></html>

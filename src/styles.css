@@ -988,6 +988,13 @@
 .ed-tb-label{font-size:11px;color:#85858c;font-weight:700;white-space:nowrap}
 .ed-color-inp{width:28px;height:28px;border:1px solid rgba(140,140,146,.25);border-radius:7px;padding:2px;background:#161618;cursor:pointer;transition:border-color .12s,box-shadow .12s}
 .ed-color-inp:hover{border-color:#ff8a00;box-shadow:0 0 0 1px rgba(255,138,0,.45)}
+/* Gradient-outline colour stops (up to 4) */
+.ed-grad-row{flex-direction:column;align-items:stretch;gap:6px}
+.ed-grad-colors{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ed-grad-swatch{position:relative;display:inline-flex}
+.ed-grad-swatch .ed-grad-rm{position:absolute;top:-6px;right:-6px;width:15px;height:15px;border-radius:50%;border:1px solid rgba(0,0,0,.4);background:#c83232;color:#fff;font-size:11px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
+.ed-grad-add{width:28px;height:28px;border-radius:7px;border:1px dashed rgba(140,140,146,.5);background:#161618;color:#d2d2d6;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;transition:border-color .12s,color .12s}
+.ed-grad-add:hover{border-color:#ff8a00;color:#fff}
 .sub-style-acc{margin-top:10px}
 .sub-style-acc .ed-acc-toggle{height:40px}
 .sub-seg-acc{margin-top:12px}
@@ -1012,11 +1019,13 @@
    the workspace row, which keeps the timeline glued right under the preview. */
 .ed-props-col{position:relative;min-height:0}
 .ed-props-col > .ed-props{position:absolute;inset:0}
-/* Clip to the preview panel (overflow:hidden) so handles never spill onto the toolbar
-   above / timeline below. The inner padding leaves room AROUND the canvas so rotation/
-   resize handles near an edge stay visible within the panel instead of being cut at the
-   canvas border (the canvas itself is still clipped to the project rect by .ed-preview-clip). */
-.ed-preview-wrap{position:relative;background:#2a2a2a;border-radius:14px;display:flex;align-items:center;justify-content:center;min-height:120px;overflow:hidden;padding:20px}
+/* overflow:VISIBLE so a SELECTED layer's resize/rotate handles stay on-screen even when the
+   layer is rotated or scaled past the panel edge — clipping here used to swallow them. z-index
+   lifts the wrap above the side props panel + the controls below, so the overflowing handles
+   paint ON TOP of those instead of hiding behind them (DOM order would otherwise occlude them).
+   The canvas itself is still clipped to the project rect by .ed-preview-clip, so ONLY the thin
+   interactive handles ever spill out — never the video/gray surround. */
+.ed-preview-wrap{position:relative;z-index:5;background:#2a2a2a;border-radius:14px;display:flex;align-items:center;justify-content:center;min-height:120px;overflow:visible;padding:20px}
 .ed-preview-resize{height:7px;border-radius:4px;background:rgba(140,140,146,.14);cursor:ns-resize;transition:background .15s;flex-shrink:0}
 .ed-preview-resize:hover,.ed-preview-resize:active{background:rgba(255,138,0,.45)}
 .ed-tl-section{flex:1 1 0;min-height:160px;display:flex;flex-direction:column;min-width:0}

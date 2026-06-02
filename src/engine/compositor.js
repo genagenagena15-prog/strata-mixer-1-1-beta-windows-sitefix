@@ -144,15 +144,41 @@ uniform vec2 uRes;
 uniform vec2 uOffset;     // shadow shift in backing px (x right, y already flipped to FBO y-up)
 uniform vec3 uColor;      // shadow/glow rgb 0..1
 uniform float uOpacity;   // 0..1 overall shadow strength
+uniform float uHard;      // 0 = soft shadow/glow (default, unchanged). >0 = OUTLINE: cut the blurred
+                          // silhouette at this alpha level → a crisp DILATED shape; the ring that
+                          // sticks out from under the layer reads as a stroke.
+uniform int uGradN;       // 0 = flat uColor (shadow/glow + solid outline). 2..4 = gradient stop count.
+uniform vec3 uGradC0; uniform vec3 uGradC1; uniform vec3 uGradC2; uniform vec3 uGradC3;
+uniform vec2 uGradDir;    // gradient axis = (cosθ, -sinθ): screen y-down folded into the FBO's y-up.
+uniform vec4 uGradRect;   // layer rect in FBO uv (x,y,w,h) so the gradient spans the LAYER, not the frame.
 out vec4 frag;
+vec3 gradAt(float t){     // up-to-4 evenly-spaced stops
+  if(uGradN <= 2) return mix(uGradC0, uGradC1, t);
+  float s = t * float(uGradN - 1);
+  if(uGradN == 3) return (s < 1.0) ? mix(uGradC0, uGradC1, s) : mix(uGradC1, uGradC2, s - 1.0);
+  if(s < 1.0) return mix(uGradC0, uGradC1, s);
+  if(s < 2.0) return mix(uGradC1, uGradC2, s - 1.0);
+  return mix(uGradC2, uGradC3, s - 2.0);
+}
 void main(){
   vec2 uv = (gl_FragCoord.xy - uOffset) / uRes;
   float a = texture(uTex, uv).a;
   // sampling outside the silhouette texture must read 0 (CLAMP_TO_EDGE could smear an edge value
   // across the offset gap) → hard-zero anything outside [0,1].
   if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) a = 0.0;
-  frag = vec4(uColor, a * uOpacity);
+  if(uHard > 0.0) a = smoothstep(uHard * 0.6, uHard * 1.4, a);   // outline: blurred → crisp dilated edge
+  vec3 col = uColor;
+  if(uGradN >= 2){
+    vec2 p = (uv - uGradRect.xy) / uGradRect.zw;            // 0..1 within the layer box
+    float tt = clamp(dot(p - 0.5, uGradDir) + 0.5, 0.0, 1.0);
+    col = gradAt(tt);
+  }
+  frag = vec4(col, a * uOpacity);
 }`;
+
+// Outline alpha cut level for the FS_SHADOW uHard path. Tuned so that, with the shadow pass's
+// sigma = width·S, the dilation ≈ `width` frame-px (the stroke thickness the user dials in).
+const OUTLINE_THRESH = 0.16;
 
 // Mask stamp: draw the FULL composite (uFull, sampled by screen pos) inside this mask's shape.
 // alpha = inside the shape (rect / ellipse / rounded-rect, ~1px AA). Multiple masks union.
@@ -359,14 +385,15 @@ export class Compositor {
         // shape (chroma cut-out if keyed, else the opaque rect), so the shadow follows the visible
         // form. Drawn BEFORE the layer → layer sits on top of its shadow.
         if (layer.type !== 'mainVideo') {
-          const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow);
-          if (sh || gl2) {
+          const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow), ol = this._outlineParams(layer.outline);
+          if (sh || gl2 || ol) {
             const sil = () => {
               if (hasChroma) this._drawChromaLayer(rec.tex, rect, opacity, null, layer.chromaKey, rot, aspect);
               else this._drawLayer(rec.tex, rect, opacity, null, rot, aspect);
             };
             if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);   // outer glow (centred, additive)
             if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);    // drop shadow
+            if (ol) this._drawLayerShadow(frame, ol, sil, bw, bh, false, OUTLINE_THRESH, this._gradFor(layer.outline, b, W, H));   // outline — drawn last (nearest the layer)
           }
         }
         // Chroma key («Удалить фон»): key out the colour → reveals the scene below it.
@@ -379,11 +406,12 @@ export class Compositor {
         this._stampMask(frame, layer, bw, bh);
       } else if (layer.type === 'maskedVideo') {
         // Shadow / glow follow the cut-out SILHOUETTE (the masked-video shape rendered into scratchB).
-        const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow);
-        if (sh || gl2) {
+        const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow), ol = this._outlineParams(layer.outline);
+        if (sh || gl2 || ol) {
           const sil = (fbo) => this._drawMaskedVideo(frame, layer, bw, bh, fbo);
           if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);
           if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);
+          if (ol) this._drawLayerShadow(frame, ol, sil, bw, bh, false, OUTLINE_THRESH, this._gradFor(layer.outline, frame.getPx(layer), W, H));
         }
         this._drawMaskedVideo(frame, layer, bw, bh);
       } else if (layer.type === 'text' || layer.type === 'subtitles') {
@@ -782,6 +810,25 @@ export class Compositor {
     return { color: fx.color || '#000000', blur, dx, dy, opacity };
   }
 
+  // Outline («Обводка») params → shaped like a CENTRED shadow so _drawLayerShadow draws it with
+  // hard=OUTLINE_THRESH (crisp dilated silhouette = stroke). `width` = stroke thickness in frame px
+  // (becomes the shadow sigma = width·S). Returns null = no stroke.
+  _outlineParams(fx) {
+    if (!fx) return null;
+    const width = +fx.width || 0;
+    const opacity = fx.opacity != null ? +fx.opacity : 1;
+    if (width <= 0 || opacity <= 0) return null;
+    return { color: fx.color || '#000000', blur: width, dx: 0, dy: 0, opacity };
+  }
+
+  // Gradient spec for a gradient outline → null when the outline is solid (or invalid). `b` is the
+  // layer's px rect (the gradient spans it); rect is converted to FBO uv (y-up). Colours stay hex —
+  // _drawLayerShadow converts them and derives the axis from `angle`.
+  _gradFor(fx, b, W, H) {
+    if (!fx || !fx.grad || !Array.isArray(fx.colors) || fx.colors.length < 2 || !b || b.w <= 0 || b.h <= 0) return null;
+    return { colors: fx.colors.slice(0, 4), angle: +fx.angle || 0, rect: [b.x / W, 1 - (b.y + b.h) / H, b.w / W, b.h / H] };
+  }
+
   // Drop shadow / outer glow for a single layer — runs BEFORE the layer's own draw so the layer sits
   // ON TOP of its shadow (Photoshop semantics). Parametrized so PHASE 3 (outer glow) reuses it: glow
   // = same call with dx=dy=0 (centred) + additive=true. Mechanism (reuses the FBO + separable-gauss
@@ -794,7 +841,7 @@ export class Compositor {
   //      (dx,dy) px, alpha = blurredAlpha × opacity, over the scene (src-over for shadow / additive for
   //      glow). Sampled by screen pos so the offset is exact.
   // Leaves the scene FBO bound (+ full viewport) so the caller can immediately draw the real layer.
-  _drawLayerShadow(frame, fx, drawSilhouette, bw, bh, additive) {
+  _drawLayerShadow(frame, fx, drawSilhouette, bw, bh, additive, hard, grad) {
     const gl = this.gl;
     const S = bw / frame.W;
     this.scratchB.resize(bw, bh);
@@ -810,7 +857,7 @@ export class Compositor {
 
     // 2. separable gaussian over scratchB by `blur` px (skip when negligible → crisp offset shadow)
     const sigma = Math.max(0.5, (fx.blur || 0) * S);
-    if ((fx.blur || 0) * S > 0.5) {
+    if (hard || (fx.blur || 0) * S > 0.5) {   // outline ALWAYS spreads (it's a dilation); shadow only when meaningful
       // scratchB → scratchC (H) → scratchB (V)
       this._gaussBlur(this.scratchB.tex, this.scratchC.fbo, this.scratchC.tex, this.scratchB.fbo, sigma, bw, bh);
     }
@@ -838,6 +885,23 @@ export class Compositor {
     gl.uniform2f(p.u.uOffset, (fx.dx || 0) * S, -(fx.dy || 0) * S);
     gl.uniform3f(p.u.uColor, rgb[0], rgb[1], rgb[2]);
     gl.uniform1f(p.u.uOpacity, fx.opacity != null ? fx.opacity : 1);
+    gl.uniform1f(p.u.uHard, hard || 0);   // 0 = shadow/glow (soft); >0 = outline (crisp dilated edge)
+    // Gradient outline: up to 4 stops along uGradDir across the layer rect. uGradN=0 → flat uColor,
+    // so shadow / glow / solid-outline draws stay byte-identical.
+    if (grad && grad.colors && grad.colors.length >= 2) {
+      const gc = grad.colors.slice(0, 4).map(hexToRgb);
+      gl.uniform1i(p.u.uGradN, gc.length);
+      gl.uniform3f(p.u.uGradC0, gc[0][0], gc[0][1], gc[0][2]);
+      gl.uniform3f(p.u.uGradC1, gc[1][0], gc[1][1], gc[1][2]);
+      if (gc[2]) gl.uniform3f(p.u.uGradC2, gc[2][0], gc[2][1], gc[2][2]);
+      if (gc[3]) gl.uniform3f(p.u.uGradC3, gc[3][0], gc[3][1], gc[3][2]);
+      const rad = (grad.angle || 0) * Math.PI / 180;
+      gl.uniform2f(p.u.uGradDir, Math.cos(rad), -Math.sin(rad));
+      const r = grad.rect;
+      gl.uniform4f(p.u.uGradRect, r[0], r[1], r[2], r[3]);
+    } else {
+      gl.uniform1i(p.u.uGradN, 0);
+    }
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     // scene stays bound (full viewport) so the caller draws the real layer right on top.
   }

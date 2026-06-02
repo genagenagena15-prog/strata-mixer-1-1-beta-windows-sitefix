@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>engine full check</title></head>
+<body style="margin:0;background:#222"><canvas id="gl" width="200" height="200"></canvas>
+<script type="module">
+import { Compositor } from '/src/engine/compositor.js';
+function done(o){ console.log('@@BENCH@@' + JSON.stringify(o)); try{window.close();}catch(e){} }
+const W=200,H=200;
+function mk(w,h,fn){ const c=document.createElement('canvas'); c.width=w;c.height=h; fn(c.getContext('2d')); return c; }
+function px(buf,x,y){ const row=H-1-y; const i=(row*W+x)*4; return [buf[i],buf[i+1],buf[i+2],buf[i+3]]; }
+function avg(buf,x,y,s){ let r=0,g=0,b=0,n=0; for(let dy=-s;dy<=s;dy++)for(let dx=-s;dx<=s;dx++){const X=x+dx,Y=y+dy; if(X<0||Y<0||X>=W||Y>=H)continue; const row=H-1-Y,i=(row*W+X)*4; r+=buf[i];g+=buf[i+1];b+=buf[i+2];n++;} return [Math.round(r/n),Math.round(g/n),Math.round(b/n)]; }
+function mae(a,b){ let s=0; for(let i=0;i<a.length;i++) s+=Math.abs(a[i]-b[i]); return +(s/a.length).toFixed(2); }
+const px100 = (x,y,w,h)=>({x,y,w,h}); // helper unused-guard
+// generic getPx: layers carry _px {x,y,w,h}
+const getPx = (l)=> l._px || {x:50,y:50,w:100,h:100};
+function frame(layers, extra){ return Object.assign({ W,H,bgColor:'#000000',layers,time:1,videoStart:0,videoEnd:10,dur:10,backingScale:1,
+  getPx, getSource:(l)=>l._src||null, getCC:(l)=>l._cc||null, getTextDraw:(l)=>l._draws||null }, extra||{}); }
+
+const RED=mk(60,60,c=>{c.fillStyle='#ff0000';c.fillRect(0,0,60,60);});
+const GRAY=mk(60,60,c=>{c.fillStyle='#808080';c.fillRect(0,0,60,60);});
+const GREENRED=mk(100,100,c=>{c.fillStyle='#16c60c';c.fillRect(0,0,50,100);c.fillStyle='#ff0000';c.fillRect(50,0,50,100);});
+const LR=mk(100,100,c=>{c.fillStyle='#ff0000';c.fillRect(0,0,50,100);c.fillStyle='#0000ff';c.fillRect(50,0,50,100);});
+const GLYPH=mk(60,60,c=>{c.fillStyle='rgba(255,255,255,1)';c.beginPath();c.arc(30,30,22,0,7);c.fill();}); // alpha glyph
+
+const results=[];
+function T(name, pass, detail){ results.push({name, pass:!!pass, detail}); }
+
+try{
+  const comp=new Compositor(document.getElementById('gl'));
+  const R=(layers,extra)=>{ comp.renderFrame(frame(layers,extra)); return comp.readPixels(W,H); };
+
+  // 1. basic image layer
+  { const b=R([{id:'a',type:'image',_src:RED,_px:px100(70,70,60,60),opacity:100}]);
+    const c=avg(b,100,100,6), corner=avg(b,20,20,4);
+    T('layer_basic', c[0]>200&&c[2]<60 && corner[0]<40, `center=${c} corner=${corner}`); }
+
+  // 2. opacity (red @50% over white bg)
+  { const b=R([{id:'b',type:'image',_src:RED,_px:px100(70,70,60,60),opacity:50}],{bgColor:'#ffffff'});
+    const c=avg(b,100,100,6); T('opacity', c[0]>200&&c[1]>90&&c[1]<190, `center=${c} (expect pink)`); }
+
+  // 3. colour correction (brightness x2 on gray)
+  { const b=R([{id:'c',type:'image',_src:GRAY,_px:px100(70,70,60,60),opacity:100,_cc:{b:2,c:1,s:1,h:0}}]);
+    const c=avg(b,100,100,6); T('cc_brightness', c[0]>220, `gray*2 center=${c} (expect ~255)`); }
+
+  // 4. chroma key (green->transparent over blue bg)
+  { const b=R([{id:'d',type:'image',_src:GREENRED,_px:px100(50,50,100,100),opacity:100,chromaKey:{color:'#16c60c',threshold:45,smoothness:30}}],{bgColor:'#0000ff'});
+    const L=avg(b,75,100,6), Rr=avg(b,125,100,6); T('chroma_key', L[2]>150&&L[1]<90 && Rr[0]>150, `green->${L} red->${Rr}`); }
+
+  // 5. rotation (red-left/blue-right rotated 90 -> red-top)
+  { const b=R([{id:'e',type:'image',_src:LR,_px:px100(50,50,100,100),opacity:100,angle:90}]);
+    const top=avg(b,100,75,6), bot=avg(b,100,125,6); T('rotation_cw', top[0]>150&&bot[2]>150, `top=${top} bot=${bot} (expect red top, blue bot)`); }
+
+  // 6. maskedVideo circle (red, outside circle -> bg blue)
+  { const b=R([{id:'f',type:'maskedVideo',_src:RED,_px:px100(50,50,100,100),shape:'circle'}],{bgColor:'#0000ff'});
+    const c=avg(b,100,100,5), corner=avg(b,58,58,3); T('maskedVideo_circle', c[0]>200 && corner[2]>150, `center=${c} corner=${corner} (red center, blue corner)`); }
+
+  // 7. mask union: mainVideo red + image blue full + mask rect center -> blue only inside rect
+  { const b=R([
+      {id:'mv',type:'mainVideo',_src:RED,_px:px100(0,0,200,200)},
+      {id:'ov',type:'image',_src:mk(20,20,c=>{c.fillStyle='#0000ff';c.fillRect(0,0,20,20);}),_px:px100(0,0,200,200),opacity:100},
+      {id:'mk',type:'mask',_px:px100(70,70,60,60),shape:'square'} ]);
+    const inRect=avg(b,100,100,6), outRect=avg(b,20,20,4);
+    T('mask_union', inRect[2]>150 && outRect[0]>150&&outRect[2]<80, `inMask=${inRect}(blue) outMask=${outRect}(red)`); }
+
+  // 8. blur: sharp L/R edge, blur over center -> edge column becomes mixed
+  { const base=R([{id:'mv2',type:'mainVideo',_src:LR,_px:px100(0,0,200,200)}]);
+    const e0=avg(base,99,100,1);
+    const b=R([{id:'mv2',type:'mainVideo',_src:LR,_px:px100(0,0,200,200)},{id:'bl',type:'blur',_px:px100(60,60,80,80),strength:18}]);
+    const e1=avg(b,99,100,1); T('blur', (e1[2]-e0[2])>25 || (e0[0]-e1[0])>25, `edge no-blur=${e0} blurred=${e1} (blurred mixes)`); }
+
+  // 9. transition (rgbrush) self-effect distorts the composite at progress .5
+  { const noTr=R([{id:'mv3',type:'mainVideo',_src:LR,_px:px100(0,0,200,200)}]);
+    const tr=R([{id:'mv3',type:'mainVideo',_src:LR,_px:px100(0,0,200,200)},{id:'tr',type:'transition',kind:'rgbrush',startTime:0,endTime:2,strength:75}],{time:1});
+    const d=mae(noTr,tr); T('transition_rgbrush', d>3, `MAE(noTr,tr)=${d} (expect distortion >3)`); }
+
+  // 10. text style (neon, style 1) additive recolour of an alpha glyph
+  { const draws=[{source:GLYPH,x:70,y:70,w:60,h:60,opacity:1,style:1,base:[0,1,1],acc:[1,0,1],intensity:1,anim:0}];
+    const b=R([{id:'tx',type:'text',_draws:draws}]);
+    const c=avg(b,100,100,5); T('text_style', (c[0]+c[1]+c[2])>120, `glyph centre=${c} (expect lit, not black)`); }
+
+  // 11. zoom layer scales the composite (red 40x40 -> bigger)
+  { const noZ=R([{id:'mv4',type:'mainVideo',_src:RED,_px:px100(80,80,40,40)}]);
+    const z=R([{id:'mv4',type:'mainVideo',_src:RED,_px:px100(80,80,40,40)},{id:'zm',type:'zoom',startTime:0,endTime:2,strength:100}],{time:1});
+    const out0=avg(noZ,70,100,2), out1=avg(z,70,100,2);
+    T('zoom_layer', out0[0]<60 && out1[0]>150, `pt no-zoom=${out0}(bg) zoomed=${out1}(red)`); }
+
+  // 12. ALL 8 GPU transitions distort the composite (self-effect) at progress .5.
+  // Use a CHECKER (high-frequency, off-centre detail) so zoom/pixelate/ripple — which are
+  // near-identity on a flat symmetric image — actually show their distortion.
+  { const CHECK=mk(200,200,c=>{ for(let y=0;y<200;y+=10)for(let x=0;x<200;x+=10){ c.fillStyle=(((x/10+y/10)%2)?'#ffffff':'#203040'); c.fillRect(x,y,10,10);} });
+    const TR=['rgbrush','zoomrush','zoomspin','datamosh','pixelate','fireburn','swirl','ripple'];
+    const base=R([{id:'tb',type:'mainVideo',_src:CHECK,_px:px100(0,0,200,200)}]); const got={};
+    for(const k of TR){ const t=R([{id:'tb',type:'mainVideo',_src:CHECK,_px:px100(0,0,200,200)},{id:'tt',type:'transition',kind:k,startTime:0,endTime:2,strength:75}],{time:1}); got[k]=mae(base,t); }
+    const fails=Object.entries(got).filter(([k,v])=>v<2).map(([k,v])=>k+'='+v);
+    T('transitions_all8', fails.length===0, fails.length?('weak: '+fails.join(',')):('all 8 distort: '+TR.map(k=>k+'='+got[k]).join(' '))); }
+
+  // 13. pixel sub-anims (fill/wave/typewriter/blurin) render lit glyph (style 0 + anim via u_anim)
+  { function maxB(buf,x,y,s){let m=0;for(let dy=-s;dy<=s;dy++)for(let dx=-s;dx<=s;dx++){const X=x+dx,Y=y+dy;if(X<0||Y<0||X>=W||Y>=H)continue;const row=H-1-Y,i=(row*W+X)*4;m=Math.max(m,buf[i],buf[i+1],buf[i+2]);}return m;}
+    const anims={fill:2,wave:3,typewriter:10,blurin:11}; const fails=[];
+    for(const [name,a] of Object.entries(anims)){ const draws=[{source:GLYPH,x:70,y:70,w:60,h:60,opacity:1,style:0,base:[1,1,1],acc:[1,1,1],intensity:1,anim:a,animTime:0.5}];
+      const b=R([{id:'pa',type:'text',_draws:draws}]); if(maxB(b,100,100,26)<70) fails.push(name); }
+    T('pixel_subanims', fails.length===0, fails.length?('blank: '+fails.join(',')):'fill/wave/type/blurin lit'); }
+
+  // 14. drop shadow: a white square over white bg. With layer.shadow (black, blurred, offset down-right)
+  // a point in the shadow-only zone (outside the square, inside the offset+blurred silhouette) turns dark;
+  // without shadow the same point stays white. Also confirm the shadow is SOFT (a mid-grey feather band
+  // exists between full-dark shadow and white bg) and that the square itself is still drawn on top.
+  { const WHITE=mk(50,50,c=>{c.fillStyle='#ffffff';c.fillRect(0,0,50,50);});
+    const sqPx={x:60,y:60,w:50,h:50};                 // square screen x 60..110, y 60..110
+    const noSh=R([{id:'sq',type:'image',_src:WHITE,_px:sqPx,opacity:100}],{bgColor:'#ffffff'});
+    const sh  =R([{id:'sq',type:'image',_src:WHITE,_px:sqPx,opacity:100,shadow:{color:'#000000',blur:6,dx:20,dy:20,opacity:1}}],{bgColor:'#ffffff'});
+    // shadow-only sample: screen (122,122) — past the square (ends 110), inside the shifted shadow (80..130)
+    const ctrl=avg(noSh,122,122,2), shp=avg(sh,122,122,2);
+    const onTop=avg(sh,85,85,3);                       // the square (white) must still paint over its shadow
+    // a soft feather band somewhere around the blurred shadow edge (grey, not pure black/white)
+    let soft=false; for(let yy=126;yy<=134&&!soft;yy++){ const g=avg(sh,122,yy,1); if(g[0]>40&&g[0]<220) soft=true; }
+    T('drop_shadow', ctrl[0]>230 && shp[0]<150 && onTop[0]>200 && soft,
+      `ctrl(no-shadow)=${ctrl}(white) shadowPt=${shp}(dark) square=${onTop}(white) soft=${soft}`); }
+
+  // 15. outline: a red square over blue bg. With layer.outline (green, width 8) a point just past the
+  // square edge — inside the dilated silhouette ring — turns GREEN; without outline it stays blue bg.
+  // The square itself (red) must still paint ON TOP of its outline.
+  { const REDSQ=mk(50,50,c=>{c.fillStyle='#ff0000';c.fillRect(0,0,50,50);});
+    const sqPx={x:75,y:75,w:50,h:50};                  // square screen x 75..125, y 75..125
+    const noOl=R([{id:'os',type:'image',_src:REDSQ,_px:sqPx,opacity:100}],{bgColor:'#0000ff'});
+    const ol  =R([{id:'os',type:'image',_src:REDSQ,_px:sqPx,opacity:100,outline:{color:'#00ff00',width:8,opacity:1}}],{bgColor:'#0000ff'});
+    const ctrl=avg(noOl,129,100,1), olp=avg(ol,129,100,1);   // x=129: ~4px past the right edge (125) → inside the ring
+    const onTop=avg(ol,100,100,4);                     // square centre must still be red over the outline
+    T('outline', ctrl[2]>150&&ctrl[1]<90 && olp[1]>150&&olp[2]<120 && onTop[0]>150&&onTop[1]<90,
+      `ctrl(no-outline)=${ctrl}(blue) outlinePt=${olp}(green) square=${onTop}(red)`); }
+
+  // 16. gradient outline: red square over black, outline gradient green→blue left→right (angle 0).
+  // The ring on the LEFT edge is green (stop 0); on the RIGHT edge it's blue (stop 1).
+  { const REDSQ=mk(50,50,c=>{c.fillStyle='#ff0000';c.fillRect(0,0,50,50);});
+    const sqPx={x:75,y:75,w:50,h:50};                  // screen x 75..125
+    const g=R([{id:'gs',type:'image',_src:REDSQ,_px:sqPx,opacity:100,outline:{width:8,opacity:1,grad:true,colors:['#00ff00','#0000ff'],angle:0}}],{bgColor:'#000000'});
+    const left=avg(g,71,100,1), right=avg(g,129,100,1), mid=avg(g,100,100,3);
+    T('outline_gradient', left[1]>150&&left[0]<120&&left[2]<120 && right[2]>150&&right[0]<120 && mid[0]>150&&mid[1]<90,
+      `leftRing=${left}(green) rightRing=${right}(blue) square=${mid}(red)`); }
+
+  done({ ok:true, pass:results.filter(r=>r.pass).length, total:results.length, results });
+}catch(e){ done({ ok:false, err:(e&&e.message||String(e)).slice(0,500), results }); }
+</script></body></html>

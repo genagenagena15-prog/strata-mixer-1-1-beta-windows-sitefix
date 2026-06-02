@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8" /><title>chroma compile check</title></head>
+<body style="margin:0;background:#000">
+<canvas id="gl" width="64" height="64"></canvas>
+<script type="module">
+// Construct the real Compositor — this compiles+links EVERY program, including the
+// new progChroma (FS_CHROMA). If FS_CHROMA has a GLSL error, makeProgram throws and
+// we report it. Success here means the whole engine constructor (the DEFAULT preview
+// path) still builds with the chroma shader added.
+import { Compositor } from '/src/engine/compositor.js';
+function done(obj){ console.log('@@BENCH@@' + JSON.stringify(obj)); try { window.close(); } catch(e){} }
+try {
+  const comp = new Compositor(document.getElementById('gl'));
+  const ok = !!(comp && comp.progChroma && comp.progChroma.u);
+  // sanity: the uniforms the draw call sets must all resolve to locations
+  const need = ['uTex','uOpacity','uB','uC','uS','uH','uKey','uThresh','uSmooth','uRect','uFlip'];
+  const missing = need.filter(n => comp.progChroma.u[n] === undefined || comp.progChroma.u[n] === null);
+  done({ ok, hasChroma: !!comp.progChroma, missingUniforms: missing });
+} catch (e) {
+  done({ ok:false, err: (e && e.message || String(e)).slice(0, 600) });
+}
+</script></body></html>

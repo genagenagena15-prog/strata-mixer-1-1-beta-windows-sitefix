@@ -10,7 +10,7 @@ import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
 import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
 
-const APP_VERSION = 'v1.3.5';
+const APP_VERSION = 'v1.3.7';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
 // crisp still). 0.5 → ¼ the pixels → ~4× cheaper compositing, no audio glitch.
 const PREVIEW_SCALE = 0.5;
@@ -436,6 +436,48 @@ const formatAspect = (settings) => {
   return '1080 / 1920';
 };
 
+// App-level "выйти?" confirm. Mounted at the top level (works on ANY tab) — unlike the editor save
+// prompt, which only exists in the Editor view. Main asks via 'app:exit-confirm-request', we reply
+// 'exit' | 'cancel'. Styled with the shared .sm-prompt-* classes.
+function ExitConfirm() {
+  const [st, setSt] = useState(null);   // {message, detail} when shown, null when hidden
+  useEffect(() => {
+    if (!window.strata?.onExitConfirmRequest) return;
+    return window.strata.onExitConfirmRequest((p) => setSt(p || { message: 'Выйти из Strata Mixer?' }));
+  }, []);
+  const answer = (choice) => { setSt(null); try { window.strata?.exitConfirmResponse?.(choice); } catch {} };
+  useEffect(() => {
+    if (!st) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); answer('cancel'); }
+      else if (e.key === 'Enter') { e.preventDefault(); answer('exit'); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [st]);
+  if (!st) return null;
+  return createPortal(
+    <div className="sm-prompt-back" onClick={(e) => { if (e.target === e.currentTarget) answer('cancel'); }}>
+      <div className="sm-prompt-modal" role="dialog" aria-modal="true">
+        <div className="sm-prompt-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+          </svg>
+        </div>
+        <div className="sm-prompt-body">
+          <h2 className="sm-prompt-title">{st.message || 'Выйти из Strata Mixer?'}</h2>
+          {st.detail && <p className="sm-prompt-detail">{st.detail}</p>}
+        </div>
+        <div className="sm-prompt-actions">
+          <button className="sm-prompt-btn sm-prompt-btn-ghost" onClick={() => answer('cancel')}>Отмена</button>
+          <button className="sm-prompt-btn sm-prompt-btn-primary" onClick={() => answer('exit')} autoFocus>Выйти</button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 function App() {
   const [active, setActive] = useState('home');
   const [files, setFiles] = useState([]);
@@ -596,6 +638,7 @@ function App() {
   return (
     <>
       <Titlebar theme={theme} onToggleTheme={toggleTheme} />
+      <ExitConfirm />
       <WindowProgressBorder progress={progress} />
       <div className={`app-shell${active === 'editor' && sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
         <aside className="sidebar">
@@ -1984,8 +2027,8 @@ function Editor({ state, setState }) {
   // The engine reads layer.shadow / layer.glow directly (no plumbing needed).
   const renderLayerFx = (l) => {
     if (!l) return null;
-    const sh = l.shadow, gl = l.glow;
-    const shOn = !!sh, glOn = !!gl;
+    const sh = l.shadow, gl = l.glow, ol = l.outline;
+    const shOn = !!sh, glOn = !!gl, olOn = !!ol;
     return (
       <div className="ed-prop-block ed-prop-sel">
         <div className="ed-prop-head">✨ Эффекты слоя</div>
@@ -2037,6 +2080,68 @@ function Editor({ state, setState }) {
               onChange={v => updLayerFx(l.id, 'glow', 'blur', v)} />
             <Slider label="Непрозрачность, %" value={Math.round((gl.opacity != null ? +gl.opacity : 0.8) * 100)}
               min="0" max="100" onChange={v => updLayerFx(l.id, 'glow', 'opacity', v / 100)} />
+          </>
+        )}
+
+        {/* Обводка (контур по силуэту слоя). У текста своя обводка отдельным блоком — здесь скрыта. */}
+        {l.type !== 'text' && (
+          <>
+            <div className="ed-prop-row">
+              <span className="ed-prop-label">Обводка</span>
+              <select className="ed-font-sel" value={olOn ? 'on' : 'off'}
+                onChange={e => toggleLayerFx(l.id, 'outline', e.target.value === 'on')}>
+                <option value="on">Есть</option>
+                <option value="off">Нет</option>
+              </select>
+            </div>
+            {olOn && (
+              <>
+                <div className="ed-prop-row">
+                  <span className="ed-prop-label">Заливка</span>
+                  <select className="ed-font-sel" value={ol.grad ? 'grad' : 'solid'}
+                    onChange={e => setOutlineGrad(l.id, e.target.value === 'grad')}>
+                    <option value="solid">Цвет</option>
+                    <option value="grad">Градиент</option>
+                  </select>
+                </div>
+                {!ol.grad && (
+                  <div className="ed-prop-row">
+                    <span className="ed-prop-label">Цвет обводки</span>
+                    <input type="color" className="ed-color-inp" value={ol.color || '#000000'}
+                      onChange={e => updLayerFx(l.id, 'outline', 'color', e.target.value)} />
+                  </div>
+                )}
+                {ol.grad && (
+                  <>
+                    <div className="ed-prop-row ed-grad-row">
+                      <span className="ed-prop-label">Цвета ({(ol.colors || []).length}/4)</span>
+                      <div className="ed-grad-colors">
+                        {(ol.colors || []).map((c, i) => (
+                          <span key={i} className="ed-grad-swatch">
+                            <input type="color" className="ed-color-inp" value={c}
+                              onChange={e => updOutlineColor(l.id, i, e.target.value)} />
+                            {(ol.colors || []).length > 2 && (
+                              <button type="button" className="ed-grad-rm" title="Убрать цвет"
+                                onClick={() => removeOutlineColor(l.id, i)}>×</button>
+                            )}
+                          </span>
+                        ))}
+                        {(ol.colors || []).length < 4 && (
+                          <button type="button" className="ed-grad-add" title="Добавить цвет"
+                            onClick={() => addOutlineColor(l.id)}>＋</button>
+                        )}
+                      </div>
+                    </div>
+                    <Slider label="Угол, °" value={Math.round(+ol.angle || 0)} min="0" max="360"
+                      onChange={v => updLayerFx(l.id, 'outline', 'angle', v)} />
+                  </>
+                )}
+                <Slider label="Толщина, px" value={Math.round(+ol.width || 0)} min="1" max="40"
+                  onChange={v => updLayerFx(l.id, 'outline', 'width', v)} />
+                <Slider label="Непрозрачность, %" value={Math.round((ol.opacity != null ? +ol.opacity : 1) * 100)}
+                  min="0" max="100" onChange={v => updLayerFx(l.id, 'outline', 'opacity', v / 100)} />
+              </>
+            )}
           </>
         )}
       </div>
@@ -4622,12 +4727,14 @@ function Editor({ state, setState }) {
     setChromaPickId(p => (p === id ? null : p));
     set('layers', ls => ls.map(x => { if (x.id !== id) return x; const { chromaKey, ...rest } = x; return rest; }));
   };
-  // Layer FX (Photoshop-style drop shadow / outer glow) — the engine reads
-  // layer.shadow = {color, blur, dx, dy, opacity} and layer.glow = {color, blur,
-  // dx:0, dy:0, opacity} as-is (compositor._shadowParams). `kind` = 'shadow' | 'glow'.
+  // Layer FX (Photoshop-style drop shadow / outer glow / outline) — the engine reads
+  // layer.shadow = {color, blur, dx, dy, opacity}, layer.glow = {color, blur, dx:0, dy:0, opacity}
+  // and layer.outline = {color, width, opacity} as-is (compositor._shadowParams/_outlineParams).
+  // `kind` = 'shadow' | 'glow' | 'outline'.
   const LAYER_FX_DEFAULTS = {
-    shadow: { color: '#000000', blur: 8, dx: 4, dy: 4, opacity: 0.5 },
-    glow:   { color: '#ffffff', blur: 14, dx: 0, dy: 0, opacity: 0.8 },
+    shadow:  { color: '#000000', blur: 8, dx: 4, dy: 4, opacity: 0.5 },
+    glow:    { color: '#ffffff', blur: 14, dx: 0, dy: 0, opacity: 0.8 },
+    outline: { color: '#000000', width: 6, opacity: 1 },
   };
   const updLayerFx = (id, kind, key, val) => set('layers', ls => ls.map(x => x.id === id
     ? { ...x, [kind]: { ...LAYER_FX_DEFAULTS[kind], ...(x[kind] || {}), [key]: val } } : x));
@@ -4637,6 +4744,28 @@ function Editor({ state, setState }) {
     if (x.id !== id) return x;
     if (on) return { ...x, [kind]: { ...LAYER_FX_DEFAULTS[kind] } };
     const { [kind]: _drop, ...rest } = x; return rest;
+  }));
+  // Outline gradient (kind='outline'): grad on → seed 2 stops from the current solid colour; the
+  // colours list is editable 2..4 (engine paints a linear gradient at `angle` across the layer box).
+  const setOutlineGrad = (id, on) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    const ol = { ...LAYER_FX_DEFAULTS.outline, ...(x.outline || {}) };
+    if (on && (!Array.isArray(ol.colors) || ol.colors.length < 2)) ol.colors = [ol.color || '#000000', '#ffffff'];
+    ol.grad = on;
+    return { ...x, outline: ol };
+  }));
+  const updOutlineColor = (id, i, val) => set('layers', ls => ls.map(x => x.id === id
+    ? { ...x, outline: { ...x.outline, colors: (x.outline.colors || []).map((c, j) => j === i ? val : c) } } : x));
+  const addOutlineColor = (id) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    const cs = [...(x.outline.colors || [])]; if (cs.length >= 4) return x;
+    cs.push(cs[cs.length - 1] || '#ffffff');
+    return { ...x, outline: { ...x.outline, colors: cs } };
+  }));
+  const removeOutlineColor = (id, i) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    const cs = (x.outline.colors || []).filter((_, j) => j !== i); if (cs.length < 2) return x;
+    return { ...x, outline: { ...x.outline, colors: cs } };
   }));
   // Eyedropper: a click on the preview while picking → sample the layer video's
   // colour at that point and store it as the key. Renderer readback works in dev
@@ -6684,6 +6813,11 @@ function Editor({ state, setState }) {
                         left:`${b.x/outWidth*100}%`, top:`${b.y/outHeight*100}%`,
                         width:`${b.w/outWidth*100}%`, height:`${b.h/outHeight*100}%`,
                         cursor: isTextEditing ? 'text' : 'move', userSelect:'none', touchAction:'none', background:'transparent',
+                        // Lift the SELECTED layer's box above the GL/2d canvas (zIndex 1–3) so its
+                        // dashed border + resize/rotate handles are visible OVER the video — the
+                        // engine canvas (z-1) otherwise paints on top of these z-auto handles and
+                        // they only showed in the empty gray surround (esp. obvious once rotated).
+                        zIndex: isSel ? 9 : undefined,
                         transform: layer.angle ? `rotate(${layer.angle}deg)` : undefined, transformOrigin:'center center',
                         border: isSel ? '1px dashed rgba(255,255,255,.85)' : undefined,
                         boxShadow: isSel ? '0 0 0 1px rgba(0,0,0,.55)' : undefined }}>
@@ -6770,7 +6904,7 @@ function Editor({ state, setState }) {
                       title="Двойной клик → редактировать текст прямо здесь"
                       style={{ position:'absolute',
                         left:`${cx - boxW/2}%`, top:`${cy - boxHpct/2}%`,
-                        width:`${boxW}%`, height:`${boxHpct}%`,
+                        width:`${boxW}%`, height:`${boxHpct}%`, zIndex:9,
                         cursor: subEdit ? 'text' : 'move', touchAction:'none', userSelect:'none' }}>
                       {!subEdit && ['e','w'].map(h =>
                         <div key={h} className={`preview-rh preview-rh-${h}`}
@@ -7521,7 +7655,7 @@ function Editor({ state, setState }) {
             </button>
             <button className="etl-add-btn" onClick={splitAtPlayhead} title="Разрезать клип под курсором по позиции воспроизведения (Ctrl+Shift+D)">✂ Разрезать</button>
             <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+клик по клипам на таймлайне для мультивыбора)">⛓ Объединить</button>
-            <button className={`etl-add-btn${volEnvMode ? ' etl-add-btn-on' : ''}`} onClick={() => setVolEnvMode(v => !v)} title="Уровень звука по секундам: на видео/аудио-клипах появится дорожка звука с линией — кликни чтобы поставить точку, тяни вниз чтобы тише. Применяется и в превью, и в рендере."><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><path fill="currentColor" d="M11 5 6 9H3v6h3l5 4V5z"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M15.5 8.5a5 5 0 0 1 0 7"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M18.5 6a8 8 0 0 1 0 12"/></svg>Уровень звука</button>
+            <button className={`etl-add-btn${volEnvMode ? ' etl-add-btn-on' : ''}`} onClick={() => setVolEnvMode(v => !v)} title="Уровень звука по секундам: на видео/аудио-клипах появится дорожка звука с линией — кликни чтобы поставить точку, тяни вниз чтобы тише."><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><path fill="currentColor" d="M11 5 6 9H3v6h3l5 4V5z"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M15.5 8.5a5 5 0 0 1 0 7"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M18.5 6a8 8 0 0 1 0 12"/></svg>Уровень звука</button>
             <div style={{flex:1}} />
             <div className="ed-zoom">
               <span className="ed-zoom-lbl">Масштаб</span>
