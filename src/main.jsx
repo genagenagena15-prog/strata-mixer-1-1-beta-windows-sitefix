@@ -4021,12 +4021,21 @@ function Editor({ state, setState }) {
           exportSources.set(id, vs);
         } catch (e) { console.error('[engine-export] VideoSource init failed for', id, e); }
       }));
+      // Per-frame buildEngineFrame reuse (GC hot-path): the old adapter rebuilt a full frame object
+      // (≈8 closures) on EVERY getSource/getTextDraw/getCC call → (Nvideo+Ntext+Ncc) rebuilds per
+      // frame × thousands of frames = heavy short-lived garbage during export. Collapse it: getCC
+      // depends only on the layer's colour props (NOT on time) → build its frame ONCE; getSource &
+      // getTextDraw share the frame's single `t` (exportRender passes the same t to both) → memoise on
+      // the last t, so one rebuild per frame. Pixel-identical (same buildEngineFrame results, reused).
+      let _efT, _efFrame = null;
+      const efAt = (t) => { if (_efFrame === null || t !== _efT) { _efT = t; _efFrame = buildEngineFrame(t, true); } return _efFrame; };
+      const ccFrame = buildEngineFrame(0, true);
       const spec = {
         W: outWidth, H: outHeight, fps, durationSec, bgColor, videoStart, videoEnd, layers,
         getPx: getLayerPx,
-        getSource: (l, t) => buildEngineFrame(t, true).getSource(l),
-        getTextDraw: (l, t) => buildEngineFrame(t, true).getTextDraw(l),
-        getCC: (l) => buildEngineFrame(0, true).getCC(l),
+        getSource: (l, t) => efAt(t).getSource(l),
+        getTextDraw: (l, t) => efAt(t).getTextDraw(l),
+        getCC: (l) => ccFrame.getCC(l),
         onProgress: (done, total) => setPct(Math.round(done / total * 100)),
       };
       await renderExportFrames(spec, async (rgba) => { await window.strata.engineExportFrame(rgba.buffer); });
