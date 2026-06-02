@@ -588,6 +588,34 @@ export class Compositor {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
+  // Separable gaussian (two FS_GAUSS passes) — the shared inner loop of every blur in this file
+  // (`_blur`, `_drawLayerShadow`, `_compositeSnapshot`). H pass: srcTex → midFbo (uStep = 1/bw, 0);
+  // V pass: midTex → dstFbo (uStep = 0, 1/bh). `radius` is derived from `sigma` identically to all
+  // three former call sites (min(180, ceil(sigma*3))). The caller owns: resizing the scratch FBOs,
+  // deciding whether to blur at all (the blur-strength threshold), and what to do before/after.
+  // Leaves progGauss bound, dstFbo bound, and midTex bound to TEXTURE0 (matches the old inline code).
+  _gaussBlur(srcTex, midFbo, midTex, dstFbo, sigma, bw, bh) {
+    const gl = this.gl;
+    const radius = Math.min(180, Math.ceil(sigma * 3));
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.progGauss); gl.bindVertexArray(this.quad);
+    gl.uniform1f(this.progGauss.u.uSigma, sigma);
+    gl.uniform1i(this.progGauss.u.uRadius, radius);
+    gl.uniform4f(this.progGauss.u.uRect, -1, -1, 1, 1);
+    gl.uniform1i(this.progGauss.u.uFlip, 0);
+    // H pass: srcTex → midFbo
+    gl.bindFramebuffer(gl.FRAMEBUFFER, midFbo); gl.viewport(0, 0, bw, bh);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.uniform1i(this.progGauss.u.uTex, 0);
+    gl.uniform2f(this.progGauss.u.uStep, 1 / bw, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // V pass: midTex → dstFbo
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
+    gl.bindTexture(gl.TEXTURE_2D, midTex);
+    gl.uniform2f(this.progGauss.u.uStep, 0, 1 / bh);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
   // Blur layer: gaussian-blur everything below it (the accumulated scene), clipped to the
   // blur rect. Mirrors renderFrameRef ≈4817 (capture region + filter:blur + clip). Separable
   // gaussian over the whole frame (CLAMP_TO_EDGE = same edge behaviour), then the blur rect is
@@ -596,28 +624,10 @@ export class Compositor {
     const gl = this.gl;
     const S = bw / frame.W;
     const strength = Math.max(1, layer.strength || 10);
-    const sigma = Math.max(0.5, strength * S);
-    const radius = Math.min(180, Math.ceil(sigma * 3));
+    const sigma = Math.max(0.5, strength * S);   // radius derived inside _gaussBlur
     this.scratchA.resize(bw, bh); this.scratchB.resize(bw, bh);
-    gl.disable(gl.BLEND);
-    gl.useProgram(this.progGauss);
-    gl.bindVertexArray(this.quad);
-    gl.uniform1f(this.progGauss.u.uSigma, sigma);
-    gl.uniform1i(this.progGauss.u.uRadius, radius);
-    gl.uniform4f(this.progGauss.u.uRect, -1, -1, 1, 1);
-    gl.uniform1i(this.progGauss.u.uFlip, 0);
-    // H pass: scene → scratchA
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchA.fbo);
-    gl.viewport(0, 0, bw, bh);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scene.tex);
-    gl.uniform1i(this.progGauss.u.uTex, 0);
-    gl.uniform2f(this.progGauss.u.uStep, 1 / bw, 0);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    // V pass: scratchA → scratchB
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchB.fbo);
-    gl.bindTexture(gl.TEXTURE_2D, this.scratchA.tex);
-    gl.uniform2f(this.progGauss.u.uStep, 0, 1 / bh);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // separable gaussian: scene → scratchA (H) → scratchB (V)
+    this._gaussBlur(this.scene.tex, this.scratchA.fbo, this.scratchA.tex, this.scratchB.fbo, sigma, bw, bh);
     // composite blurred rect back into scene (replace inside rect)
     const b = frame.getPx(layer);
     if (!b || b.w <= 0 || b.h <= 0) return;
@@ -801,24 +811,8 @@ export class Compositor {
     // 2. separable gaussian over scratchB by `blur` px (skip when negligible → crisp offset shadow)
     const sigma = Math.max(0.5, (fx.blur || 0) * S);
     if ((fx.blur || 0) * S > 0.5) {
-      const radius = Math.min(180, Math.ceil(sigma * 3));
-      gl.disable(gl.BLEND);
-      gl.useProgram(this.progGauss); gl.bindVertexArray(this.quad);
-      gl.uniform1f(this.progGauss.u.uSigma, sigma);
-      gl.uniform1i(this.progGauss.u.uRadius, radius);
-      gl.uniform4f(this.progGauss.u.uRect, -1, -1, 1, 1);
-      gl.uniform1i(this.progGauss.u.uFlip, 0);
-      // H: scratchB → scratchC
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchC.fbo); gl.viewport(0, 0, bw, bh);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchB.tex);
-      gl.uniform1i(this.progGauss.u.uTex, 0);
-      gl.uniform2f(this.progGauss.u.uStep, 1 / bw, 0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      // V: scratchC → scratchB
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchB.fbo);
-      gl.bindTexture(gl.TEXTURE_2D, this.scratchC.tex);
-      gl.uniform2f(this.progGauss.u.uStep, 0, 1 / bh);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      // scratchB → scratchC (H) → scratchB (V)
+      this._gaussBlur(this.scratchB.tex, this.scratchC.fbo, this.scratchC.tex, this.scratchB.fbo, sigma, bw, bh);
     }
 
     // 3. tint + offset + composite scratchB → scene
@@ -936,22 +930,7 @@ export class Compositor {
     // 2. optional dest-space gaussian (scratchB → scratchC → scratchB)
     if (blurPx > 0.5) {
       const sigma = Math.max(0.5, blurPx * (bw / frame.W));
-      const radius = Math.min(180, Math.ceil(sigma * 3));
-      gl.disable(gl.BLEND);
-      gl.useProgram(this.progGauss); gl.bindVertexArray(this.quad);
-      gl.uniform1f(this.progGauss.u.uSigma, sigma);
-      gl.uniform1i(this.progGauss.u.uRadius, radius);
-      gl.uniform4f(this.progGauss.u.uRect, -1, -1, 1, 1);
-      gl.uniform1i(this.progGauss.u.uFlip, 0);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchC.fbo); gl.viewport(0, 0, bw, bh);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchB.tex);
-      gl.uniform1i(this.progGauss.u.uTex, 0);
-      gl.uniform2f(this.progGauss.u.uStep, 1 / bw, 0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.scratchB.fbo);
-      gl.bindTexture(gl.TEXTURE_2D, this.scratchC.tex);
-      gl.uniform2f(this.progGauss.u.uStep, 0, 1 / bh);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      this._gaussBlur(this.scratchB.tex, this.scratchC.fbo, this.scratchC.tex, this.scratchB.fbo, sigma, bw, bh);
     }
     // 3. composite scratchB → scene
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo); gl.viewport(0, 0, bw, bh);

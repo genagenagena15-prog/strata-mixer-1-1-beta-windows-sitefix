@@ -8,7 +8,7 @@ import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
-import { TEXT_STYLES, TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
+import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.3.5';
 // Preview backing-resolution scale while PLAYING (full res when paused for a
@@ -165,9 +165,6 @@ const SUB_EFFECTS = [
 // no-animation option remains until the pack's anims land. The SUB_ANIM timing
 // consts below are kept (referenced by now-dead render branches that no-op when
 // anim==='none') and get physically removed when the pack replaces that code.
-const SUB_ANIMS = [
-  { id: 'none', name: 'Без анимации' },
-];
 const SUB_ANIM = {
   // slideup: rise OFFSET px from below + fade, over MS (reveal as spoken)
   SLIDE_MS: 160, SLIDE_OFFSET: 32, SLIDE_FADE_MS: 110,
@@ -2117,7 +2114,6 @@ function Editor({ state, setState }) {
   const [hotkeysOpen, setHotkeysOpen] = useState(false);
   // Оформление (styling) is shown by default now; the text+timings list is the
   // collapsible instead (tucked at the bottom under "Текст и тайминги").
-  const [subStyleOpen, setSubStyleOpen] = useState(true);
   const [subSegOpen, setSubSegOpen] = useState(false);
   // Double-click a subtitle (timeline/preview) → open + scroll to that segment.
   const subSegRefs = useRef({});
@@ -2852,18 +2848,6 @@ function Editor({ state, setState }) {
     }
     return best;
   }
-  // Map a 0-100 strength to the kind-specific visual params. Linearly
-  // interpolates between the old low (s=0) and high (s=100) preset values.
-  // - shake:   camera shake + white flash
-  // - whippan: fast horizontal motion-blur sweep
-  // - zoom:    quick zoom punch with blur (up to 3× scale)
-  // - blur:    burst of gaussian blur that resolves
-  // Old transition kinds REMOVED (pivoting to the GPU effects pack). No params
-  // until the pack's transitions land — returns {} so callers stay safe.
-  function transitionParams() {
-    return {};
-  }
-
   function addTransition(kind, strength = 50) {
     // Strength = 0-100 → visual intensity (amp / blur / shift / scale).
     // Duration is fixed at 0.4 s; the user stretches the clip on the
@@ -2871,14 +2855,12 @@ function Editor({ state, setState }) {
     const k = kind || 'none';
     const numStrength = Math.max(0, Math.min(100, Number(strength) || 50));
     const duration = 0.4;
-    const params = transitionParams(k, numStrength);
     const cx = Math.max(0, Math.min(dur, currentTime));   // centre the effect on the playhead
     const half = duration / 2;
     const ls = Math.max(0, Math.min(dur - duration, cx - half));
     addLayer({
       id: uid(), type: 'transition', kind: k, strength: numStrength,
       startTime: ls, endTime: ls + duration,
-      ...params,
     });
   }
   function addMaskRegion() {
@@ -7057,9 +7039,8 @@ function Editor({ state, setState }) {
               ? sel.strength
               : (sel.strength === 'low' ? 25 : sel.strength === 'high' ? 80 : 50);
             const applyStrength = (v) => {
-              const params = transitionParams(sel.kind || 'none', v);
               set('layers', ls => ls.map(x => x.id === sel.id
-                ? { ...x, strength: Number(v), ...params }
+                ? { ...x, strength: Number(v) }
                 : x));
             };
             return (

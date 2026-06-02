@@ -2,6 +2,7 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu, Tray, nativeImage, scr
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const archiver = require('archiver');
 const extractZip = require('extract-zip');
@@ -17,6 +18,21 @@ function volumeCurve(percent) {
   if (v <= 1) return v;
   return v * v * v;
 }
+
+// ffmpeg atempo only accepts 0.5..2.0 — chain factors to reach any speed.
+// Produces the exact same comma-joined string the inlined loops did (same
+// .toFixed(4), same order). Caller clamps the speed before passing it in.
+function atempoChain(speed) {
+  const at = [];
+  let r = speed;
+  while (r > 2) { at.push('atempo=2.0'); r /= 2; }
+  while (r < 0.5) { at.push('atempo=0.5'); r *= 2; }
+  at.push('atempo=' + r.toFixed(4));
+  return at.join(',');
+}
+
+// Master loudness normalisation appended to the final audio mix (−16 LUFS).
+const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
 
 let mainWindow = null;
 let splashWindow = null;
@@ -1100,8 +1116,7 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
     const te = Math.max(ts + 0.01, Number(s.trimEnd) || (ts + 1));
     const delay = Math.max(0, Math.round(Number(s.delayMs) || 0));
     const vol = volumeCurve(s.volume != null ? Number(s.volume) : 100).toFixed(4);
-    const at = []; let r = sp; while (r > 2) { at.push('atempo=2.0'); r /= 2; } while (r < 0.5) { at.push('atempo=0.5'); r *= 2; } at.push(`atempo=${r.toFixed(4)}`);
-    const tempo = (Math.abs(sp - 1) > 1e-3) ? (',' + at.join(',')) : '';
+    const tempo = (Math.abs(sp - 1) > 1e-3) ? (',' + atempoChain(sp)) : '';
     // Volume automation (keyframe envelope) → applied AFTER adelay where stream t == timeline t.
     const envExpr = buildVolEnvExpr(s.volKeys, delay / 1000);
     const envFilt = envExpr ? `,volume='${envExpr}':eval=frame` : '';
@@ -1111,7 +1126,6 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
   });
   const hasAudio = mix.length > 0;
   if (hasAudio) {
-    const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
     if (mix.length === 1) filter.push(`${mix[0]}${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
     else filter.push(`${mix.join('')}amix=inputs=${mix.length}:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
     args.push('-filter_complex', filter.join(';'));
@@ -1662,7 +1676,6 @@ ipcMain.handle('editor:makeProxy', async (event, payload) => {
 
   // Stable cache key based on file path so multiple layers reusing the same
   // source share one proxy, and re-opening the project reuses it too.
-  const crypto = require('crypto');
   const hash = crypto.createHash('md5').update(file).digest('hex').slice(0, 12);
   const tmpDir = path.join(app.getPath('temp'), 'strata-proxy');
   try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
@@ -1736,19 +1749,16 @@ ipcMain.handle('editor:concatClips', async (event, payload) => {
     const hasAud = !!probes[i]?.hasAudio;
 
     // Build atempo chain (atempo only accepts 0.5..2.0, chain if needed).
-    let r = speed; const atempos = [];
-    while (r > 2) { atempos.push('atempo=2.0'); r /= 2; }
-    while (r < 0.5) { atempos.push('atempo=0.5'); r *= 2; }
-    atempos.push(`atempo=${r.toFixed(4)}`);
+    const atempoStr = atempoChain(speed);
 
     if (isAudio) {
-      filterParts.push(`[${i}:a]atrim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempos.join(',')}[a${i}]`);
+      filterParts.push(`[${i}:a]atrim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempoStr}[a${i}]`);
       outPairs.push(`[a${i}]`);
     } else {
       // Normalise video to target canvas: trim, retime, scale-fit + pad, format.
       filterParts.push(`[${i}:v]trim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},setpts=(PTS-STARTPTS)/${speed.toFixed(4)},scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(${w}-iw)/2:(${h}-ih)/2,setsar=1,format=yuv420p[v${i}]`);
       if (hasAud) {
-        filterParts.push(`[${i}:a]atrim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempos.join(',')}[a${i}]`);
+        filterParts.push(`[${i}:a]atrim=start=${srcStart.toFixed(3)}:end=${srcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempoStr}[a${i}]`);
       } else {
         // Generate silent track of the right output duration.
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${len.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`);
@@ -2480,11 +2490,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         // applied in the editor are honoured here too (same fix as video).
         const mvAtSrc = (Number(mvLayer.srcStart) || 0).toFixed(3);
         const mvAtSrcEnd = ((Number(mvLayer.srcStart) || 0) + Math.max(0.01, videoEnd - videoStart) * mvSp).toFixed(3);
-        let atParts = [], atRem = mvSp;
-        while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
-        while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
-        atParts.push(`atempo=${atRem.toFixed(4)}`);
-        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${Math.round(videoStart*1000)}:all=1,volume=${volumeCurve(mvVol).toFixed(4)}[auMain]`);
+        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atempoChain(mvSp)},adelay=${Math.round(videoStart*1000)}:all=1,volume=${volumeCurve(mvVol).toFixed(4)}[auMain]`);
       } else {
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
       }
@@ -2509,14 +2515,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           mixInputs.push(`[auVov${i}]`);
           return;
         }
-        let atParts = [], atRem = oSp;
-        while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
-        while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
-        atParts.push(`atempo=${atRem.toFixed(4)}`);
         const oEnv = buildVolEnvExpr(layer.volKeys, oDelay / 1000);
         const oEnvF = oEnv ? `,volume='${oEnv}':eval=frame` : '';
         const oBaseVol = oEnv ? '1' : oVol.toFixed(4);   // envelope present → sole level (ignore base)
-        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${oDelay}:all=1,volume=${oBaseVol}${oEnvF}[auVov${i}]`);
+        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atempoChain(oSp)},adelay=${oDelay}:all=1,volume=${oBaseVol}${oEnvF}[auVov${i}]`);
         mixInputs.push(`[auVov${i}]`);
       });
       audioLayers.forEach((layer, i) => {
@@ -2545,7 +2547,6 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       // sources (voice files at -40 dB, etc.) come out at a consistent loud
       // level in every export, instead of sounding noticeably quieter than
       // the rest of the project. Single-pass mode — fast enough for export.
-      const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
       if (mixInputs.length === 1) {
         filterParts.push(`[auMain]${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
       } else {
@@ -2743,12 +2744,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const clipDur = Math.max(0.01, videoEnd - videoStart);
     const mvSrcEnd = mvSrc + clipDur * mvSp;
     const delayMs = Math.round(videoStart * 1000);
-    const atParts = [];
-    let atRem = mvSp;
-    while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
-    while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
-    atParts.push(`atempo=${atRem.toFixed(4)}`);
-    filterParts.push(`[0:a]atrim=${mvSrc.toFixed(3)}:${mvSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${delayMs}:all=1[auMain]`);
+    filterParts.push(`[0:a]atrim=${mvSrc.toFixed(3)}:${mvSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempoChain(mvSp)},adelay=${delayMs}:all=1[auMain]`);
     mixInputs.push('[auMain]');
   }
 
@@ -2767,12 +2763,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const oSrc = Number(l.srcStart || 0);
     const oSp = Math.max(0.1, (l.speed || 100) / 100);
     const delayMs = Math.round(oStart * 1000);
-    const atParts = [];
-    let atRem = oSp;
-    while (atRem > 2) { atParts.push('atempo=2.0'); atRem /= 2; }
-    while (atRem < 0.5) { atParts.push('atempo=0.5'); atRem *= 2; }
-    atParts.push(`atempo=${atRem.toFixed(4)}`);
-    filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atParts.join(',')},adelay=${delayMs}:all=1[auV${i}]`);
+    filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atempoChain(oSp)},adelay=${delayMs}:all=1[auV${i}]`);
     mixInputs.push(`[auV${i}]`);
   });
 
