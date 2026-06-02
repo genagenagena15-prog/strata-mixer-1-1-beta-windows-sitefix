@@ -34,6 +34,33 @@ function atempoChain(speed) {
 // Master loudness normalisation appended to the final audio mix (−16 LUFS).
 const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
 
+// ── Shared audio-filtergraph builders ──────────────────────────────────────────────────────
+// Three paths build essentially the same per-source audio sub-chain + final mix: engine
+// export (engine:export-begin), the main ffmpeg export (video:edit) and the transcription
+// extractor (extractMixedAudioForTranscription). They differ only in POLICY (raw % vs
+// volumeCurve vs no volume; loudnorm or not; first_pts or not) — so the policy fragments stay
+// at each call site and only the comma-sensitive SKELETON is shared here. Output is byte-
+// identical to the former inline strings (regression-checked by proto/audio-graph-test.mjs).
+
+// One source clip → trim to its source window, reset PTS, optional tempo, delay to the timeline
+// position, optional base volume + keyframe envelope. tempo/vol/env are PRE-FORMATTED fragments,
+// each already carrying its own leading comma ('' when unused).
+function audioClipChain(idx, trimStart, trimEnd, delayMs, label, opts) {
+  const o = opts || {}, tempo = o.tempo || '', vol = o.vol || '', env = o.env || '';
+  return `[${idx}:a]atrim=${trimStart.toFixed(3)}:${trimEnd.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delayMs}:all=1${vol}${env}[${label}]`;
+}
+
+// Final mix tail → amix N sources (or pass one through), optional loudnorm, then aresample to
+// absorb atrim/atempo/adelay PTS drift. loudnorm/firstPts default ON (the export paths); the
+// transcription path passes both false.
+function finalAudioMix(mixInputs, label, opts) {
+  const o = opts || {};
+  const ln = (o.loudnorm === false) ? '' : `${LOUDNORM},`;
+  const ar = (o.firstPts === false) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0';
+  if (mixInputs.length === 1) return `${mixInputs[0]}${ln}${ar}[${label}]`;
+  return `${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,${ln}${ar}[${label}]`;
+}
+
 let mainWindow = null;
 let splashWindow = null;
 let splashShownAt = 0;
@@ -1121,13 +1148,12 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
     const envExpr = buildVolEnvExpr(s.volKeys, delay / 1000);
     const envFilt = envExpr ? `,volume='${envExpr}':eval=frame` : '';
     const baseVol = envExpr ? '1' : vol;   // envelope present → it's the SOLE level (ignore base «Громкость %»)
-    filter.push(`[${i + 1}:a]atrim=${ts.toFixed(3)}:${te.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delay}:all=1,volume=${baseVol}${envFilt}[au${i}]`);
+    filter.push(audioClipChain(i + 1, ts, te, delay, `au${i}`, { tempo, vol: `,volume=${baseVol}`, env: envFilt }));
     mix.push(`[au${i}]`);
   });
   const hasAudio = mix.length > 0;
   if (hasAudio) {
-    if (mix.length === 1) filter.push(`${mix[0]}${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
-    else filter.push(`${mix.join('')}amix=inputs=${mix.length}:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+    filter.push(finalAudioMix(mix, 'auFinal'));
     args.push('-filter_complex', filter.join(';'));
   }
   args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p');
@@ -2482,15 +2508,15 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const baSrcEnd = baSrcStart + baLen;
         const baDelayMs = Math.round((Number(baseAud.startTime) || 0) * 1000);
         const baVol = volumeCurve(Number(baseAud.volume) || 100).toFixed(4);
-        filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}:all=1,volume=${baVol}[auMain]`);
+        filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auMain', { vol: `,volume=${baVol}` }));
       } else if (mvLayer && baseHasAudio && !mvMuted) {
         // [0:a] is the main video's audio — only safe to use as the base mix
         // when there IS a mainVideo (input [0] is conceptually the timeline
         // base). Trim from mvLayer.srcStart for the clip duration so head-trims
         // applied in the editor are honoured here too (same fix as video).
-        const mvAtSrc = (Number(mvLayer.srcStart) || 0).toFixed(3);
-        const mvAtSrcEnd = ((Number(mvLayer.srcStart) || 0) + Math.max(0.01, videoEnd - videoStart) * mvSp).toFixed(3);
-        filterParts.push(`[0:a]atrim=${mvAtSrc}:${mvAtSrcEnd},asetpts=PTS-STARTPTS,${atempoChain(mvSp)},adelay=${Math.round(videoStart*1000)}:all=1,volume=${volumeCurve(mvVol).toFixed(4)}[auMain]`);
+        const mvAtSrc = (Number(mvLayer.srcStart) || 0);
+        const mvAtSrcEnd = mvAtSrc + Math.max(0.01, videoEnd - videoStart) * mvSp;
+        filterParts.push(audioClipChain(0, mvAtSrc, mvAtSrcEnd, Math.round(videoStart * 1000), 'auMain', { tempo: ',' + atempoChain(mvSp), vol: `,volume=${volumeCurve(mvVol).toFixed(4)}` }));
       } else {
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
       }
@@ -2518,7 +2544,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const oEnv = buildVolEnvExpr(layer.volKeys, oDelay / 1000);
         const oEnvF = oEnv ? `,volume='${oEnv}':eval=frame` : '';
         const oBaseVol = oEnv ? '1' : oVol.toFixed(4);   // envelope present → sole level (ignore base)
-        filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atempoChain(oSp)},adelay=${oDelay}:all=1,volume=${oBaseVol}${oEnvF}[auVov${i}]`);
+        filterParts.push(audioClipChain(idx, oSrc, oSrc + oLen * oSp, oDelay, `auVov${i}`, { tempo: ',' + atempoChain(oSp), vol: `,volume=${oBaseVol}`, env: oEnvF }));
         mixInputs.push(`[auVov${i}]`);
       });
       audioLayers.forEach((layer, i) => {
@@ -2533,7 +2559,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const aEnv = buildVolEnvExpr(layer.volKeys, delayMs / 1000);
         const aEnvF = aEnv ? `,volume='${aEnv}':eval=frame` : '';
         const aBaseVol = aEnv ? '1' : vol.toFixed(4);   // envelope present → sole level (ignore base)
-        filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1,volume=${aBaseVol}${aEnvF}[auLayer${i}]`);
+        filterParts.push(audioClipChain(idx, aSrc, aSrc + aLen, delayMs, `auLayer${i}`, { vol: `,volume=${aBaseVol}`, env: aEnvF }));
         mixInputs.push(`[auLayer${i}]`);
       });
       // Always pass the final audio through aresample to absorb tiny PTS
@@ -2547,11 +2573,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       // sources (voice files at -40 dB, etc.) come out at a consistent loud
       // level in every export, instead of sounding noticeably quieter than
       // the rest of the project. Single-pass mode — fast enough for export.
-      if (mixInputs.length === 1) {
-        filterParts.push(`[auMain]${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
-      } else {
-        filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
-      }
+      filterParts.push(finalAudioMix(mixInputs, 'auFinal'));
       audioMap = '[auFinal]';
     }
 
@@ -2735,7 +2757,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const baLen = Math.max(0.01, Number(baseAudio.length) || 1);
     const baSrcEnd = baSrcStart + baLen;
     const baDelayMs = Math.round((Number(baseAudio.startTime) || 0) * 1000);
-    filterParts.push(`[0:a]atrim=${baSrcStart.toFixed(3)}:${baSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${baDelayMs}:all=1[auBase]`);
+    filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auBase', {}));
     mixInputs.push('[auBase]');
   } else if (mainVideo && audioProbeMap.get(mainFile)) {
     // Main video's audio — trimmed + tempo-adjusted + delayed like in video:edit.
@@ -2744,7 +2766,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const clipDur = Math.max(0.01, videoEnd - videoStart);
     const mvSrcEnd = mvSrc + clipDur * mvSp;
     const delayMs = Math.round(videoStart * 1000);
-    filterParts.push(`[0:a]atrim=${mvSrc.toFixed(3)}:${mvSrcEnd.toFixed(3)},asetpts=PTS-STARTPTS,${atempoChain(mvSp)},adelay=${delayMs}:all=1[auMain]`);
+    filterParts.push(audioClipChain(0, mvSrc, mvSrcEnd, delayMs, 'auMain', { tempo: ',' + atempoChain(mvSp) }));
     mixInputs.push('[auMain]');
   }
 
@@ -2763,7 +2785,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const oSrc = Number(l.srcStart || 0);
     const oSp = Math.max(0.1, (l.speed || 100) / 100);
     const delayMs = Math.round(oStart * 1000);
-    filterParts.push(`[${idx}:a]atrim=${oSrc.toFixed(3)}:${(oSrc + oLen * oSp).toFixed(3)},asetpts=PTS-STARTPTS,${atempoChain(oSp)},adelay=${delayMs}:all=1[auV${i}]`);
+    filterParts.push(audioClipChain(idx, oSrc, oSrc + oLen * oSp, delayMs, `auV${i}`, { tempo: ',' + atempoChain(oSp) }));
     mixInputs.push(`[auV${i}]`);
   });
 
@@ -2778,7 +2800,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const aLen = Math.max(0.1, aEnd - aStart);
     const aSrc = Number(l.srcStart || 0);
     const delayMs = Math.round(aStart * 1000);
-    filterParts.push(`[${idx}:a]atrim=${aSrc.toFixed(3)}:${(aSrc + aLen).toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delayMs}:all=1[auA${i}]`);
+    filterParts.push(audioClipChain(idx, aSrc, aSrc + aLen, delayMs, `auA${i}`, {}));
     mixInputs.push(`[auA${i}]`);
   });
 
@@ -2786,11 +2808,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     throw new Error('В проекте нет аудио для распознавания (все слои без звука)');
   }
 
-  if (mixInputs.length === 1) {
-    filterParts.push(`${mixInputs[0]}aresample=async=1[afin]`);
-  } else {
-    filterParts.push(`${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,aresample=async=1[afin]`);
-  }
+  filterParts.push(finalAudioMix(mixInputs, 'afin', { loudnorm: false, firstPts: false }));
 
   const args = [
     ...inputArgs,
