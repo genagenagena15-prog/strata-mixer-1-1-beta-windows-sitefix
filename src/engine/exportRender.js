@@ -33,6 +33,11 @@ export async function renderExportFrames(spec, onFrame) {
     for (let i = 0; i < total; i++) {
       if (spec.signal && spec.signal.aborted) break;
       const t = i / fps;
+      // WAIT for every active source to actually decode its frame at t before compositing. WebCodecs
+      // output is async; without this a stack of overlay decoders that can't all keep up returns stale
+      // frames → the 2nd+ overlay "fast-forwards" in the exported file (preview is fine — it samples the
+      // live <video>). No-op when there are no WebCodecs sources to wait on.
+      if (spec.prepareFrame) await spec.prepareFrame(t);
       const frame = {
         W, H, bgColor: spec.bgColor, layers: spec.layers, time: t,
         videoStart: spec.videoStart, videoEnd: spec.videoEnd, dur: durationSec,

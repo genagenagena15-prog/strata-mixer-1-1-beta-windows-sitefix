@@ -4205,6 +4205,24 @@ function Editor({ state, setState }) {
         getSource: (l, t) => efAt(t).getSource(l),
         getTextDraw: (l, t) => efAt(t).getTextDraw(l),
         getCC: (l) => ccFrame.getCC(l),
+        // Before compositing each frame, WAIT for every active WebCodecs source to decode its frame at
+        // t (mirrors getSource's per-layer time mapping). Fixes the 2nd+ overlay "fast-forwarding" in
+        // the exported file when a stack of decoders can't all keep up in real time.
+        prepareFrame: async (t) => {
+          const proms = [];
+          for (const l of layers) {
+            if (l.hidden) continue;
+            let vs = null, st = t;
+            if (l.type === 'mainVideo') { vs = exportSources.get(l.id); }
+            else if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
+              const ls = l.startTime || 0, le = l.endTime != null ? l.endTime : durationSec;
+              if (t < ls || t > le) continue;                 // layer off-screen this frame → don't decode it
+              vs = exportSources.get(l.id); st = t - ls + (l.srcStart || 0);
+            }
+            if (vs && vs.ready && vs.ensureFrameAt) proms.push(vs.ensureFrameAt(st));
+          }
+          if (proms.length) await Promise.all(proms);
+        },
         onProgress: (done, total) => setPct(Math.round(done / total * 100)),
       };
       await renderExportFrames(spec, async (rgba) => { return await window.strata.engineExportFrame(rgba.buffer); });

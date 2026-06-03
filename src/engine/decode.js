@@ -148,6 +148,31 @@ export class VideoSource {
     return chosen;
   }
 
+  // Like frameAt but ASYNC: pump the decoder and WAIT until the frame at tSec is actually decoded
+  // into the ring (or EOF / error / timeout). WebCodecs output is async, so the sync frameAt() returns
+  // whatever happens to be decoded NOW — fine for a single source (the per-frame ffmpeg await lets it
+  // catch up), but a STACK of overlay decoders can't all keep up in real time, so the 2nd+ source
+  // returned a STALE frame → it looked stuck then jumped = the "overlay fast-forwards in EXPORT" bug.
+  // The export awaits this for every active source before compositing each frame. Export-only; preview
+  // never calls it (it samples the live <video>). Mirrors frameAt's seek decision so the subsequent
+  // sync frameAt(tSec) picks the now-ready frame without re-seeking.
+  async ensureFrameAt(tSec, timeoutMs = 4000) {
+    if (!this.ready || this.err) return;
+    const tUs = Math.round((tSec + this.srcStart) * US);
+    const oldest = this.ring.length ? this.ring[0].timestamp : null;
+    const kfTarget = this._keyframeFor(Math.max(0, tUs));
+    if (oldest != null && tUs < oldest - SEEK_BACK_US) this._seekTo(tUs);
+    else if (kfTarget > this.idx) this._seekTo(tUs);
+    const start = Date.now();
+    while (!this.err) {
+      this._pump(tUs);
+      if (this.ring.some((f) => f.timestamp >= tUs)) return;                            // a frame at/after tUs is decoded → frameAt can pick the right one
+      if (this.idx >= this.chunks.length && this.decoder.decodeQueueSize === 0) return; // past EOF — nothing left to decode (hold last frame)
+      if (Date.now() - start > timeoutMs) return;                                       // safety: never hang the export on a stuck decoder
+      await new Promise((r) => setTimeout(r, 1));                                        // yield so the async decoder output lands in the ring
+    }
+  }
+
   get width() { return this.w; }
   get height() { return this.h; }
   get aspect() { return this.h ? this.w / this.h : 16 / 9; }
