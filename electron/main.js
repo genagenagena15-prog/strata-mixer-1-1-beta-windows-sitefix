@@ -1134,6 +1134,24 @@ ipcMain.handle('files:exist', async (_e, paths) => {
 ipcMain.handle('file:readBytes', async (_e, p) => {
   try { return await fs.promises.readFile(p); } catch { return null; }
 });
+// Bundled preset overlays (e.g. the «Мяч» green-screen animation): the renderer asks
+// for a preset by bare filename and gets back a REAL on-disk absolute path (via appPath,
+// which resolves dev vs packaged + asar.unpacked). Needed because the engine decoder
+// (file:readBytes) and the ffmpeg export both require a real path — a Vite/app:// URL
+// won't work for either. Preset files live in assets/presets/ (asarUnpack'd in package.json).
+ipcMain.handle('presets:getPath', async (_e, name) => {
+  // Reject path traversal / absolute paths — only a bare filename is allowed.
+  if (!name || typeof name !== 'string' || /[\\/]/.test(name) || name.includes('..')) {
+    return { ok: false, error: 'bad name' };
+  }
+  try {
+    const p = appPath('assets', 'presets', name);
+    await fs.promises.access(p, fs.constants.R_OK);
+    return { ok: true, path: p };
+  } catch {
+    return { ok: false, error: 'not found' };
+  }
+});
 // Chroma-key eyedropper fallback for PACKAGED builds: webSecurity:true taints the
 // renderer canvas so it can't read a file:// video's pixels. Extract ONE pixel at
 // source (x,y) of the frame at time t via ffmpeg → "#rrggbb". In dev the renderer

@@ -58,6 +58,8 @@ contextBridge.exposeInMainWorld('strata', {
   // Phase 2 Tier A: read raw bytes of a media file for the renderer's WebCodecs decoder
   // (mediabunny demuxes a Blob; fetch('file://') is blocked in the renderer).
   readFileBytes: (path) => ipcRenderer.invoke('file:readBytes', path),
+  // Resolve a bundled preset overlay (e.g. 'BALL.mp4') to its real absolute on-disk path.
+  getPresetPath: (name) => ipcRenderer.invoke('presets:getPath', name),
   // Chroma-key eyedropper fallback (packaged builds, where the renderer canvas is
   // tainted): read one source pixel's colour via ffmpeg → { ok, hex }.
   sampleVideoPixel: (payload) => ipcRenderer.invoke('chroma:sample-pixel', payload),

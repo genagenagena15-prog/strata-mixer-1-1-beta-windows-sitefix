@@ -63,6 +63,18 @@ const LAYER_ICONS = {
   transition:   new URL('../assets/layer-icons/transition.png', import.meta.url).href,
 };
 
+// Встроенные пресет-анимации («Анимации»): зелёнка-видео, которые кидаются на
+// слой одной кнопкой уже с настроенным хромакеем. Сам файл лежит в assets/presets/
+// и подтягивается реальным путём через window.strata.getPresetPath(file) (не Vite-URL —
+// его не прочитает ни движок-декодер, ни ffmpeg-экспорт). Чтобы добавить новую
+// анимацию: положи видео в assets/presets/ и допиши сюда строку.
+const PRESET_OVERLAYS = [
+  { id: 'ball', name: 'Мяч', emoji: '⚽', file: 'BALL.mp4',
+    previewSrc: new URL('../assets/presets/BALL.mp4', import.meta.url).href,   // для hover-превью (Vite-URL, не для экспорта)
+    chroma: { color: '#36cc31', threshold: 45, smoothness: 30 },
+    glow: { color: '#ffffff', blur: 50, opacity: 0.9 } },   // светлая вспышка позади мяча
+];
+
 // Subtitle layout constants — SHARED contract with the ASS export in
 // electron/main.js (buildAssForSubtitles must use the same fractions so the
 // burned-in result wraps identically to the preview).
@@ -2519,6 +2531,7 @@ function Editor({ state, setState }) {
   const [effPreview, setEffPreview] = useState(null);  // { kind:'transition'|'style'|'anim', id, x, y } | null
   const effPrevCanvasRef = useRef(null);
   const effPrevCompRef = useRef(null);
+  const presetPrevVideoRef = useRef(null);   // скрытое <video> ролика для hover-превью пресета
   const animReplayRef = useRef(0);   // wall-clock ms of the last anim change → replay entrance on preview
   // Volume automation (per-clip keyframe envelope): toggle + waveform-peaks cache (file → Float32Array).
   const [volEnvMode, setVolEnvMode] = useState(false);
@@ -3256,6 +3269,43 @@ function Editor({ state, setState }) {
     addLayer({ id, type: 'videoOverlay', file: f, startTime: 0, endTime: dur0, srcDuration: probed > 0 ? probed : undefined, x: 50, y: 50, size: 100 });
     ensureProxy(id, f);
   }
+  // Кинуть встроенную пресет-анимацию (напр. «Мяч») на таймлайн как видео-оверлей,
+  // СРАЗУ с включённым хромакеем (зелёный фон убран) и без звука. В отличие от
+  // addVideoOverlay тут нет диалога выбора файла — берём bundled-файл по реальному пути.
+  async function addPresetOverlay(preset) {
+    if (!preset) return;
+    if (!window.strata?.getPresetPath) {
+      alert(`Почти готово! Закрой программу ПОЛНОСТЬЮ и запусти заново (npm run dev). Перезагрузки страницы мало — переход «${preset.name}» включится только после полного перезапуска.`);
+      return;
+    }
+    let res;
+    try { res = await window.strata.getPresetPath(preset.file); } catch { res = null; }
+    if (!res?.ok || !res.path) {
+      alert(`Не нашёл файл перехода «${preset.name}» (${preset.file}). Перезапусти программу (npm run dev); файл должен лежать в assets/presets/.`);
+      return;
+    }
+    const f = res.path;
+    const id = Date.now();
+    let probed = 0;
+    try { probed = await probeMediaDuration(f); } catch { probed = 0; }
+    const len = probed > 0.1 ? probed : 1.75;
+    // Центрируем анимацию НА плейхеде, как настоящий переход: середина клипа =
+    // позиция курсора. Клампим в неотрицательное; конец вылез за край — растягиваем таймлайн.
+    const startTime = Math.max(0, currentTime - len / 2);
+    const endTime = startTime + len;
+    if (endTime > totalDuration) set('totalDuration', endTime);
+    addLayer({
+      id, type: 'videoOverlay', file: f,
+      label: preset.name, isPreset: true,   // маскировка под обычный переход-эффект
+      startTime, endTime,
+      srcDuration: probed > 0 ? probed : undefined,
+      x: 50, y: 50, size: 100, fitCover: true, muted: true,   // fitCover → залить кадр (по высоте), как у импортируемых видео
+      ccB: 30,                               // +30% яркости (и в превью, и в экспорте)
+      ...(preset.glow ? { glow: { ...preset.glow } } : {}),   // светлая вспышка за мячом (аддитивное свечение по силуэту)
+      chromaKey: { ...preset.chroma },
+    });
+    ensureProxy(id, f);
+  }
   async function addAudioFile() {
     const f = await window.strata?.pickAudio?.();
     if (!f) return;
@@ -3904,7 +3954,7 @@ function Editor({ state, setState }) {
     if (x + cardW > window.innerWidth - 8) x = r.left - cardW - 10;
     if (x < 8) x = 8;
     y = Math.max(8, Math.min(y, window.innerHeight - cardH - 8));
-    setEffPreview({ kind, id, x, y, fcss: (extra && extra.fcss) || null, color: (extra && extra.color) || null, outlineColor: (extra && extra.outlineColor) || null, outline: (extra && extra.outline) });
+    setEffPreview({ kind, id, x, y, fcss: (extra && extra.fcss) || null, color: (extra && extra.color) || null, outlineColor: (extra && extra.outlineColor) || null, outline: (extra && extra.outline), previewSrc: (extra && extra.previewSrc) || null, chroma: (extra && extra.chroma) || null, glow: (extra && extra.glow) || null });
   };
   const hideEffPrev = () => setEffPreview(null);
   useEffect(() => {
@@ -3914,6 +3964,20 @@ function Editor({ state, setState }) {
     try { if (!comp) { comp = new Compositor(canvas); effPrevCompRef.current = comp; } } catch { return; }
     const W = canvas.width, H = canvas.height;
     const spec = effPreview;
+    // Пресет-превью: крутим скрытое <video> ролика, чтобы показать сам мяч поверх фона A→B.
+    if (spec.kind === 'preset' && spec.previewSrc) {
+      let pv = presetPrevVideoRef.current;
+      if (!pv) {
+        pv = document.createElement('video');
+        pv.muted = true; pv.loop = true; pv.playsInline = true;
+        // Скрытый, но В DOM (1×1, невидимый) — иначе Chromium может не декодировать кадры.
+        pv.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1';
+        document.body.appendChild(pv);
+        presetPrevVideoRef.current = pv;
+      }
+      if (pv.src !== spec.previewSrc) pv.src = spec.previewSrc;
+      pv.play().catch(() => {});
+    }
     let raf = 0; const t0 = performance.now();
     const loop = () => {
       const t = (performance.now() - t0) / 1000;
@@ -3959,12 +4023,38 @@ function Editor({ state, setState }) {
             getSource: (l) => l.type === 'mainVideo' ? bg : null,
             getTextDraw: (l) => (l.type === 'subtitles' && d) ? [d] : [], getCC: () => null,
           });
+        } else if (spec.kind === 'preset') {
+          // Превью-пресет как у переходов: фон = картинка A (первая половина) → B (вторая),
+          // а поверх крутится сам ролик (с хромакеем, вспышкой и яркостью), будто это переход A→B.
+          const ab = effPrevAB();
+          const loopT = (t % 2.0) / 2.0;                  // 0..1, период 2с
+          const bg = loopT < 0.5 ? ab.a : ab.b;           // на середине ролика фон меняется A→B
+          const pv = presetPrevVideoRef.current;
+          const ready = pv && pv.readyState >= 2 && pv.videoWidth;
+          const ballAR = ready ? pv.videoWidth / pv.videoHeight : 0.8;
+          const frameAR = W / H;
+          const sizeFrac = Math.max(1, ballAR / frameAR);   // заливка по высоте (cover)
+          const bw = sizeFrac * W, bh = bw / ballAR;
+          comp.renderFrame({
+            W, H, bgColor: '#0e0f14',
+            layers: [
+              { id: 'bg', type: 'mainVideo' },
+              { id: 'ball', type: 'videoOverlay', startTime: 0, endTime: 9, chromaKey: spec.chroma || undefined, glow: spec.glow || undefined },
+            ],
+            time: loopT, videoStart: 0, videoEnd: 9, dur: 9,
+            getPx: (l) => l.type === 'mainVideo'
+              ? { x: 0, y: 0, w: W, h: H }
+              : { x: (W - bw) / 2, y: (H - bh) / 2, w: bw, h: bh },
+            getSource: (l) => l.type === 'mainVideo' ? bg : (ready ? pv : null),
+            getCC: (l) => l.id === 'ball' ? { b: 1.3, c: 1, s: 1, h: 0 } : null,
+            getTextDraw: () => [],
+          });
         }
       } catch { /* a bad preview frame must never break the editor */ }
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
+    return () => { cancelAnimationFrame(raf); try { presetPrevVideoRef.current?.pause(); } catch {} };
   }, [effPreview]);
   useEffect(() => () => { try { effPrevCompRef.current?.dispose?.(); } catch {} }, []);
 
@@ -5870,6 +5960,7 @@ function Editor({ state, setState }) {
   }
   function lName(l) {
     const rev = l.reversed ? ' ↺' : '';
+    if (l.label) return l.label + rev;   // пресет-переход показывает своё имя, не файл
     if (l.type === 'mainVideo') return compactName(fileName(l.file || ''), 9) + rev;
     if (l.type === 'text') return l.text?.slice(0, 8) || 'Текст';
     if (l.type === 'blur') return 'Блюр';
@@ -5894,6 +5985,7 @@ function Editor({ state, setState }) {
   // label (it isn't truncated anyway).
   function lFull(l) {
     const rev = l.reversed ? ' ↺' : '';
+    if (l.label) return l.label + rev;
     if (l.file) return fileName(l.file) + rev;
     if (l.type === 'text') return l.text || 'Текст';
     return lName(l);
@@ -7779,9 +7871,9 @@ function Editor({ state, setState }) {
           {/* Video overlay properties */}
           {sel?.type === 'videoOverlay' && (
             <div className="ed-prop-block ed-prop-sel">
-              <div className="ed-prop-head">🎬 {compactName(fileName(sel.file||''), 16)}</div>
+              <div className="ed-prop-head">{sel.isPreset ? '✨ ' + (sel.label || 'Эффект') : '🎬 ' + compactName(fileName(sel.file||''), 16)}</div>
               <Slider label="Размер, %" value={Math.round(sel.size)} min="5" max="200" onChange={v=>updLayer(sel.id,'size',v)} />
-              <Slider label="Громкость, %" value={sel.volume??100} min="0" max="200" onChange={v=>updLayer(sel.id,'volume',v)} />
+              {!sel.isPreset && <Slider label="Громкость, %" value={sel.volume??100} min="0" max="200" onChange={v=>updLayer(sel.id,'volume',v)} />}
               <Slider label="Яркость" value={sel.ccB ?? 0} min="-50" max="50" onChange={v=>updLayer(sel.id,'ccB',v)} />
               <Slider label="Насыщенность, %" value={sel.ccS ?? 100} min="0" max="200" onChange={v=>updLayer(sel.id,'ccS',v)} />
               <Slider label="Цветовой тон, °" value={sel.ccH ?? 0} min="-180" max="180" onChange={v=>updLayer(sel.id,'ccH',v)} />
@@ -7790,7 +7882,7 @@ function Editor({ state, setState }) {
               )}
             </div>
           )}
-          {sel?.type === 'videoOverlay' && renderLayerFx(sel)}
+          {sel?.type === 'videoOverlay' && !sel.isPreset && renderLayerFx(sel)}
 
           {/* Audio layer properties */}
           {sel?.type === 'audio' && (
@@ -7817,7 +7909,8 @@ function Editor({ state, setState }) {
                 </button>
                 <div className="ed-acc-body"><div className="ed-acc-inner">
                 {sel?.type !== 'videoOverlay' && <p className="ed-effects-hint">Выберите видео-слой на таймлайне.</p>}
-                {sel?.type === 'videoOverlay' && (() => {
+                {sel?.isPreset && <p className="ed-effects-hint">У этого перехода нет дополнительных настроек.</p>}
+                {sel?.type === 'videoOverlay' && !sel.isPreset && (() => {
                   const speedOn = !!sel.fxSpeed || (sel.speed != null && sel.speed !== 100);
                   return (
                     <>
@@ -7912,6 +8005,15 @@ function Editor({ state, setState }) {
                         onMouseEnter={(e) => showEffPrev('transition', t.id, e)}
                         onClick={() => { addTransition(t.id, 75); hideEffPrev(); }}>
                         {t.name}
+                      </button>
+                    ))}
+                    {/* Видео-переходы из готовых файлов (зелёный фон убирается автоматически).
+                        Для пользователя — такой же чип-переход, как GPU-эффекты выше. */}
+                    {PRESET_OVERLAYS.map(p => (
+                      <button key={p.id} className="ed-trans-chip"
+                        onMouseEnter={(e) => showEffPrev('preset', p.id, e, { previewSrc: p.previewSrc, chroma: p.chroma, glow: p.glow })}
+                        onClick={() => { addPresetOverlay(p); hideEffPrev(); }}>
+                        {p.name}
                       </button>
                     ))}
                   </div>
@@ -8120,8 +8222,8 @@ function Editor({ state, setState }) {
                         {/* 1:1 type badge pinned to the clip start — instantly tells
                             you what the layer is (video / image / audio / text…). */}
                         <span className="etl-clip-typebadge" style={{background:lColor(layer)}} title={lName(layer)}>
-                          {LAYER_ICONS[layer.type]
-                            ? <img src={LAYER_ICONS[layer.type]} alt="" />
+                          {(layer.isPreset ? LAYER_ICONS.transition : LAYER_ICONS[layer.type])
+                            ? <img src={layer.isPreset ? LAYER_ICONS.transition : LAYER_ICONS[layer.type]} alt="" />
                             : <span>{layer.type==='audio'?'♪':layer.type==='text'?'T':layer.type==='subtitles'?'✦':'▦'}</span>}
                         </span>
                         {layer.type==='audio' && !volEnvMode && (
@@ -8136,7 +8238,7 @@ function Editor({ state, setState }) {
                         {layer.type==='image' && layer.file && (
                           <img className="etl-clip-thumb" src={fileUrl(layer.file)} alt="" aria-hidden="true" />
                         )}
-                        {(layer.type==='videoOverlay' || layer.type==='maskedVideo') && layer.file && (() => {
+                        {(layer.type==='videoOverlay' || layer.type==='maskedVideo') && layer.file && !layer.isPreset && (() => {
                           const clipDur = Math.max(0.1, (layer.endTime ?? dur) - (layer.startTime || 0));
                           const srcStart = layer.srcStart || 0;
                           // Fill the whole clip width with fixed ~42px square frames:
