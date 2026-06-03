@@ -389,7 +389,7 @@ export class Compositor {
         // seeks briefly drop a <video>'s readyState below 2, and returning null here would
         // flash the layer to BLACK until the seek settles. Only skip on the very first load.
         if (srcReady(src) && this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
-        else if (src == null || !rec.hasFrame) continue;   // null source (phantom / undecoded layer) → skip; do NOT paint a stale (black) texture over the layers below. A not-ready ELEMENT (mid-scrub) still keeps its last good frame.
+        else if (!rec.hasFrame) continue;   // source not ready AND nothing cached → skip. If we DO have a cached frame, keep painting it (a mid-scrub <video> briefly drops readyState<2 / getSource→null; holding the last good frame avoids a black flash). The phantom-overlay-black case is handled upstream: _isFullCover requires a live source (so it can't occlude the real layer) and doClearAll resets the compositor (so no stale black texture survives a clear).
         const b = frame.getPx(layer);
         if (!b || b.w <= 0 || b.h <= 0) continue;
         const rect = pxRectToNDC(b.x, b.y, b.w, b.h, W, H);

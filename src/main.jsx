@@ -3805,7 +3805,10 @@ function Editor({ state, setState }) {
         const _now = typeof performance !== 'undefined' ? performance.now() : Date.now();
         const _lastSeek = seekCooldownRef.current.get(l.id + '_v') || 0;
         const _drift = Math.abs(el.currentTime - t);
-        if (!proxyPlayRef.current && !el._smWarming && _drift > driftLimit && (_drift > 1.5 || _now - _lastSeek > 800)) {
+        // The 800ms cooldown is a PLAYBACK-only guard against a macOS seek-storm. While SCRUBBING
+        // (!playing) the user expects the picture to track the playhead tightly, so bypass it — otherwise
+        // the frame only refreshes ~once/800ms during a drag = choppy "can't scrub smoothly".
+        if (!proxyPlayRef.current && !el._smWarming && _drift > driftLimit && (!playing || _drift > 1.5 || _now - _lastSeek > 800)) {
           try { el.currentTime = t; seekCooldownRef.current.set(l.id + '_v', _now); } catch {}
         }
         try { el.playbackRate = spd; } catch {}
@@ -4900,17 +4903,50 @@ function Editor({ state, setState }) {
   }, []);
 
   // Drive the playhead when playing a timeline that has no main video.
+  // MASTER CLOCK: follow a real, natively-playing media element's currentTime instead of a free-running
+  // wall-clock. With a wall-clock, a heavy render (stack of overlays) delays this React-state tick, so the
+  // playhead LAGGED the audio that kept playing → the sync effect then yanked that audio BACKWARD to the
+  // lagging playhead = audible stutter/"repeat then jump back". Anchoring the playhead to the audio it
+  // already plays means the playhead can never lag it, so the audio is never reseeked. Falls back to the
+  // wall-clock when there's no audible media to anchor to (e.g. all muted).
   useEffect(() => {
     if (!playing || videoRef.current) return;
     let raf = 0, last = performance.now();
+    const masterTime = () => {
+      // First non-muted, in-range, actually-advancing audible element = the clock.
+      for (const l of layers) {
+        if (l.muted || l.reversed) continue;
+        const ls = l.startTime || 0, le = l.endTime != null ? l.endTime : dur;
+        const ct = currentTimeRef.current;
+        if (ct < ls - 0.05 || ct > le + 0.05) continue;
+        let el = null;
+        if (l.type === 'videoOverlay' || l.type === 'maskedVideo') el = videoAudioRefs.current[l.id];
+        else if (l.type === 'audio') el = audioLayerRefs.current[l.id];
+        if (el && !el.paused && el.readyState >= 2) {
+          const spd = Math.max(0.1, (l.speed || 100) / 100);
+          const tl = ls + (el.currentTime - (l.srcStart || 0)) / spd;
+          // Only anchor when the master is already CLOSE to the playhead — at play-start / master switch
+          // the element may not have seeked to position yet; trust the wall-clock for that frame instead
+          // of snapping the playhead onto a stale audio position.
+          if (isFinite(tl) && tl >= 0 && Math.abs(tl - ct) < 1.0) return tl;
+        }
+      }
+      return null;
+    };
     const tick = (ts) => {
       const delta = (ts - last) / 1000; last = ts;
-      setCurrentTime((t) => { const nt = t + delta; if (nt >= dur) { setPlaying(false); return dur; } return nt; });
+      const mt = masterTime();
+      if (mt != null) {
+        if (mt >= dur) { setCurrentTime(dur); setPlaying(false); }
+        else setCurrentTime(mt);
+      } else {
+        setCurrentTime((t) => { const nt = t + delta; if (nt >= dur) { setPlaying(false); return dur; } return nt; });
+      }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [playing, dur]);
+  }, [playing, dur, layers]);
 
   function seekTo(t) { const v = videoRef.current; if (v) v.currentTime = t; setCurrentTime(t); }
   function togglePlay() {
