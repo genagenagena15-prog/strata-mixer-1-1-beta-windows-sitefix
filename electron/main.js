@@ -747,7 +747,16 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      webSecurity: app.isPackaged || process.env.STRATA_SKIP_UPDATE_CHECK !== '1'
+      // webSecurity MUST be false: the WebGL engine uploads local <video>/<img> (file://) into GL
+      // textures (texImage2D) for BOTH preview and export (readPixels). With webSecurity:true a
+      // packaged build treats every file:// source as a separate (opaque) origin → the canvas/texture
+      // is TAINTED → texImage2D / readPixels throw SecurityError → black preview + black export while
+      // audio still plays. This was THE "9/10 black screen" bug on both Win and Mac (it only worked in
+      // dev because `npm run dev` sets STRATA_SKIP_UPDATE_CHECK=1 → webSecurity:false there). The app
+      // only ever loads local files + our own bundled UI + trusted API endpoints (Groq/GitHub), with
+      // contextIsolation:true and nodeIntegration:false, so disabling SOP here is safe. It also lets
+      // the chroma-key eyedropper read pixels directly (the ffmpeg fallback below becomes belt-and-braces).
+      webSecurity: false
     }
   });
 
