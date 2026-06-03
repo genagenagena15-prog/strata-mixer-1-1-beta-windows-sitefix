@@ -20,7 +20,7 @@ function audioClipChain(idx, trimStart, trimEnd, delayMs, label, opts) {
 function finalAudioMix(mixInputs, label, opts) {
   const o = opts || {};
   const ln = (o.loudnorm === false) ? '' : `${LOUDNORM},`;
-  const ar = (o.firstPts === false) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0';
+  const ar = ((o.firstPts === false) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0') + ',aformat=channel_layouts=stereo';
   if (mixInputs.length === 1) return `${mixInputs[0]}${ln}${ar}[${label}]`;
   return `${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,${ln}${ar}[${label}]`;
 }
@@ -53,10 +53,10 @@ const ENV = `,volume='if(lt(t,1.0000),0.5000,1.0000)':eval=frame`;
 }
 eq('export final single',
   finalAudioMix(['[au0]'], 'auFinal'),
-  `[au0]${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+  `[au0]${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 eq('export final multi',
   finalAudioMix(['[au0]', '[au1]'], 'auFinal'),
-  `[au0][au1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+  `[au0][au1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 
 // ── 2. video:edit — base [0:a] (no tempo) / main (tempo) / overlay (tempo+env) / audio (env) ──
 eq('vedit base [0:a]',
@@ -83,10 +83,10 @@ eq('vedit base [0:a]',
 }
 eq('vedit final single',
   finalAudioMix(['[auMain]'], 'auFinal'),
-  `[auMain]${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+  `[auMain]${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 eq('vedit final multi',
   finalAudioMix(['[auMain]', '[auVov0]'], 'auFinal'),
-  `[auMain][auVov0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0[auFinal]`);
+  `[auMain][auVov0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 
 // ── 3. extractMixed… — no volume, no env, no loudnorm, no first_pts ──
 eq('extract base [0:a]',
@@ -113,10 +113,10 @@ eq('extract base [0:a]',
 }
 eq('extract final single',
   finalAudioMix(['[auMain]'], 'afin', { loudnorm: false, firstPts: false }),
-  `[auMain]aresample=async=1[afin]`);
+  `[auMain]aresample=async=1,aformat=channel_layouts=stereo[afin]`);
 eq('extract final multi',
   finalAudioMix(['[auMain]', '[auV0]'], 'afin', { loudnorm: false, firstPts: false }),
-  `[auMain][auV0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,aresample=async=1[afin]`);
+  `[auMain][auV0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,aresample=async=1,aformat=channel_layouts=stereo[afin]`);
 
 console.log(`audio-graph-test: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -56,7 +56,11 @@ function audioClipChain(idx, trimStart, trimEnd, delayMs, label, opts) {
 function finalAudioMix(mixInputs, label, opts) {
   const o = opts || {};
   const ln = (o.loudnorm === false) ? '' : `${LOUDNORM},`;
-  const ar = (o.firstPts === false) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0';
+  // aformat=channel_layouts=stereo: the newer ffmpeg in the Mac CI build refuses to negotiate the
+  // channel layout between aresample and the output format ("Cannot select channel layout … Conversion
+  // failed!" → Mac export crashes). Pinning an explicit stereo layout fixes Mac and is a harmless no-op
+  // on the (older) bundled Windows ffmpeg, which already produced stereo.
+  const ar = ((o.firstPts === false) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0') + ',aformat=channel_layouts=stereo';
   if (mixInputs.length === 1) return `${mixInputs[0]}${ln}${ar}[${label}]`;
   return `${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,${ln}${ar}[${label}]`;
 }
@@ -767,6 +771,17 @@ function createWindow() {
     // any background-downloaded update on the way out). Keeping the app in the tray was why users
     // never got updates — they never actually quit.
     handleExitRequest();
+  });
+
+  // DevTools toggle. The app menu is removed (setApplicationMenu(null)), which also kills the default
+  // Cmd/Ctrl+Shift+I accelerator — so users couldn't open the console. Re-bind it (+ F12) so they can
+  // grab console errors for bug reports (esp. Mac-only issues we can't reproduce locally).
+  mainWindow.webContents.on('before-input-event', (_e, input) => {
+    if (input.type !== 'keyDown') return;
+    const k = (input.key || '').toLowerCase();
+    if (((input.control || input.meta) && input.shift && k === 'i') || k === 'f12') {
+      try { mainWindow.webContents.toggleDevTools(); } catch {}
+    }
   });
 
   // Tell the renderer whether the window is maximized/fullscreen, so the editor

@@ -1025,7 +1025,7 @@
    paint ON TOP of those instead of hiding behind them (DOM order would otherwise occlude them).
    The canvas itself is still clipped to the project rect by .ed-preview-clip, so ONLY the thin
    interactive handles ever spill out — never the video/gray surround. */
-.ed-preview-wrap{position:relative;z-index:5;background:#2a2a2a;border-radius:14px;display:flex;align-items:center;justify-content:center;min-height:120px;overflow:visible;padding:20px}
+.ed-preview-wrap{position:relative;background:#2a2a2a;border-radius:14px;display:flex;align-items:center;justify-content:center;min-height:120px;overflow:hidden;padding:20px}
 .ed-preview-resize{height:7px;border-radius:4px;background:rgba(140,140,146,.14);cursor:ns-resize;transition:background .15s;flex-shrink:0}
 .ed-preview-resize:hover,.ed-preview-resize:active{background:rgba(255,138,0,.45)}
 .ed-tl-section{flex:1 1 0;min-height:160px;display:flex;flex-direction:column;min-width:0}

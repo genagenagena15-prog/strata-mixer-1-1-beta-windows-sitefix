@@ -10,7 +10,14 @@ import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
 import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
 
-const APP_VERSION = 'v1.3.7';
+const APP_VERSION = 'v1.3.8';
+// Compare two semver-ish strings → -1 / 0 / 1 (tolerates a leading 'v').
+const verCmp = (a, b) => {
+  const pa = String(a || '').replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b || '').replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d < 0 ? -1 : 1; }
+  return 0;
+};
 // Preview backing-resolution scale while PLAYING (full res when paused for a
 // crisp still). 0.5 → ¼ the pixels → ~4× cheaper compositing, no audio glitch.
 const PREVIEW_SCALE = 0.5;
@@ -851,17 +858,22 @@ function NotificationBell() {
       } else {
         fresh.forEach(n => announcedRef.current.add(n.id));
       }
-      if (fresh.length) {
-        // The one-time "what's new" popup is now a CENTERED modal showing the
-        // release's patch notes (instead of a corner toast). Show the newest.
-        const newest = [...fresh].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))[0];
+      // Patch-note popups (type:'update') only fire for the version we're ACTUALLY RUNNING (or older).
+      // Gating on version stops them appearing MID-SESSION on the old app when a newer release is
+      // published (that spammed everyone on v1.3.7's release). A future-version update stays UNSEEN, so
+      // it pops the first time the user truly launches that version. Non-update announcements unchanged.
+      const appVer = APP_VERSION.replace(/^v/, '');
+      const showable = fresh.filter((n) => !(n.type === 'update' && n.version && verCmp(n.version, appVer) > 0));
+      if (showable.length) {
+        // The one-time "what's new" popup is a CENTERED modal showing the release's patch notes.
+        const newest = [...showable].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))[0];
         if (!mutedRef.current) playNotifChime();
         setCenterModal({ title: newest.title || 'Что нового', body: newest.body || '', version: newest.version, kind: 'info' });
       }
-      // Mark them as seen so we never re-toast on next launch.
-      if (fresh.length) {
+      // Mark only the SHOWN ones as seen — a future-version update stays unseen until its version ships.
+      if (showable.length) {
         const next = new Set(seenSet);
-        fresh.forEach(n => next.add(n.id));
+        showable.forEach(n => next.add(n.id));
         saveSeenIds(next);
         setSeen(next);
       }
@@ -2953,11 +2965,11 @@ function Editor({ state, setState }) {
   }
   function addTransition(kind, strength = 50) {
     // Strength = 0-100 → visual intensity (amp / blur / shift / scale).
-    // Duration is fixed at 0.4 s; the user stretches the clip on the
-    // timeline independently — length = how long, slider = how strong.
+    // Duration default 0.8 s (was 0.4 — transitions felt too fast → 2× slower); the user
+    // stretches the clip on the timeline independently — length = how long, slider = how strong.
     const k = kind || 'none';
     const numStrength = Math.max(0, Math.min(100, Number(strength) || 50));
-    const duration = 0.4;
+    const duration = 0.8;
     const cx = Math.max(0, Math.min(dur, currentTime));   // centre the effect on the playhead
     const half = duration / 2;
     const ls = Math.max(0, Math.min(dur - duration, cx - half));
@@ -4020,8 +4032,12 @@ function Editor({ state, setState }) {
         const draws = [];
         for (const w of segL.words) {
           const isActive = T >= w.start && T <= w.end;
-          const tWord = replayActive ? replaySec : Math.max(0, T - w.start);   // sec since this word activated
-          const tr = (animA && !animPixel) ? animTransform(animA, tWord) : { sx: 1, sy: 1, ox: 0, oy: 0, rot: 0 };
+          const tWord = Math.max(0, T - w.start);   // sec since this word activated
+          // Animate ONLY the currently-highlighted (active) word, ALWAYS — including immediately after the
+          // user changes the animation. (Removed the few-second "replay" that animated EVERY word as a
+          // preview: a just-changed anim briefly played on the whole line, which looked wrong/«strange».
+          // The hover preview card already shows the motion when picking an anim.)
+          const tr = (animA && !animPixel && isActive) ? animTransform(animA, tWord) : { sx: 1, sy: 1, ox: 0, oy: 0, rot: 0 };
           const dxPx = tr.ox * fs, dyPx = tr.oy * fs;   // clip-space offset → px via font size
           const color = isActive ? highlightColor : baseColor;
           const outline = olMode === 'none' ? 0 : olT;
@@ -4171,6 +4187,15 @@ function Editor({ state, setState }) {
         try {
           if (!compRef.current) compRef.current = new Compositor(gl);
           compRef.current.renderFrame(buildEngineFrame());
+          // Engine mode returns here and never runs the 2D paint path below — which is what normally
+          // fills the fullscreen MIRROR canvas, so fullscreen stayed BLACK on Tier A. When the
+          // fullscreen overlay is open, copy the freshly-rendered GL frame onto its 2D canvas
+          // (drawImage right after renderFrame reads the still-valid GL backbuffer).
+          const fs = fsCanvasRef.current;
+          if (fs) {
+            if (fs.width !== gl.width || fs.height !== gl.height) { fs.width = gl.width; fs.height = gl.height; }
+            try { const fc = fs.getContext('2d'); if (fc) fc.drawImage(gl, 0, 0); } catch {}
+          }
           return;
         } catch (e) { engineModeRef.current = false; setEngineMode(false); setEngineErr(String((e && e.message) || e)); console.error('[engine] disabled:', e); }
       }
@@ -6603,8 +6628,13 @@ function Editor({ state, setState }) {
         {/* Preview column */}
         <div className="ed-preview-col">
           {/* Hidden video elements for canvas frame capture */}
-          {file && <video ref={videoRef} key={file} src={fileUrl(file)} muted playsInline preload="metadata"
+          {file && <video ref={videoRef} key={file} src={fileUrl(file)} muted playsInline preload="auto"
             onLoadedMetadata={onVideoMeta} onTimeUpdate={onTimeUpdate}
+            // Repaint the instant the main video has a decodable frame (load / seek). Without this the
+            // engine could paint BLACK right after loading a new clip (only the audio mirror heard) until
+            // the user pokes the timeline — esp. on macOS / HEVC where the first frame decodes slowly.
+            // preload="auto" (was "metadata") makes that first frame land without needing an interaction.
+            onLoadedData={() => kickRender()} onCanPlay={() => kickRender()} onSeeked={() => kickRender()}
             style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0, pointerEvents:'none' }} />}
           {file && <video ref={videoRevRef} key={`rev-${file}`} src={fileUrl(file)} muted playsInline preload="auto"
             style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0, pointerEvents:'none' }} />}
@@ -7184,11 +7214,22 @@ function Editor({ state, setState }) {
                 ? { ...x, strength: Number(v) }
                 : x));
             };
+            // Length = the transition's own duration on the timeline (endTime − startTime). The slider
+            // sets endTime = startTime + chosen seconds (clamped to the project), mirrored by stretching
+            // the clip directly. Drag gives 0.1-s steps.
+            const durSec = Math.max(0.1, Math.round(((sel.endTime ?? 0) - (sel.startTime ?? 0)) * 10) / 10);
+            const applyLength = (v) => {
+              const d = Math.max(0.1, Number(v));
+              set('layers', ls => ls.map(x => x.id === sel.id
+                ? { ...x, endTime: Math.min(dur, (x.startTime || 0) + d) }
+                : x));
+            };
             return (
               <div className="ed-prop-block ed-prop-sel">
                 <div className="ed-prop-head">⚡ Переход</div>
                 <Slider label="Сила" value={cur} min="0" max="100" onChange={applyStrength} />
-                <p className="ed-effects-hint">Длина клипа на таймлайне — это длительность перехода. Сила меняет интенсивность эффекта.</p>
+                <Slider label="Длина, с" value={durSec} min={0.2} max={5} step={0.1} onChange={applyLength} />
+                <p className="ed-effects-hint">«Сила» — интенсивность эффекта, «Длина» — сколько длится переход (можно и растянуть клип на таймлайне).</p>
               </div>
             );
           })()}

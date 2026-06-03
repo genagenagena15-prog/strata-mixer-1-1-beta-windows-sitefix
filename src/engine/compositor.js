@@ -109,14 +109,20 @@ in vec2 vUv;
 uniform sampler2D uTex;
 uniform vec2 uStep;      // direction * texel (1/res)
 uniform float uSigma;
-uniform int uRadius;
+uniform int uRadius;     // gaussian extent in texels ~ceil(sigma*3); sets the sample SPREAD
 out vec4 frag;
+// FIXED 25 taps, spacing scaled to the blur radius → CONSTANT cost regardless of blur strength (a big
+// blur spreads the same samples wider instead of taking hundreds). LINEAR-filtered uTex smooths between
+// the wider-spaced taps, so large blurs stay smooth. Replaces a ±180 loop that ran 361 iterations PER
+// PIXEL for EVERY blur (even tiny ones) — that, stacked across shadow+glow+outline+blur, was the freeze.
 void main(){
+  const int N = 12;                                   // 2N+1 = 25 taps
+  float spread = max(1.0, float(uRadius)) / float(N); // texels between taps
   float wsum = 0.0; vec4 acc = vec4(0.0);
-  for(int i=-180;i<=180;i++){
-    if(i < -uRadius || i > uRadius) continue;
-    float w = exp(-float(i*i) / (2.0*uSigma*uSigma));
-    acc += w * texture(uTex, vUv + uStep*float(i));
+  for(int i=-N;i<=N;i++){
+    float x = float(i) * spread;                      // offset in texels
+    float w = exp(-(x*x) / (2.0*uSigma*uSigma));
+    acc += w * texture(uTex, vUv + uStep*x);
     wsum += w;
   }
   frag = acc / wsum;
