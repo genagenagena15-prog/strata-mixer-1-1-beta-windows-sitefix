@@ -793,6 +793,14 @@ function createWindow() {
   mainWindow.on('leave-full-screen', sendMaxState);
   mainWindow.webContents.on('did-finish-load', sendMaxState);
 
+  // Kill any in-progress engine export when the renderer crashes or navigates away.
+  mainWindow.webContents.on('render-process-gone', () => {
+    if (_engExp && !_engExp.isDead()) { try { _engExp.kill(); } catch {} _engExp = null; }
+  });
+  mainWindow.webContents.on('did-start-loading', () => {
+    if (_engExp && !_engExp.isDead()) { try { _engExp.kill(); } catch {} _engExp = null; }
+  });
+
   if (!app.isPackaged && process.env.STRATA_SKIP_UPDATE_CHECK === '1') {
     const devPort = process.env.VITE_DEV_PORT || 5173;
     mainWindow.loadURL(`http://localhost:${devPort}`);
@@ -1170,6 +1178,9 @@ function buildVolEnvExpr(keys, clipStartSec) {
 // optional main-source audio). A NEW, default-off path; the existing video:edit filtergraph is untouched.
 let _engExp = null;
 ipcMain.handle('engine:export-begin', (_e, meta) => {
+  if (_engExp && !_engExp.isDead()) {
+    return { ok: false, error: 'export already in progress' };
+  }
   const ffmpeg = findFfmpeg();
   if (!ffmpeg) return { ok: false, error: 'ffmpeg not found' };
   const { W, H, fps, outPath, audioSources, mainFile } = meta || {};
@@ -1211,6 +1222,8 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
   args.push(outPath);
   let stderr = '';
   const ff = spawn(ffmpeg, args);
+  activeProcs.add(ff);
+  ff.on('close', () => activeProcs.delete(ff));
   ff.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-4000); });
   ff.on('error', () => {});
   const drains = [];
@@ -1600,13 +1613,19 @@ ipcMain.on('project:set-dirty', (_event, dirty) => {
 function requestRendererSave() {
   return new Promise((resolve) => {
     if (!mainWindow || mainWindow.isDestroyed()) return resolve({ ok: false, error: 'no window' });
+    const timer = setTimeout(() => {
+      ipcMain.removeListener('project:save-response', handler);
+      resolve({ saved: false, cancel: true });
+    }, 30000);
     const handler = (_event, res) => {
+      clearTimeout(timer);
       ipcMain.removeListener('project:save-response', handler);
       resolve(res || { ok: false, error: 'no response' });
     };
     ipcMain.on('project:save-response', handler);
     try { mainWindow.webContents.send('project:save-request', {}); }
     catch (e) {
+      clearTimeout(timer);
       ipcMain.removeListener('project:save-response', handler);
       resolve({ ok: false, error: String(e.message || e) });
     }
@@ -1727,6 +1746,7 @@ ipcMain.handle('project:open-path', async (_e, file) => {
 const PROXY_CONCURRENCY = 2;
 let _proxyInflight = 0;
 const _proxyQueue = [];
+const _proxyInFlight = new Map(); // file -> Promise<result> — dedup concurrent proxy requests for the same source
 function _acquireProxySlot() {
   return new Promise(resolve => {
     if (_proxyInflight < PROXY_CONCURRENCY) {
@@ -1746,6 +1766,14 @@ function _releaseProxySlot() {
 ipcMain.handle('editor:makeProxy', async (event, payload) => {
   const { file, force } = payload || {};
   if (!file) return { ok: false, error: 'no file' };
+  const existing = _proxyInFlight.get(file);
+  if (existing) return existing;
+  const promise = _makeProxyImpl(event, payload).finally(() => _proxyInFlight.delete(file));
+  _proxyInFlight.set(file, promise);
+  return promise;
+});
+async function _makeProxyImpl(event, payload) {
+  const { file, force } = payload || {};
   const ffmpeg = findFfmpeg();
   if (!ffmpeg) return { ok: false, error: 'FFmpeg не найден' };
 
@@ -1809,7 +1837,7 @@ ipcMain.handle('editor:makeProxy', async (event, payload) => {
       else resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-300)}` });
     });
   });
-});
+}
 
 // Concatenate multiple clips (possibly from different source files) into one
 // normalised MP4/MP3, returning the temp path so the editor can replace the
@@ -2609,6 +2637,7 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         mixInputs.push(`[auVov${i}]`);
       });
       audioLayers.forEach((layer, i) => {
+        if (!layer.file || !require('fs').existsSync(layer.file)) return;
         inputArgs.push('-i', layer.file);
         const idx = inputIdx++;
         const aStart = layer.startTime || 0;
@@ -3936,6 +3965,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             const fadeTag = fadeRem > 0 ? `\\fad(${fadeRem},0)` : '';
             highOv = `{\\an5\\move(${hX},${hY},${cx},${cy},0,${remMs})${fadeTag}\\fscx${scNow}\\fscy${fy(scNow)}\\t(0,${remMs},\\fscx100\\fscy${yScale})\\c${high}}`;
           }
+        } else if (anim === 'pop') {
+          // Scale 130% → 100% quickly on the active word — the default animation.
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx130\\fscy${fy(130)}\\t(0,150,\\fscx100\\fscy${yScale})}`;
+        } else if (anim === 'slideside') {
+          // Slide in from the left side, revealed at word start time.
+          baseStart = wStart; baseStartNum = wStartNum;
+          const slideX = Math.max(0, cx - 40);
+          const mv = `\\move(${slideX},${cy},${cx},${cy},0,${A.SLIDE_MS})\\fad(${A.SLIDE_FADE_MS},0)`;
+          baseOv = `{\\an5${mv}\\c${base}}`;
+          highOv = `{\\an5${mv}\\c${high}}`;
+        } else if (anim === 'rotatein') {
+          // Quick scale-in with slight horizontal stretch → nearest to a rotate feel in ASS.
+          baseStart = wStart; baseStartNum = wStartNum;
+          const rf = `\\fscx160\\fscy${fy(60)}\\t(0,200,\\fscx100\\fscy${yScale})\\fad(100,0)`;
+          baseOv = `{\\an5\\pos(${cx},${cy})${rf}\\c${base}}`;
+          highOv = `{\\an5\\pos(${cx},${cy})${rf}\\c${high}}`;
+        } else if (anim === 'shake') {
+          // Rapid horizontal jitter on the active word (3 twitches via \move chain).
+          const d = 6;
+          highOv = `{\\an5\\move(${cx - d},${cy},${cx + d},${cy},0,60)\\t(60,120,)\\move(${cx + d},${cy},${cx - d},${cy},60,120)\\move(${cx - d},${cy},${cx},${cy},120,180)\\c${high}}`;
+        } else if (anim === 'bouncedrop') {
+          // Fall from above with a bounce squash — similar to drop but with an overshoot.
+          baseStart = wStart; baseStartNum = wStartNum;
+          const mv = `\\move(${cx},${cy - A.DROP_OFFSET},${cx},${cy},0,${A.DROP_MS})`;
+          const bounce = `\\t(${A.DROP_MS},${A.DROP_MS + A.DROP_SQUASH_MS},\\fscy${fy(115)})\\t(${A.DROP_MS + A.DROP_SQUASH_MS},${A.DROP_MS + 2 * A.DROP_SQUASH_MS},\\fscy${yScale})`;
+          baseOv = `{\\an5${mv}\\fad(80,0)${bounce}\\c${base}}`;
+          highOv = `{\\an5${mv}\\fad(80,0)${bounce}\\c${high}}`;
+        } else if (anim === 'jelly') {
+          // Wobble: scaleX stretches then snaps back on the active word.
+          highOv = `{\\an5\\pos(${cx},${cy})\\c${high}\\fscx140\\fscy${fy(80)}\\t(0,100,\\fscx85\\fscy${fy(115)})\\t(100,200,\\fscx105\\fscy${fy(97)})\\t(200,280,\\fscx100\\fscy${yScale})}`;
         }
 
         // The base (Layer 0) must NOT overlap this word's highlight window — else

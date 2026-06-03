@@ -325,6 +325,17 @@ export class Compositor {
     if (!r) { r = { tex: createTexture(this.gl) }; this.texCache.set(id, r); }
     return r;
   }
+  // Decide whether to (re)upload a source into its texture this frame. A DOM <video> is
+  // uploaded ONLY when it has PRESENTED a new frame since the last upload — the renderer
+  // stamps src._smFrameSeq from requestVideoFrameCallback. Re-uploading a PAUSED <video>
+  // on every paint intermittently makes texImage2D read BLACK (a Chromium video→GL quirk);
+  // gating on a fresh present keeps the last good texture instead. Non-video sources
+  // (images, WebCodecs VideoFrame) and not-yet-stamped videos always upload.
+  _vidFresh(src, rec) {
+    if (typeof HTMLVideoElement === 'undefined' || !(src instanceof HTMLVideoElement)) return true;
+    if (src._smFrameSeq === undefined) return true;
+    return src._smFrameSeq !== rec._seq;
+  }
 
   // Drop a layer's cached GPU texture (call when a layer is removed).
   forget(id) {
@@ -377,7 +388,7 @@ export class Compositor {
         // Keep the LAST uploaded frame when the live source isn't ready: rapid scrubbing /
         // seeks briefly drop a <video>'s readyState below 2, and returning null here would
         // flash the layer to BLACK until the seek settles. Only skip on the very first load.
-        if (srcReady(src)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; }
+        if (srcReady(src) && this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
         else if (!rec.hasFrame) continue;
         const b = frame.getPx(layer);
         if (!b || b.w <= 0 || b.h <= 0) continue;
@@ -703,7 +714,7 @@ export class Compositor {
     if (mv && !mv.hidden && frame.time >= frame.videoStart && frame.time <= frame.videoEnd) {
       const src = frame.getSource(mv);
       const rec = this._texFor(mv.id);
-      if (srcReady(src)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; }   // else keep last (scrub)
+      if (srcReady(src) && this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }   // upload only on a fresh present (else keep last)
       if (rec.hasFrame) {
         const b = frame.getPx(mv);
         if (b && b.w > 0 && b.h > 0) this._drawLayer(rec.tex, pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H), 1);
@@ -754,8 +765,7 @@ export class Compositor {
     if (srcReady(src)) {
       rec.srcW = src.videoWidth || src.naturalWidth || src.displayWidth || src.codedWidth || src.width || 1;
       rec.srcH = src.videoHeight || src.naturalHeight || src.displayHeight || src.codedHeight || src.height || 1;
-      uploadElement(gl, rec.tex, src);
-      rec.hasFrame = true;
+      if (this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
     } else if (!rec.hasFrame) return;
     const srcW = rec.srcW || 1, srcH = rec.srcH || 1;
     // UV sub-rect: srcCrop (clamped exactly like canvas2d) or cover-fit centred.

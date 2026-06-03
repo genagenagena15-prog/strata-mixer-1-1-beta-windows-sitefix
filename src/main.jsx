@@ -2679,6 +2679,7 @@ function Editor({ state, setState }) {
   const proxyFilesRef = useRef([]);
   const proxyPlayRef = useRef(false);
   const proxyActiveUrlRef = useRef(null);
+  const seekCooldownRef = useRef(new Map()); // id→lastSeekMs, prevents seek storm on Mac
   const currentTimeRef = useRef(0);
   const previewFullscreenRef = useRef(false);
   const measureCanvasRef = useRef(null);
@@ -2900,11 +2901,36 @@ function Editor({ state, setState }) {
     }
     set('layers', (l) => l.filter(x => x.id !== id));
     setSelectedId((s) => s === id ? null : s);
+    // FIX 1: release GPU textures for the deleted layer
+    if (compRef.current) {
+      try { compRef.current.forget(id); } catch {}
+      try {
+        const tc = compRef.current.texCache;
+        if (tc) for (const k of [...tc.keys()]) { if (String(k).startsWith(id + '#')) { const r = tc.get(k); try { compRef.current.gl.deleteTexture(r.tex); } catch {} tc.delete(k); } }
+      } catch {}
+    }
+    // FIX 5: clean up seekCooldownRef entries for deleted layer
+    seekCooldownRef.current.delete(id + '_v');
+    seekCooldownRef.current.delete(id + '_a');
+    seekCooldownRef.current.delete(id + '_au');
   };
   const delSelected = () => {
     const ids = selectedIds.size ? [...selectedIds] : (selectedId ? [selectedId] : []);
     if (!ids.length) return;
     pushUndo();
+    // FIX 1 + FIX 5: release GPU textures and seek cooldown entries for deleted layers
+    for (const id of ids) {
+      if (compRef.current) {
+        try { compRef.current.forget(id); } catch {}
+        try {
+          const tc = compRef.current.texCache;
+          if (tc) for (const k of [...tc.keys()]) { if (String(k).startsWith(id + '#')) { const r = tc.get(k); try { compRef.current.gl.deleteTexture(r.tex); } catch {} tc.delete(k); } }
+        } catch {}
+      }
+      seekCooldownRef.current.delete(id + '_v');
+      seekCooldownRef.current.delete(id + '_a');
+      seekCooldownRef.current.delete(id + '_au');
+    }
     setState((s) => ({ ...s, file: ids.includes('__mv__') ? null : s.file, layers: s.layers.filter((x) => !ids.includes(x.id)) }));
     setSelectedId(null); setSelectedIds(new Set());
   };
@@ -3660,8 +3686,8 @@ function Editor({ state, setState }) {
   // all clips (and split halves) of that file. Saves the browser from
   // spawning 30+ <video> decoders on every clip render.
   async function generateThumbsForFile(file) {
+    const video = document.createElement('video');
     try {
-      const video = document.createElement('video');
       video.muted = true;
       video.preload = 'auto';
       video.src = fileUrl(file);
@@ -3697,6 +3723,9 @@ function Editor({ state, setState }) {
       setThumbsRev(r => r + 1);
     } catch {
       thumbsCacheRef.current.delete(file);
+    } finally {
+      // FIX 6: release the scratch video decoder so the browser can GC it
+      try { video.pause(); video.removeAttribute('src'); video.load(); } catch {}
     }
   }
   useEffect(() => {
@@ -3767,8 +3796,11 @@ function Editor({ state, setState }) {
         const driftLimit = tightSync ? 0.08 : 0.3;
         // While the proxy owns the picture, don't reseek these decoders either —
         // they're paused and off-screen; a single resync runs on hand-back.
-        if (!proxyPlayRef.current && Math.abs(el.currentTime - t) > driftLimit) {
-          try { el.currentTime = t; } catch {}
+        const _now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const _lastSeek = seekCooldownRef.current.get(l.id + '_v') || 0;
+        const _drift = Math.abs(el.currentTime - t);
+        if (!proxyPlayRef.current && !el._smWarming && _drift > driftLimit && (_drift > 1.5 || _now - _lastSeek > 800)) {
+          try { el.currentTime = t; seekCooldownRef.current.set(l.id + '_v', _now); } catch {}
         }
         try { el.playbackRate = spd; } catch {}
         // Actually play the hidden <video> so frames decode smoothly — the
@@ -3779,7 +3811,7 @@ function Editor({ state, setState }) {
         // sound) — saves N video decodes on heavy projects.
         if (playing && inRange && !l.reversed && !proxyPlayRef.current) {
           if (el.paused) el.play().catch(() => {});
-        } else if (!el.paused) {
+        } else if (!el.paused && !el._smWarming) {
           try { el.pause(); } catch {}
         }
 
@@ -3793,7 +3825,12 @@ function Editor({ state, setState }) {
           // when a heavy re-render (e.g. selecting a layer) briefly stalls the
           // RAF loop and currentTime lags — the reseek re-buffers and clicks.
           const aDrift = playing ? 0.35 : 0.12;
-          if (Math.abs(aEl.currentTime - t) > aDrift) aEl.currentTime = t;
+          const _aNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          const _aLast = seekCooldownRef.current.get(l.id + '_a') || 0;
+          const _aDrift = Math.abs(aEl.currentTime - t);
+          if (_aDrift > aDrift && (_aDrift > 1.5 || _aNow - _aLast > 800)) {
+            try { aEl.currentTime = t; seekCooldownRef.current.set(l.id + '_a', _aNow); } catch {}
+          }
           try { aEl.playbackRate = spd; } catch {}
           applyClipVolume(aEl, l);
           if (playing && inRange && !l.reversed && !l.muted) {
@@ -3807,7 +3844,12 @@ function Editor({ state, setState }) {
         const t = (l.srcStart || 0) + Math.max(0, currentTime - (l.startTime || 0));
         // Loose during playback (native sync) / tight while scrubbing — avoids
         // reseek stutter when a re-render briefly stalls the RAF loop.
-        if (Math.abs(el.currentTime - t) > (playing ? 0.35 : 0.12)) el.currentTime = t;
+        const _auNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const _auLast = seekCooldownRef.current.get(l.id + '_au') || 0;
+        const _auDrift = Math.abs(el.currentTime - t);
+        if (_auDrift > (playing ? 0.35 : 0.12) && (_auDrift > 1.5 || _auNow - _auLast > 800)) {
+          try { el.currentTime = t; seekCooldownRef.current.set(l.id + '_au', _auNow); } catch {}
+        }
         applyClipVolume(el, l);
         // Speaker toggle (muted) silences audio; the eye (hidden) never touches it.
         if (playing && inRange && !l.muted) { if (el.paused) el.play().catch(() => {}); }
@@ -3966,14 +4008,14 @@ function Editor({ state, setState }) {
       if (l.type === 'mainVideo') {
         if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T); if (f) return f; } }
         if (forExport) return null;
-        const v = l.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current; return (v && v.readyState >= 2) ? v : null;
+        const v = l.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current; if (!v || v.readyState < 2) return null; return (v.paused && v._smBitmap && v._smBitmapSeq === v._smFrameSeq) ? v._smBitmap : v;
       }
       if (l.type === 'image') return imgCacheRef.current.get(l.file) || null;
       if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
         if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T - (l.startTime || 0) + (l.srcStart || 0)); if (f) return f; } }
         if (forExport) return null;
         const ov = videoOverlayRefs.current[l.id];
-        if (ov && ov.readyState >= 2 && ov.videoWidth) return ov;
+        if (ov && ov.readyState >= 2 && ov.videoWidth) return (ov.paused && ov._smBitmap && ov._smBitmapSeq === ov._smFrameSeq) ? ov._smBitmap : ov;
         const cache = videoFrameCacheRef.current.get(l.id);
         return (cache && cache.width) ? cache : null;
       }
@@ -4159,7 +4201,7 @@ function Editor({ state, setState }) {
         getCC: (l) => ccFrame.getCC(l),
         onProgress: (done, total) => setPct(Math.round(done / total * 100)),
       };
-      await renderExportFrames(spec, async (rgba) => { await window.strata.engineExportFrame(rgba.buffer); });
+      await renderExportFrames(spec, async (rgba) => { return await window.strata.engineExportFrame(rgba.buffer); });
       const fin = await window.strata.engineExportFinish();
       result = (fin && fin.ok) ? { ok: true } : { ok: false, error: (fin && fin.error) || 'ошибка ffmpeg' };
       if (!onPct) { if (result.ok) alert('Готово (движок):\n' + outPath); else alert('Экспорт: ' + result.error); }
@@ -4173,6 +4215,7 @@ function Editor({ state, setState }) {
     return result;
   }
   const paintOnceRef = useRef(null);
+  const frameCbArmedRef = useRef(null);
   const paintOnce = () => {
     const draw = renderFrameRef.current;
     if (!draw) return;
@@ -4252,6 +4295,68 @@ function Editor({ state, setState }) {
     renderUntilRef.current = Math.max(renderUntilRef.current, nowMs() + ms);
     ensureRenderLoop();
   };
+  // A paused, off-screen (1×1, opacity:0) <video> frequently does NOT present its first
+  // frame to the compositor after load — so texImage2D/drawImage read BLACK until the user
+  // pokes the timeline (which seeks → forces a present). This was the "load video → black,
+  // only audio" bug. Force ONE real seek on first load so the decoder presents that frame
+  // right away; requestVideoFrameCallback (below) then repaints it the instant it lands.
+  const primePresent = (v) => {
+    if (!v || v._smPrimed) return;
+    try {
+      const d = v.duration;
+      if (!isFinite(d) || d <= 0.05) { v._smPrimed = true; return; }
+      v._smPrimed = true;
+      // A just-LOADED, paused, off-screen (1×1, opacity:0) decoder does NOT produce a frame
+      // on a bare seek — currentTime updates but nothing decodes, so texImage2D/drawImage
+      // read BLACK (the "load video → black, only audio" bug). PLAYING forces the cold
+      // decoder to actually present frames. We watch them via requestVideoFrameCallback and
+      // STOP on the first NON-black one — which also skips a black / fade-in lead-in (some
+      // clips genuinely start with ~0.1s of black) so the user sees real footage, not black.
+      // (Proven live: bare seek → bright=0 at t=0.06; play() presents; this clip's frames at
+      // t=0 and 0.04 are black, content begins at 0.1.)
+      v._smWarming = true;   // the sync effect must not pause / seek-cancel mid warm-up
+      let settled = false, frames = 0;
+      const probe = document.createElement('canvas'); probe.width = 32; probe.height = 56;
+      const pctx = probe.getContext('2d', { willReadFrequently: true });
+      const isBlackFrame = () => {
+        try {
+          pctx.drawImage(v, 0, 0, 32, 56);
+          const dd = pctx.getImageData(0, 0, 32, 56).data;
+          for (let i = 0; i < dd.length; i += 4) { if (Math.max(dd[i], dd[i + 1], dd[i + 2]) > 24) return false; }
+          return true;
+        } catch { return false; }
+      };
+      const finish = () => {
+        if (settled) return; settled = true;
+        try { if (!playingRef.current && !v.paused) v.pause(); } catch {}
+        // Force a FRESH present at a (warm, content) position: a PAUSED <video> can upload
+        // BLACK to WebGL texImage2D even when 2D drawImage already sees the frame, so a bare
+        // kickRender after pause is unreliable. A tiny real seek re-presents a content frame;
+        // its onSeeked handler kicks the repaint, and the compositor uploads real pixels.
+        try {
+          const t2 = Math.min((v.currentTime || 0) + 0.05, (v.duration || 1) - 0.03);
+          const done = () => { v.removeEventListener('seeked', done); v._smWarming = false; kickRender(1500); };
+          v.addEventListener('seeked', done, { once: true });
+          v.currentTime = t2;
+        } catch { v._smWarming = false; }
+        kickRender(1500);
+        setTimeout(() => { v._smWarming = false; kickRender(800); }, 500);
+      };
+      const onFrame = () => {
+        if (settled) return;
+        frames++;
+        if (!isBlackFrame() || frames >= 12 || v.currentTime >= 0.6) { finish(); return; }   // first content frame, or give up on a genuinely dark clip
+        try { v.requestVideoFrameCallback(onFrame); } catch { finish(); }
+      };
+      if (typeof v.requestVideoFrameCallback === 'function') v.requestVideoFrameCallback(onFrame);
+      const p = v.play();
+      if (p && p.catch) p.catch(() => { try { v.currentTime = Math.min(0.3, d - 0.03); } catch {} finish(); });
+      setTimeout(finish, 1500);   // hard safety cap
+    } catch {}
+    // Belt-and-suspenders: if rVFC doesn't fire within 2s (slow HEVC/AV1 decode),
+    // kick another long burst so the frame lands even on slow decoders.
+    setTimeout(() => { if (!v._smPrimed) return; kickRender(2000); }, 2000);
+  };
   // Repaint whenever the visible frame can change (scrub, edit, bg, canvas size,
   // font load). During playback the loop self-sustains via playingRef.
   useEffect(() => {
@@ -4263,7 +4368,17 @@ function Editor({ state, setState }) {
   useEffect(() => {
     playingRef.current = playing;
     // Each fresh play retries FULL-res first; adaptive drop re-decides per play.
-    if (playing) { lowResRef.current = false; paintMsRef.current = 0; }
+    if (playing) {
+      lowResRef.current = false; paintMsRef.current = 0;
+      // Recovery: retry full-res every 8s — a single slow frame (codec cold-start / GC)
+      // shouldn't permanently lock the preview in half-res for the whole clip.
+      const _recovTimer = setTimeout(function _lowResRecov() {
+        if (!playingRef.current) return;
+        lowResRef.current = false;
+        setTimeout(_lowResRecov, 8000);
+      }, 8000);
+      void _recovTimer; // intentionally fire-and-forget; self-cancels when play stops
+    }
     kickRender();
     return () => { /* loop self-stops; nothing to cancel here */ };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4296,6 +4411,44 @@ function Editor({ state, setState }) {
     return () => cv.removeEventListener('webglcontextlost', onLost);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // requestVideoFrameCallback: repaint EXACTLY when a preview <video> presents a new frame.
+  // Load events (loadeddata/canplay/seeked) can fire BEFORE the frame is actually presentable,
+  // and the repaint burst is time-boxed (650ms) — so a late first-present was missed and the
+  // preview stayed BLACK with only audio. rVFC fires for paused / off-screen videos too and
+  // re-arms per frame, so the first real frame after load always triggers a paint (both the
+  // main video and any overlay/cut-out videos). Harmless during playback (the loop self-sustains).
+  useEffect(() => {
+    const armed = frameCbArmedRef.current || (frameCbArmedRef.current = new WeakSet());
+    const arm = (v) => {
+      if (!v || typeof v.requestVideoFrameCallback !== 'function' || armed.has(v)) return;
+      armed.add(v);
+      const onFrame = () => {
+        if (!v.isConnected) { armed.delete(v); try { v._smBitmap && v._smBitmap.close && v._smBitmap.close(); } catch {} v._smBitmap = null; return; }
+        const seq = v._smFrameSeq = (v._smFrameSeq || 0) + 1;   // a freshly PRESENTED frame
+        // Snapshot paused / warming frames to an ImageBitmap. texImage2D(<video>) reads BLACK
+        // intermittently from a stale PAUSED video (a Chromium video→GL upload quirk) even right
+        // after a present — but an ImageBitmap is a concrete decoded snapshot that always uploads
+        // correctly. getSource() hands this bitmap to the compositor while the video is paused.
+        // (Live playback uploads the element directly, so we skip the snapshot cost there.)
+        if ((v.paused || v._smWarming) && typeof createImageBitmap === 'function') {
+          createImageBitmap(v).then((bmp) => {
+            if (!v.isConnected || (v._smBitmapSeq || 0) >= seq) { try { bmp.close(); } catch {} return; }  // gone or superseded by a newer snapshot
+            const old = v._smBitmap; v._smBitmap = bmp; v._smBitmapSeq = seq;
+            try { old && old.close && old.close(); } catch {}
+            kickRender();
+            if (paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
+          }).catch(() => {});
+        }
+        kickRender();
+        try { v.requestVideoFrameCallback(onFrame); } catch { armed.delete(v); }
+      };
+      try { v.requestVideoFrameCallback(onFrame); } catch { armed.delete(v); }
+    };
+    arm(videoRef.current);
+    arm(videoRevRef.current);
+    Object.values(videoOverlayRefs.current || {}).forEach(arm);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file, layers]);
   // Phase 2 Tier A: probe the tier once (async — WebCodecs hw check).
   useEffect(() => {
     let alive = true;
@@ -4330,6 +4483,11 @@ function Editor({ state, setState }) {
     try { compRef.current?.dispose(); } catch {}
     for (const vs of videoSourcesRef.current.values()) { try { vs.dispose && vs.dispose(); } catch {} }
     videoSourcesRef.current.clear();
+    // FIX 4A: clear dangling timers
+    try { clearTimeout(snapshotTimerRef.current); } catch {}
+    try { clearTimeout(editorHintTimerRef.current); } catch {}
+    // FIX 4B: close AudioContext to release OS audio resources
+    try { if (audioCtxRef.current) audioCtxRef.current.close(); } catch {}
   }, []);
 
   // An edit invalidates the prepared buffer: bump the token (so a stale render's
@@ -6634,7 +6792,7 @@ function Editor({ state, setState }) {
             // engine could paint BLACK right after loading a new clip (only the audio mirror heard) until
             // the user pokes the timeline — esp. on macOS / HEVC where the first frame decodes slowly.
             // preload="auto" (was "metadata") makes that first frame land without needing an interaction.
-            onLoadedData={() => kickRender()} onCanPlay={() => kickRender()} onSeeked={() => kickRender()}
+            onLoadedData={(e) => { primePresent(e.target); kickRender(3000); }} onCanPlay={() => kickRender()} onSeeked={() => kickRender()}
             style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0, pointerEvents:'none' }} />}
           {file && <video ref={videoRevRef} key={`rev-${file}`} src={fileUrl(file)} muted playsInline preload="auto"
             style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0, pointerEvents:'none' }} />}
@@ -6655,7 +6813,7 @@ function Editor({ state, setState }) {
               // AFTER that (e.g. on opening a project whose BASE is a video-overlay, so
               // there's no mainVideo to drive paints) would otherwise leave the preview
               // black (only the <audio> mirror is heard) until the user scrubs.
-              onLoadedData={() => kickRender()}
+              onLoadedData={(e) => { primePresent(e.target); kickRender(3000); }}
               onSeeked={() => kickRender()}
               onError={() => {
                 // Silent safety net: if the proactive proxy didn't fire (e.g.
