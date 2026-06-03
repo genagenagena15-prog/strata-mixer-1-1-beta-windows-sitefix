@@ -2769,6 +2769,12 @@ function Editor({ state, setState }) {
     // bitmaps/canvas backing them stick around in memory until GC.
     try { videoFrameCacheRef.current.clear(); } catch {}
     try { imgCacheRef.current.clear(); } catch {}
+    // Reset the GL compositor too. Clearing layers WITHOUT resetting it leaves its per-layer textures
+    // and GL state behind; after «Очистить» a freshly REIMPORTED video then rendered BLACK through the
+    // engine while canvas2d (Ctrl+Shift+G) showed it fine — a stale-GL-state bug. Dispose + null it so
+    // the next paint builds a brand-new Compositor with clean state (like a first load).
+    try { compRef.current?.dispose?.(); } catch {}
+    compRef.current = null;
     videoOverlayRefs.current = {};
     audioLayerRefs.current = {};
     setState((s) => ({ ...s, layers: [], file: null }));
@@ -4008,14 +4014,14 @@ function Editor({ state, setState }) {
       if (l.type === 'mainVideo') {
         if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T); if (f) return f; } }
         if (forExport) return null;
-        const v = l.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current; if (!v || v.readyState < 2) return null; return (v.paused && v._smBitmap && v._smBitmapSeq === v._smFrameSeq) ? v._smBitmap : v;
+        const v = l.reversed ? (videoRevRef.current || videoRef.current) : videoRef.current; if (!v || v.readyState < 2) return null; return v.paused ? pausedVideoSource(v) : v;
       }
       if (l.type === 'image') return imgCacheRef.current.get(l.file) || null;
       if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
         if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T - (l.startTime || 0) + (l.srcStart || 0)); if (f) return f; } }
         if (forExport) return null;
         const ov = videoOverlayRefs.current[l.id];
-        if (ov && ov.readyState >= 2 && ov.videoWidth) return (ov.paused && ov._smBitmap && ov._smBitmapSeq === ov._smFrameSeq) ? ov._smBitmap : ov;
+        if (ov && ov.readyState >= 2 && ov.videoWidth) return ov.paused ? pausedVideoSource(ov) : ov;
         const cache = videoFrameCacheRef.current.get(l.id);
         return (cache && cache.width) ? cache : null;
       }
@@ -4253,6 +4259,22 @@ function Editor({ state, setState }) {
   // a ref that's refreshed every render → a continuous drag (loop never restarts) paints
   // the LATEST mask/video position instead of needing an extra "poke" to refresh.
   paintOnceRef.current = paintOnce;
+  // DIAGNOSTIC (temporary): window.__smDiag() forces a fresh paint, then returns the live engine state —
+  // engine on/tier/err, what getSource hands EACH layer (NULL / canvas / <video> + dims), layer geometry,
+  // GL-canvas brightness, and the overlay <video> state. Used to pin down the reimport-after-clear black.
+  if (typeof window !== 'undefined') window.__smDiag = () => {
+    try { paintOnceRef.current && paintOnceRef.current(); } catch (e) {}
+    let ef; try { ef = buildEngineFrame(); } catch (e) { return { buildErr: String((e && e.message) || e) }; }
+    const info = (layers || []).map((l) => {
+      let s = 'n/a', px = null;
+      try { const r = ef.getSource(l); s = (r === null) ? 'NULL' : (typeof r === 'string' ? r : (r.tagName || 'canvas') + ' ' + (r.videoWidth || r.width || 0) + 'x' + (r.videoHeight || r.height || 0)); } catch (e) { s = 'ERR:' + ((e && e.message) || e); }
+      try { px = ef.getPx(l); } catch (e) {}
+      const ov = videoOverlayRefs.current[l.id];
+      return { id: String(l.id).slice(-6), type: l.type, op: l.opacity, st: l.startTime, et: l.endTime, px: px ? { x: Math.round(px.x), y: Math.round(px.y), w: Math.round(px.w), h: Math.round(px.h) } : null, src: s, ovRS: ov ? ov.readyState : null, ovT: ov ? +(ov.currentTime || 0).toFixed(2) : null, ovPaused: ov ? ov.paused : null, ovW: ov ? ov.videoWidth : null };
+    });
+    let glBright = '?'; try { const g = glCanvasRef.current; const t = document.createElement('canvas'); t.width = 16; t.height = 16; const x = t.getContext('2d'); x.drawImage(g, 0, 0, 16, 16); const d = x.getImageData(0, 0, 16, 16).data; let m = 0; for (let i = 0; i < d.length; i += 4) m = Math.max(m, d[i], d[i + 1], d[i + 2]); glBright = m; } catch (e) { glBright = 'ERR'; }
+    return { engineMode: engineModeRef.current, tier: engineTierRef.current, engineErr, T: +((ef.time) || 0).toFixed(2), playing: playingRef.current, loopRunning: loopRunningRef.current, glW: glCanvasRef.current ? glCanvasRef.current.width : null, glH: glCanvasRef.current ? glCanvasRef.current.height : null, glBright, nLayers: (layers || []).length, layers: info };
+  };
   const ensureRenderLoop = () => {
     if (loopRunningRef.current) return;
     loopRunningRef.current = true;
@@ -4300,6 +4322,34 @@ function Editor({ state, setState }) {
   // pokes the timeline (which seeks → forces a present). This was the "load video → black,
   // only audio" bug. Force ONE real seek on first load so the decoder presents that frame
   // right away; requestVideoFrameCallback (below) then repaints it the instant it lands.
+  // A PAUSED <video> can upload BLACK to a WebGL texture via texImage2D even when it visibly shows a
+  // frame (a Chromium video→GL quirk) — this is the "load video → black, only audio" bug, worst on
+  // reimport-after-clear and in PACKAGED builds. 2D drawImage, by contrast, ALWAYS captures the frame
+  // the element is displaying, and uploading a 2D canvas to GL is rock-solid. So while paused we blit
+  // the current frame into a per-element scratch canvas and hand THAT to the compositor (which already
+  // accepts canvas sources). Fully SYNCHRONOUS → none of the createImageBitmap seq-race that left the
+  // packaged build black. Re-blits only when a new frame was presented (rVFC bumps _smFrameSeq), so a
+  // static paused frame costs one draw, not one per paint. During PLAYBACK getSource hands over the live
+  // <video> directly (that path works), so the blit only runs when paused.
+  const pausedVideoSource = (v) => {
+    try {
+      const w = v.videoWidth, h = v.videoHeight;
+      if (!w || !h) return v;                       // no decoded frame yet → caller's readyState guard covers it
+      let c = v._smBlitCanvas;
+      if (!c) { c = v._smBlitCanvas = document.createElement('canvas'); c._cx = c.getContext('2d'); }
+      // ALWAYS re-blit while paused. The <video>'s decoded frame can change WITHOUT a
+      // requestVideoFrameCallback present — e.g. a seek that completes silently after reimport-after-clear.
+      // Gating the blit on _smFrameSeq cached a stale BLACK frame even though the element already held the
+      // picture (diag on the black preview showed the <video> at bright=249 while the canvas blit stayed
+      // black). Paused → low paint rate, and this is the same per-frame copy the compositor already does
+      // during playback, so an unconditional drawImage is cheap and always correct.
+      if (c.width !== w) c.width = w;
+      if (c.height !== h) c.height = h;
+      c._cx.drawImage(v, 0, 0, w, h);
+      return c;
+    } catch { return v; }
+  };
+
   const primePresent = (v) => {
     if (!v || v._smPrimed) return;
     try {
@@ -4423,23 +4473,13 @@ function Editor({ state, setState }) {
       if (!v || typeof v.requestVideoFrameCallback !== 'function' || armed.has(v)) return;
       armed.add(v);
       const onFrame = () => {
-        if (!v.isConnected) { armed.delete(v); try { v._smBitmap && v._smBitmap.close && v._smBitmap.close(); } catch {} v._smBitmap = null; return; }
-        const seq = v._smFrameSeq = (v._smFrameSeq || 0) + 1;   // a freshly PRESENTED frame
-        // Snapshot paused / warming frames to an ImageBitmap. texImage2D(<video>) reads BLACK
-        // intermittently from a stale PAUSED video (a Chromium video→GL upload quirk) even right
-        // after a present — but an ImageBitmap is a concrete decoded snapshot that always uploads
-        // correctly. getSource() hands this bitmap to the compositor while the video is paused.
-        // (Live playback uploads the element directly, so we skip the snapshot cost there.)
-        if ((v.paused || v._smWarming) && typeof createImageBitmap === 'function') {
-          createImageBitmap(v).then((bmp) => {
-            if (!v.isConnected || (v._smBitmapSeq || 0) >= seq) { try { bmp.close(); } catch {} return; }  // gone or superseded by a newer snapshot
-            const old = v._smBitmap; v._smBitmap = bmp; v._smBitmapSeq = seq;
-            try { old && old.close && old.close(); } catch {}
-            kickRender();
-            if (paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
-          }).catch(() => {});
-        }
+        if (!v.isConnected) { armed.delete(v); return; }
+        v._smFrameSeq = (v._smFrameSeq || 0) + 1;   // a freshly PRESENTED frame
+        // A new frame was presented → repaint. While paused, getSource() blits this frame to a 2D
+        // canvas synchronously (pausedVideoSource) — no async ImageBitmap, no seq race. _smFrameSeq
+        // also gates the compositor's per-present upload of the LIVE <video> during playback.
         kickRender();
+        if (paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
         try { v.requestVideoFrameCallback(onFrame); } catch { armed.delete(v); }
       };
       try { v.requestVideoFrameCallback(onFrame); } catch { armed.delete(v); }

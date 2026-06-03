@@ -389,7 +389,7 @@ export class Compositor {
         // seeks briefly drop a <video>'s readyState below 2, and returning null here would
         // flash the layer to BLACK until the seek settles. Only skip on the very first load.
         if (srcReady(src) && this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
-        else if (!rec.hasFrame) continue;
+        else if (src == null || !rec.hasFrame) continue;   // null source (phantom / undecoded layer) → skip; do NOT paint a stale (black) texture over the layers below. A not-ready ELEMENT (mid-scrub) still keeps its last good frame.
         const b = frame.getPx(layer);
         if (!b || b.w <= 0 || b.h <= 0) continue;
         const rect = pxRectToNDC(b.x, b.y, b.w, b.h, W, H);
@@ -549,10 +549,13 @@ export class Compositor {
     if (!(b.x <= 0 && b.y <= 0 && b.x + b.w >= W && b.y + b.h >= H)) return false;
     // must have something to draw (live source ready, or a texture kept from a prior frame —
     // matches the renderFrame "keep last frame during scrub" behaviour)
+    // Require a LIVE-ready source THIS frame to qualify as an occlusion cover. (Previously a stale cached
+    // texture also qualified — so a not-yet-decoded / "phantom" full-frame overlay counted as a cover,
+    // HID the real content layer below it, and itself painted a stale BLACK texture → black preview on
+    // reimport / stacked overlays. The paused-frame blit keeps genuinely-scrubbing layers "ready", so
+    // live-only here does NOT reintroduce scrub flicker.)
     const src = frame.getSource ? frame.getSource(layer) : null;
-    if (srcReady(src)) return true;
-    const rec = this.texCache.get(layer.id);
-    return !!(rec && rec.hasFrame);
+    return srcReady(src);
   }
 
   _drawLayer(tex, rect, opacity, cc, rot, aspect) {
