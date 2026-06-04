@@ -69,20 +69,14 @@ const LAYER_ICONS = {
 // его не прочитает ни движок-декодер, ни ffmpeg-экспорт). Чтобы добавить новую
 // анимацию: положи видео в assets/presets/ и допиши сюда строку.
 const PRESET_OVERLAYS = [
-  { id: 'ball', name: 'Мяч', emoji: '⚽', file: 'ball-fx.mp4',   // мяч + встроенный звук-вжух (картинка не тронута)
-    previewSrc: new URL('../assets/presets/ball-fx.mp4', import.meta.url).href,   // для hover-превью
-    clipColor: '#fde047',   // цвет клипа как у переходов (жёлтый) — единый эффект
-    ccB: 30,                // +30% яркости
-    chroma: { color: '#36cc31', threshold: 45, smoothness: 30 },
-    glow: { color: '#ffffff', blur: 50, opacity: 0.9 } },   // световой ореол-«вспышка» вокруг мяча (на том же слое)
-  { id: 'chicken', name: 'Chicken', emoji: '🐔', file: 'chicken.mp4',   // курица со своим звуком — просто чистый хромакей
-    previewSrc: new URL('../assets/presets/chicken.mp4', import.meta.url).href,
-    clipColor: '#fde047',
-    chroma: { color: '#28e733', threshold: 45, smoothness: 30 } },
-  { id: 'ball2', name: 'Мяч 2', emoji: '⚽', file: 'ball2.mp4',   // ещё один переход со своим звуком — чистый хромакей
+  { id: 'ball', name: 'Мяч', emoji: '⚽', file: 'ball2.mp4',   // «Мяч» (бывш. «Мяч 2») — чистый хромакей, свой звук
     previewSrc: new URL('../assets/presets/ball2.mp4', import.meta.url).href,
     clipColor: '#fde047',
     chroma: { color: '#11f212', threshold: 45, smoothness: 30 } },
+  { id: 'chicken', name: 'Chicken', emoji: '🐔', file: 'chicken.mp4',   // курица со своим звуком — чистый хромакей
+    previewSrc: new URL('../assets/presets/chicken.mp4', import.meta.url).href,
+    clipColor: '#fde047',
+    chroma: { color: '#28e733', threshold: 45, smoothness: 30 } },
 ];
 
 // Subtitle layout constants — SHARED contract with the ASS export in
@@ -5831,28 +5825,14 @@ function Editor({ state, setState }) {
     // chroma key, outer glow / drop shadow / outline, mask cut-outs, GPU transitions, animated subtitles.
     // Plain edits (cuts, basic overlays, text) take the FAST single-pass ffmpeg path — ~a minute again —
     // and ffmpeg decodes continuously, so there's no clip-seam jerk either.
-    const needsEngine = layers.some(l => {
-      if (l.hidden) return false;
-      if (l.glow || l.shadow || l.outline) return true;                                    // outer glow / drop shadow / outline (any layer)
-      if (l.chromaKey && l.chromaKey.color) return true;                                    // exact green-screen removal
-      if (l.type === 'maskedVideo' || l.type === 'transition') return true;                 // cut-out shapes / GPU transition pack
-      if (l.type === 'text' && (Number(l.outlineWidth) || 0) > 0) return true;              // text outline (engine rasteriser)
-      if (l.type === 'subtitles' && l.style && l.style.anim && l.style.anim !== 'none') return true; // animated subtitles
-      return false;
-    });
-    let result;
-    if (fmt === 'mp4' && engineMode && engineTierRef.current === 'A' && needsEngine) {
-      // Tier A + engine ON + GPU effects present → render through the WebGL2 compositor (effects baked
-      // in) + the multi-source audio graph.
-      off?.();   // engine path reports progress via setSaveProgress, not onEditProgress
-      result = await runEngineExport(outPath, (p) => setSaveProgress(Math.min(99, p)));
-      if (result?.ok) { playDoneSound(); setSaveProgress(100); setSaveFinishing(true); }
-    } else {
-      // Fast single-pass ffmpeg path — plain projects, or mp3/webm, or Tier B.
-      result = await window.strata?.editVideo?.(
-        buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
-      );
-    }
+    // v1.3.5-SPEED: ALWAYS export through the fast single-pass ffmpeg path. The per-frame GPU-engine
+    // export (compositor.renderFrame → gl.readPixels ~8MB/frame → IPC → ffmpeg rawvideo) is 10-20× slower
+    // and had silently become the default for mp4 on capable GPUs — THAT is the regression vs 1.3.5.
+    // ffmpeg bakes chroma (chromakey), transitions, colour-correction, blur; only GPU-only glow/shadow/
+    // outline aren't baked (exactly as in 1.3.5). runEngineExport stays in the code for a future opt-in.
+    let result = await window.strata?.editVideo?.(
+      buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
+    );
     exportingRef.current = false;
     if (result && !result.ok && result.error !== 'canceled') { setSaveProgress(null); setSaveFinishing(false); alert('Ошибка: ' + result.error); }
     else if (result?.ok) window.strata?.revealFile?.(outPath);

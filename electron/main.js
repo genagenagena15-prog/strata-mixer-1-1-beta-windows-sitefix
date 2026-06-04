@@ -3469,21 +3469,24 @@ async function detectAcceleration(ffmpeg) {
 let _hwEncCache = null;
 async function detectWorkingH264Encoder(ffmpeg) {
   if (_hwEncCache !== null) return _hwEncCache;
-  for (const codec of ['h264_nvenc', 'h264_qsv', 'h264_amf']) {
-    const ok = await new Promise((resolve) => {
-      try {
-        const p = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
-          '-i', 'color=c=black:s=128x128:r=5', '-frames:v', '3', '-c:v', codec, '-f', 'null', '-'],
-          { windowsHide: true });
-        const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(false); }, 6000);
-        p.on('close', (code) => { clearTimeout(t); resolve(code === 0); });
-        p.on('error', () => { clearTimeout(t); resolve(false); });
-      } catch { resolve(false); }
-    });
-    if (ok) { _hwEncCache = codec; return codec; }
-  }
-  _hwEncCache = 'libx264';
-  return 'libx264';
+  const test = (codec) => new Promise((resolve) => {
+    try {
+      const p = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+        '-i', 'color=c=black:s=128x128:r=5', '-frames:v', '3', '-c:v', codec, '-f', 'null', '-'],
+        { windowsHide: true });
+      const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(false); }, 3500);
+      p.on('close', (code) => { clearTimeout(t); resolve(code === 0); });
+      p.on('error', () => { clearTimeout(t); resolve(false); });
+    } catch { resolve(false); }
+  });
+  // Probe candidates in PARALLEL — worst case ~3.5s ONCE (cached), NOT 3×6s=18s sequential. That 18s on
+  // machines with no working GPU encoder (weak PCs / VMs) was itself a first-export stall. Priority order:
+  // nvenc > qsv > amf; libx264 (CPU) if none work.
+  const codecs = ['h264_nvenc', 'h264_qsv', 'h264_amf'];
+  const oks = await Promise.all(codecs.map(test));
+  const idx = oks.findIndex(Boolean);
+  _hwEncCache = idx >= 0 ? codecs[idx] : 'libx264';
+  return _hwEncCache;
 }
 
 function chooseEncoder(settings, acceleration) {
