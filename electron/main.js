@@ -9,9 +9,9 @@ const extractZip = require('extract-zip');
 
 // Volume taper for exports: matches the renderer's volumeCurve. Piecewise —
 // fine quiet control below 50 % (5 % ≈ −46 dB, 1 % ≈ −74 dB), linear from
-// 50 – 100 %, cubic boost above 100 %. The master loudnorm downstream keeps
-// the overall export at -16 LUFS so quieting one layer doesn't drop the
-// whole mix's perceived level.
+// 50 – 100 %, cubic boost above 100 %. Export keeps the source's native loudness
+// (no master loudnorm) so the render matches the live preview; a transparent peak
+// limiter downstream only prevents clipping, it never changes perceived level.
 function volumeCurve(percent) {
   const v = Math.max(0, Number(percent) || 0) / 100;
   if (v <= 0.5) return 2 * v * v;
@@ -31,8 +31,15 @@ function atempoChain(speed) {
   return at.join(',');
 }
 
-// Master loudness normalisation appended to the final audio mix (−16 LUFS).
+// Master loudness normalisation (−16 LUFS). Kept available in case a per-export "normalize
+// loudness" toggle is added later, but NOT used by default any more: it pulled loud sources DOWN
+// to −16 LUFS, so the render sounded quieter than the live preview (which plays at native loudness).
 const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+// Default master policy: keep the source's NATIVE loudness (render == preview) and only tame peaks
+// with a transparent limiter so layered or already-hot/clipping clips can't distort. level=disabled
+// caps peaks WITHOUT raising the overall level (it never makes the audio louder), so perceived
+// loudness stays exactly what you hear in the preview.
+const PEAK_LIMIT = 'alimiter=limit=0.95:level=disabled';
 
 // ── Shared audio-filtergraph builders ──────────────────────────────────────────────────────
 // Three paths build essentially the same per-source audio sub-chain + final mix: engine
@@ -50,12 +57,12 @@ function audioClipChain(idx, trimStart, trimEnd, delayMs, label, opts) {
   return `[${idx}:a]atrim=${trimStart.toFixed(3)}:${trimEnd.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delayMs}:all=1${vol}${env}[${label}]`;
 }
 
-// Final mix tail → amix N sources (or pass one through), optional loudnorm, then aresample to
-// absorb atrim/atempo/adelay PTS drift. loudnorm/firstPts default ON (the export paths); the
-// transcription path passes both false.
+// Final mix tail → amix N sources (or pass one through), optional master peak-limiter, then
+// aresample to absorb atrim/atempo/adelay PTS drift. limiter/firstPts default ON (the export
+// paths, so layered/hot clips can't clip); the transcription path passes both false (raw signal).
 function finalAudioMix(mixInputs, label, opts) {
   const o = opts || {};
-  const ln = (o.loudnorm === false) ? '' : `${LOUDNORM},`;
+  const ln = (o.loudnorm === false) ? '' : `${PEAK_LIMIT},`;   // peak limiter (native loudness), not loudnorm
   // aformat=channel_layouts=stereo: the newer ffmpeg in the Mac CI build refuses to negotiate the
   // channel layout between aresample and the output format ("Cannot select channel layout … Conversion
   // failed!" → Mac export crashes). Pinning an explicit stereo layout fixes Mac and is a harmless no-op
@@ -578,7 +585,10 @@ async function downloadAndRunRequiredUpdate(data) {
 
     await new Promise(resolve => setTimeout(resolve, 900));
 
-    const child = spawn(installerPath, [], {
+    // '--updated /S --force-run' = the same silent args electron-updater feeds the assisted NSIS
+    // installer: install in-place to the existing location with NO wizard, then relaunch. Without
+    // them the assisted (oneClick:false) installer would pop the full wizard + UAC on update.
+    const child = spawn(installerPath, ['--updated', '/S', '--force-run'], {
       detached: true,
       stdio: 'ignore',
       windowsHide: false
@@ -663,11 +673,18 @@ function getSafeWindowBounds() {
   return { width, height, minWidth, minHeight };
 }
 
+// Drive the splash's REAL progress bar from main-process load milestones.
+// Safe no-op if the splash is already gone / destroyed.
+function setSplashProgress(p) {
+  if (!splashWindow || splashWindow.isDestroyed()) return;
+  splashWindow.webContents.executeJavaScript('window.__setProgress && window.__setProgress(' + Number(p) + ')').catch(() => {});
+}
+
 function createSplashWindow() {
   const theme = readTheme();
   splashWindow = new BrowserWindow({
-    width: 300,
-    height: 332,
+    width: 580,
+    height: 240,
     resizable: false,
     minimizable: false,
     maximizable: false,
@@ -676,7 +693,7 @@ function createSplashWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     show: false,
-    backgroundColor: theme === 'light' ? '#ebf1f8' : '#020202',
+    backgroundColor: theme === 'light' ? '#ecf0f9' : '#010101',   // EXACT cube-video corner colours (white/black) → splash blends seamlessly
     webPreferences: { contextIsolation: true, nodeIntegration: false }
   });
   splashShownAt = Date.now();
@@ -684,6 +701,8 @@ function createSplashWindow() {
     hash: encodeURIComponent(theme + '|' + CURRENT_DISPLAY_VERSION)
   });
   splashWindow.once('ready-to-show', () => { if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show(); });
+  // Milestone: the splash itself painted → small early progress.
+  splashWindow.webContents.once('did-finish-load', () => setSplashProgress(15));
   splashWindow.on('closed', () => { splashWindow = null; });
   return splashWindow;
 }
@@ -760,13 +779,25 @@ function createWindow() {
     }
   });
 
+  // Drive the splash's real progress bar from the main window's load milestones.
+  setSplashProgress(40);                                                         // main window created / loading
+  mainWindow.webContents.once('did-start-loading', () => setSplashProgress(65)); // content fetch underway
+  mainWindow.webContents.once('did-finish-load', () => setSplashProgress(90));   // renderer finished loading
+
   // Keep the small splash visible until the main window has painted, then
-  // swap to it. A minimum on-screen time lets the splash animation play.
+  // swap to it. A short floor lets the bar reach 100% + the finish clip read.
   mainWindow.once('ready-to-show', () => {
-    const wait = Math.max(0, 2200 - (Date.now() - splashShownAt));
+    setSplashProgress(100);
+    const wait = Math.max(0, 500 - (Date.now() - splashShownAt));   // минимум 0.5с на экране (чтобы Кубик + полоса успели прочитаться)
     setTimeout(() => {
-      closeSplash();
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show();
+      // Play the celebration clip + fade the splash out, then swap.
+      if (splashWindow && !splashWindow.isDestroyed()) {
+        splashWindow.webContents.executeJavaScript('window.__finish && window.__finish()').catch(() => {});
+      }
+      setTimeout(() => {
+        closeSplash();
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show();
+      }, 250); // matches the CSS opacity fade
     }, wait);
   });
 
@@ -1068,7 +1099,8 @@ ipcMain.handle('update:rollback', async () => {
     });
     setUpdateWindowStatus({ title: 'Загрузка завершена', detail: 'Запускаем установщик. Strata Mixer закроется.', status: 'Готово', percent: 100 });
     await new Promise((r) => setTimeout(r, 800));
-    const child = spawn(installerPath, [], { detached: true, stdio: 'ignore', windowsHide: false });
+    // Silent in-place install + relaunch (assisted installer would otherwise show the full wizard).
+    const child = spawn(installerPath, ['--updated', '/S', '--force-run'], { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
     updateWindowCanClose = true;
     isQuitting = true;
@@ -1152,6 +1184,19 @@ ipcMain.handle('presets:getPath', async (_e, name) => {
     return { ok: false, error: 'not found' };
   }
 });
+// Write a renderer-encoded PNG (pre-baked static GPU effect: outline/shadow/glow) to a temp file and
+// return its path, so the FAST ffmpeg export can composite it as an overlay instead of paying the slow
+// per-frame engine export. Tracked in liveTmpFiles → cleaned up on quit.
+ipcMain.handle('temp:write-png', async (_e, bytes) => {
+  try {
+    const dir = path.join(app.getPath('temp'), 'strata-prebake');
+    await fs.promises.mkdir(dir, { recursive: true });
+    const p = path.join(dir, `fx-${Date.now()}-${Math.round(Math.random() * 1e6)}.png`);
+    await fs.promises.writeFile(p, Buffer.from(bytes));
+    try { liveTmpFiles.add(p); } catch {}
+    return { ok: true, path: p };
+  } catch (e) { return { ok: false, error: String(e) }; }
+});
 // Chroma-key eyedropper fallback for PACKAGED builds: webSecurity:true taints the
 // renderer canvas so it can't read a file:// video's pixels. Extract ONE pixel at
 // source (x,y) of the frame at time t via ffmpeg → "#rrggbb". In dev the renderer
@@ -1184,6 +1229,8 @@ ipcMain.handle('chroma:sample-pixel', async (_e, payload) => {
 // Used after adelay (stream t == timeline t). Returns null when there's nothing to automate.
 function buildVolEnvExpr(keys, clipStartSec) {
   if (!Array.isArray(keys) || keys.length === 0) return null;
+  const DB_FLOOR = -60;                                        // mirror the renderer's VOL_DB_FLOOR
+  const g2db = (g) => (g <= 0 ? DB_FLOOR : Math.max(DB_FLOOR, 20 * Math.log10(g)));
   const pts = keys
     .map(k => ({ t: (Number(clipStartSec) || 0) + Math.max(0, Number(k.t) || 0), v: Math.max(0, Math.min(2, Number(k.v))) }))
     .filter(p => isFinite(p.t) && isFinite(p.v))
@@ -1192,9 +1239,15 @@ function buildVolEnvExpr(keys, clipStartSec) {
   let expr = pts[pts.length - 1].v.toFixed(4);                 // after last point → hold
   for (let i = pts.length - 1; i > 0; i--) {
     const a = pts[i - 1], b = pts[i];
-    const seg = (b.t - a.t) > 1e-4
-      ? `(${a.v.toFixed(4)}+(t-${a.t.toFixed(4)})*${((b.v - a.v) / (b.t - a.t)).toFixed(6)})`
-      : b.v.toFixed(4);
+    let seg;
+    if ((b.t - a.t) <= 1e-4 || a.v === b.v) {
+      seg = b.v.toFixed(4);                                    // held → constant
+    } else {
+      // Interpolate in dB (gain(t) = 10^((dbA + (t-tA)*slope)/20)) → even, natural fade, no
+      // end-of-ramp "burst". Matches the renderer's dB interpolation so export == preview.
+      const dbA = g2db(a.v), slope = (g2db(b.v) - dbA) / (b.t - a.t);
+      seg = `pow(10,(${dbA.toFixed(4)}+(t-${a.t.toFixed(4)})*${slope.toFixed(6)})/20)`;
+    }
     expr = `if(lt(t,${b.t.toFixed(4)}),${seg},${expr})`;
   }
   expr = `if(lt(t,${pts[0].t.toFixed(4)}),${pts[0].v.toFixed(4)},${expr})`;  // before first → hold
@@ -1204,7 +1257,7 @@ function buildVolEnvExpr(keys, clipStartSec) {
 // Phase 2 engineExport — receive compositor-rendered RGBA frames + spawn ffmpeg (rawvideo → H.264 +
 // optional main-source audio). A NEW, default-off path; the existing video:edit filtergraph is untouched.
 let _engExp = null;
-ipcMain.handle('engine:export-begin', (_e, meta) => {
+ipcMain.handle('engine:export-begin', async (_e, meta) => {
   if (_engExp && !_engExp.isDead()) {
     return { ok: false, error: 'export already in progress' };
   }
@@ -1218,6 +1271,15 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
   // engine export sounds identical. `audioSources` is built by the renderer (runEngineExport).
   let srcs = Array.isArray(audioSources) ? audioSources.filter(s => s && s.file && fs.existsSync(s.file)) : [];
   if (!srcs.length && mainFile && fs.existsSync(mainFile)) srcs = [{ file: mainFile, trimStart: 0, trimEnd: 1e6, delayMs: 0, speed: 1, volume: 100 }];
+  // Probe each source for an actual audio stream. A silent clip (e.g. the GIF-derived chicken_jump
+  // preset, or any user video with no audio track) would make `[i:a]` reference a non-existent stream
+  // and break the whole filtergraph → engine export fails. Mirror the video:edit path: substitute a
+  // silent anullsrc so the clip still holds its slot in the mix.
+  const engHasAudio = new Map();
+  for (const f of new Set(srcs.map(s => s.file))) {
+    try { const p = await probeMediaInfo(ffmpeg, f); engHasAudio.set(f, !!p.hasAudio); }
+    catch { engHasAudio.set(f, false); }
+  }
   const filter = [], mix = [];
   srcs.forEach((s, i) => {
     args.push('-i', s.file);                         // input index = i+1 (0 = the rawvideo pipe)
@@ -1225,6 +1287,12 @@ ipcMain.handle('engine:export-begin', (_e, meta) => {
     const ts = Math.max(0, Number(s.trimStart) || 0);
     const te = Math.max(ts + 0.01, Number(s.trimEnd) || (ts + 1));
     const delay = Math.max(0, Math.round(Number(s.delayMs) || 0));
+    if (!engHasAudio.get(s.file)) {                  // no audio track → silent placeholder keeps the mix slot
+      const segDur = Math.max(0.1, (te - ts) / sp);
+      filter.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${segDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delay}:all=1[au${i}]`);
+      mix.push(`[au${i}]`);
+      return;
+    }
     const vol = volumeCurve(s.volume != null ? Number(s.volume) : 100).toFixed(4);
     const tempo = (Math.abs(sp - 1) > 1e-3) ? (',' + atempoChain(sp)) : '';
     // Volume automation (keyframe envelope) → applied AFTER adelay where stream t == timeline t.
@@ -2458,7 +2526,12 @@ ipcMain.handle('video:edit', async (_event, payload) => {
             const hex = String(layer.chromaKey.color).replace('#', '').slice(0, 6).padStart(6, '0');
             const sim = Math.max(0.01, Math.min(1, (layer.chromaKey.threshold != null ? layer.chromaKey.threshold : 45) / 100 * 0.5));
             const blend = Math.max(0, Math.min(1, (layer.chromaKey.smoothness != null ? layer.chromaKey.smoothness : 30) / 100 * 0.4));
-            chromaPart = `,chromakey=0x${hex}:${sim.toFixed(3)}:${blend.toFixed(3)}`;
+            // Despill (matches the GL shader): a green key leaves a green rim. When the key colour
+            // is predominantly green, pull green down via colorchannelmixer so the fringe stops
+            // looking green. Gated on a green key so blue/other screens are never touched.
+            const kr = parseInt(hex.slice(0, 2), 16), kg = parseInt(hex.slice(2, 4), 16), kb = parseInt(hex.slice(4, 6), 16);
+            const despill = (kg > kr && kg > kb) ? ',colorchannelmixer=gr=0.15:gg=0.70:gb=0.15' : '';
+            chromaPart = `,chromakey=0x${hex}:${sim.toFixed(3)}:${blend.toFixed(3)}${despill}`;
           }
           filterParts.push(`[${idx}:v]trim=start=${ovSrc}:end=${(ovSrc + ovDur * ovSp).toFixed(3)},setpts=(PTS-STARTPTS)/${ovSp}+${layer.startTime || 0}/TB,scale=${scaleW}:${scaleH}${ccPart}${chromaPart},format=rgba[vov${i}]`);
           filterParts.push(`${videoStream}[vov${i}]overlay=${x}:${y}:${enable}[vvidov${i}]`);
@@ -2689,11 +2762,12 @@ ipcMain.handle('video:edit', async (_event, payload) => {
       // input as "ended early" → 2-sec dropout fade-out kicks in and the
       // rest of the audio disappears (the exact symptom of the cut+mask
       // + cut bug). dropout_transition=0 also disables that fade entirely.
-      // loudnorm normalizes the final mix to the streaming/broadcast standard
-      // -16 LUFS with peaks capped at -1.5 dBTP. This means "naturally quiet"
-      // sources (voice files at -40 dB, etc.) come out at a consistent loud
-      // level in every export, instead of sounding noticeably quieter than
-      // the rest of the project. Single-pass mode — fast enough for export.
+      // The final mix keeps the source's NATIVE loudness (no loudnorm) so the
+      // export matches what you hear in the live preview — earlier we normalised
+      // to -16 LUFS, which pulled loud social/music sources DOWN and made the
+      // render sound quieter than the preview. A transparent peak limiter
+      // (PEAK_LIMIT) only stops layered/hot clips from clipping; it never raises
+      // the level. (LOUDNORM is still defined if a normalize toggle is added.)
       filterParts.push(finalAudioMix(mixInputs, 'auFinal'));
       audioMap = '[auFinal]';
     }
@@ -2940,6 +3014,14 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     throw new Error('В проекте нет аудио для распознавания (все слои без звука)');
   }
 
+  // Output length must cover the WHOLE timeline even if the renderer's totalDuration is stale
+  // (e.g. a clip added after a cut / «Вырезка» didn't extend it) — otherwise the mp3 is cut
+  // mid-project and Whisper never sees speech past that point → subtitles stop in the middle.
+  let contentEnd = (mainVideo || baseAudio) ? Math.max(0, Number(videoEnd) || 0) : 0;
+  for (const l of vovLayers) contentEnd = Math.max(contentEnd, Number(l.endTime ?? totalDur) || 0);
+  for (const l of audLayers) contentEnd = Math.max(contentEnd, Number(l.endTime ?? totalDur) || 0);
+  const outDur = Math.min(SUBTITLE_MAX_SECONDS, Math.max(0.1, totalDur, contentEnd));
+
   filterParts.push(finalAudioMix(mixInputs, 'afin', { loudnorm: false, firstPts: false }));
 
   const args = [
@@ -2951,7 +3033,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     '-ar', '16000',       // 16kHz — Whisper's native rate (smaller file, same quality)
     '-c:a', 'libmp3lame',
     '-b:a', '64k',        // tiny file — keeps us well under Groq's 25MB cap
-    '-t', String(totalDur),
+    '-t', String(outDur),
     '-y', outPath,
   ];
 

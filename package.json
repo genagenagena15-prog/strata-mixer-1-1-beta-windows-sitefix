@@ -56,11 +56,19 @@
       "icon": "assets/strata_mixer_v1_2_4.ico"
     },
     "nsis": {
-      "oneClick": true,
+      "oneClick": false,
       "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Strata Mixer",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "assets/strata_mixer_v1_2_4.ico",
+      "uninstallerIcon": "assets/strata_mixer_v1_2_4.ico",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/installerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp",
       "include": "build/installer.nsh"
     },
     "mac": {
@@ -101,5 +109,5 @@
     "wait-on": "^9.0.10",
     "wrangler": "^4.95.0"
   },
-  "publicVersion": "v1.3.8"
+  "publicVersion": "v1.4 beta"
 }

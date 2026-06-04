@@ -73,7 +73,15 @@ void main(){
   vec4 t = texture(uTex, vUv);
   float d = distance(chroma(t.rgb), chroma(uKey));
   float a = smoothstep(uThresh, uThresh + max(uSmooth, 1e-4), d);
-  vec3 c = applyCC(t.rgb, uB, uC, uS, uH);
+  vec3 rgb = t.rgb;
+  // Despill: a green screen leaves a green rim/cast on the kept pixels. When the KEY is
+  // predominantly green, clamp green so it can't exceed the brighter of red/blue — this kills
+  // the green fringe but leaves yellows/whites alone (a chicken/ball isn't green). Skips
+  // blue/other-coloured keys so they're never desaturated.
+  if (uKey.g > uKey.r && uKey.g > uKey.b) {
+    rgb.g = min(rgb.g, max(rgb.r, rgb.b));
+  }
+  vec3 c = applyCC(rgb, uB, uC, uS, uH);
   frag = vec4(clamp(c, 0.0, 1.0), t.a * a * uOpacity);
 }`;
 
@@ -501,6 +509,65 @@ export class Compositor {
     gl.uniform4f(this.progBlit.u.uRect, -1, -1, 1, 1);
     gl.uniform1i(this.progBlit.u.uFlip, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // Pre-bake helper: render ONE layer's STATIC GPU effect (glow/shadow/outline) onto a TRANSPARENT
+  // background and read it back as RGBA (row 0 = bottom). Lets the FAST ffmpeg export composite the
+  // effect as a PNG overlay instead of paying the slow per-frame engine export. For maskedVideo we bake
+  // ONLY the edge effect (effectsOnly — the video fill is dynamic, stays in ffmpeg); for image we can
+  // bake the whole layer + effect. Returns null if the layer isn't bakeable this frame.
+  renderLayerOnly(frame, layerId, effectsOnly) {
+    const gl = this.gl;
+    const W = frame.W, H = frame.H, bw = W, bh = H;
+    if (this.canvas.width !== bw || this.canvas.height !== bh) { this.canvas.width = bw; this.canvas.height = bh; }
+    this.scene.resize(bw, bh);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.clearColor(0, 0, 0, 0);               // transparent background
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+    const layer = frame.layers.find(l => l.id === layerId);
+    if (!layer) return null;
+    const t = frame.time;
+
+    if (layer.type === 'image' || layer.type === 'videoOverlay') {
+      const src = frame.getSource(layer);
+      const rec = this._texFor(layer.id);
+      if (srcReady(src)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; }
+      else if (!rec.hasFrame) return null;
+      const b = frame.getPx(layer);
+      if (!b || b.w <= 0 || b.h <= 0) return null;
+      const rect = pxRectToNDC(b.x, b.y, b.w, b.h, W, H);
+      const opacity = layer.type === 'image' ? (layer.opacity ?? 100) / 100 : 1;
+      const cc = frame.getCC ? frame.getCC(layer) : null;
+      const rot = -(layer.angle || 0) * Math.PI / 180, aspect = W / H;
+      const hasChroma = !!(layer.chromaKey && layer.chromaKey.color);
+      const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow), ol = this._outlineParams(layer.outline);
+      if (sh || gl2 || ol) {
+        const sil = () => { if (hasChroma) this._drawChromaLayer(rec.tex, rect, opacity, null, layer.chromaKey, rot, aspect); else this._drawLayer(rec.tex, rect, opacity, null, rot, aspect); };
+        if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);
+        if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);
+        if (ol) this._drawLayerShadow(frame, ol, sil, bw, bh, false, OUTLINE_THRESH, this._gradFor(layer.outline, b, W, H));
+      }
+      if (!effectsOnly) { if (hasChroma) this._drawChromaLayer(rec.tex, rect, opacity, cc, layer.chromaKey, rot, aspect); else this._drawLayer(rec.tex, rect, opacity, cc, rot, aspect); }
+    } else if (layer.type === 'maskedVideo') {
+      // Only the edge effect — the masked video fill stays dynamic (drawn by ffmpeg).
+      const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow), ol = this._outlineParams(layer.outline);
+      if (!sh && !gl2 && !ol) return null;
+      const sil = (fbo) => this._drawMaskedVideo(frame, layer, bw, bh, fbo);
+      if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);
+      if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);
+      if (ol) this._drawLayerShadow(frame, ol, sil, bw, bh, false, OUTLINE_THRESH, this._gradFor(layer.outline, frame.getPx(layer), W, H));
+    } else {
+      return null;
+    }
+
+    const buf = new Uint8Array(W * H * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    return buf;   // row 0 = bottom (GL order) — caller flips for a PNG
   }
 
   // Occlusion culling — index of the TOPMOST layer that is an opaque full-frame cover (a solid

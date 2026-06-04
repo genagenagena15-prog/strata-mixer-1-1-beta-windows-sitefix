@@ -73,10 +73,14 @@ const PRESET_OVERLAYS = [
     previewSrc: new URL('../assets/presets/ball2.mp4', import.meta.url).href,
     clipColor: '#fde047',
     chroma: { color: '#11f212', threshold: 45, smoothness: 30 } },
-  { id: 'chicken', name: 'Chicken', emoji: '🐔', file: 'chicken.mp4',   // курица со своим звуком — чистый хромакей
+  { id: 'chicken_jump', name: 'Chicken', emoji: '🐔', file: 'chicken_jump.mp4',   // новый «Chicken» (chicken_jump_green.gif → mp4): чистый зелёный фон #00ff00, со звуком кудахтанья (1с, запечён по центру клипа)
+    previewSrc: new URL('../assets/presets/chicken_jump.mp4', import.meta.url).href,
+    clipColor: '#fde047',
+    chroma: { color: '#00ff00', threshold: 40, smoothness: 32 } },
+  { id: 'chicken', name: 'Chicken R7', emoji: '🐔', file: 'chicken.mp4',   // бывш. «Chicken» → теперь «Chicken R7» — курица со своим звуком
     previewSrc: new URL('../assets/presets/chicken.mp4', import.meta.url).href,
     clipColor: '#fde047',
-    chroma: { color: '#28e733', threshold: 45, smoothness: 30 } },
+    chroma: { color: '#28e733', threshold: 30, smoothness: 26 } },   // порог понижен: курица была слишком прозрачной (выбивался зелёный спилл)
 ];
 
 // Subtitle layout constants — SHARED contract with the ASS export in
@@ -281,6 +285,13 @@ function migrateLegacyLayers(layers) {
 // Applied in BOTH preview (per-frame gain) and export (ffmpeg volume expression) → render == preview.
 // (Audio-bearing layer types are checked via the component-scope LAYER_HAS_AUDIO(type) helper.)
 function volKeysOf(layer) { return (layer && Array.isArray(layer.volKeys)) ? layer.volKeys : []; }
+// The volume envelope lives in PERCEPTUAL (decibel) space so it matches how the ear hears:
+// ramps between points fade EVENLY instead of "bursting" near the end the way a straight gain
+// ramp does. VOL_DB_FLOOR = how many dB below unity counts as silence for a ramp (a point at
+// gain 0 fades from here, not from −∞). Stored keyframe value stays the linear gain.
+const VOL_DB_FLOOR = -60;
+const gainToDb = (g) => (g <= 0 ? VOL_DB_FLOOR : Math.max(VOL_DB_FLOOR, 20 * Math.log10(g)));
+const dbToGain = (db) => (db <= VOL_DB_FLOOR ? 0 : Math.pow(10, db / 20));
 function volFactorAt(keys, tRel) {
   if (!keys || !keys.length) return 1;
   const n = keys.length;
@@ -289,24 +300,31 @@ function volFactorAt(keys, tRel) {
   for (let i = 1; i < n; i++) {
     if (tRel <= keys[i].t) {
       const a = keys[i - 1], b = keys[i];
-      return a.v + (b.v - a.v) * ((tRel - a.t) / Math.max(1e-4, b.t - a.t));
+      if (a.v === b.v) return a.v;
+      const f = (tRel - a.t) / Math.max(1e-4, b.t - a.t);     // interpolate in dB → natural fade
+      return dbToGain(gainToDb(a.v) + (gainToDb(b.v) - gainToDb(a.v)) * f);
     }
   }
   return keys[n - 1].v;
 }
-// Perceptual fader taper for the volume envelope: equal vertical movement ≈ equal perceived
-// loudness change, so dragging is GENTLE around unity (fine control) and only reaches the
-// extremes near the very top/bottom. P>1 = gentler near 1.0. p: 0=top(loud)…0.5=middle(1.0)…
-// 1=bottom(silent). gain: 0..vmax (1 = original level). Stored value stays the gain, so the
-// envelope/export consume it unchanged — only the drag↔position mapping is curved.
-const VOL_CURVE_P = 2.5;
+// Perceptual fader taper: vertical position ↔ gain is laid out in DECIBELS, so equal drag = equal
+// loudness change everywhere — you can actually "catch" −10/−15 dB in the middle instead of the
+// level diving from loud to silent in the last few pixels. p: 0=top(louder, +TOP dB) … 0.5=middle
+// (0 dB = original) … 1=bottom(silent). Stored value stays the linear gain (export consumes it raw).
+const VOL_BOT_DB = -48;                                  // bottom of the fader ≈ −48 dB, then silence
 function volPosToGain(p, vmax) {
-  const x = (0.5 - Math.max(0, Math.min(1, p))) * 2;   // +1 top … 0 middle … -1 bottom
-  return x >= 0 ? (1 + Math.pow(x, VOL_CURVE_P) * (vmax - 1)) : (1 - Math.pow(-x, VOL_CURVE_P));
+  p = Math.max(0, Math.min(1, p));
+  const topDb = 20 * Math.log10(Math.max(1.0001, vmax || 2));   // +6 dB when vmax = 2
+  if (p <= 0.5) return Math.pow(10, (topDb * (0.5 - p) * 2) / 20);
+  if (p >= 0.992) return 0;                              // very bottom snaps to true silence
+  return Math.pow(10, (VOL_BOT_DB * (p - 0.5) * 2) / 20);
 }
 function volGainToPos(v, vmax) {
-  if (v >= 1) return 0.5 - Math.pow((v - 1) / Math.max(1e-6, vmax - 1), 1 / VOL_CURVE_P) / 2;
-  return 0.5 + Math.pow(Math.max(0, 1 - v), 1 / VOL_CURVE_P) / 2;
+  if (v <= 0) return 1;
+  const topDb = 20 * Math.log10(Math.max(1.0001, vmax || 2));
+  const db = 20 * Math.log10(v);
+  if (db >= 0) return 0.5 - Math.min(1, db / topDb) / 2;
+  return 0.5 + Math.min(1, db / VOL_BOT_DB) / 2;
 }
 // Waveform fill path in a 0..100 × 0..100 box (centre line = 50), top mirrored to bottom.
 function waveformPath100(peaks) {
@@ -351,7 +369,7 @@ function VolumeEnvelope({ layer, clipDur, peaks, onChange }) {
     const v = Math.max(0, Math.min(VMAX, volPosToGain(p, VMAX)));
     return { t, v };
   };
-  const onMove = (e) => { if (dragRef.current == null) return; const { t, v } = fromEvent(e); const ks = keys.slice(); ks[dragRef.current] = { t, v }; onChange(sortK(ks)); };
+  const onMove = (e) => { if (dragRef.current == null) return; const { t, v } = fromEvent(e); const ks = keys.slice(); const moved = { t, v }; ks[dragRef.current] = moved; const sorted = sortK(ks); dragRef.current = sorted.indexOf(moved); onChange(sorted); };   // track the dragged point by identity: after a time-reorder its index moves, so re-find it (else the next move grabs the wrong point)
   const onUp = (e) => { if (dragRef.current != null) { dragRef.current = null; try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {} } };
   // The line ALWAYS spans the full clip width: held flat at the first point's value before it, and at
   // the last point's value after it (matches volFactorAt's clamping). Empty → flat 100% across.
@@ -4060,7 +4078,7 @@ function Editor({ state, setState }) {
     raf = requestAnimationFrame(loop);
     return () => { cancelAnimationFrame(raf); try { presetPrevVideoRef.current?.pause(); } catch {} };
   }, [effPreview]);
-  useEffect(() => () => { try { effPrevCompRef.current?.dispose?.(); } catch {} }, []);
+  useEffect(() => () => { try { effPrevCompRef.current?.dispose?.(); } catch {} try { presetPrevVideoRef.current?.remove(); presetPrevVideoRef.current = null; } catch {} }, []);
 
   // Lazily decode an audio/video file → downsampled peaks for the timeline waveform. Cached per file.
   const ensureWave = (file) => {
@@ -5771,7 +5789,7 @@ function Editor({ state, setState }) {
   }
   // Build the exact payload video:edit consumes. Overrides let the preview-proxy
   // reuse it at low res / temp path / preview channel — guaranteeing preview=output.
-  function buildEditPayload({ outWidth: ow, outHeight: oh, outPath, format, quality, custom, preview }) {
+  function buildEditPayload({ outWidth: ow, outHeight: oh, outPath, format, quality, custom, preview, layersOverride }) {
     const { baseVid, baseAud, baseFile } = computeExportBase();
     if (!baseFile) return null;
     const baseAudioPayload = baseAud ? {
@@ -5790,7 +5808,7 @@ function Editor({ state, setState }) {
       mainVideo: baseVid ? { ...baseVid, type: 'mainVideo' } : (layers.find(l => l.type === 'mainVideo') || null),
       baseAudio: baseAudioPayload,
       baseAudioMuted: !!(baseAud && baseAud.muted),
-      layers: layers
+      layers: (layersOverride || layers)
         .filter(l => l !== baseVid && l !== baseAud && l.type !== 'mainVideo' && !(l.hidden && !hasAudioType(l)))
         .map(l => l.type === 'subtitles'
           ? { ...l, _layout: subtitleLayoutsRef.current.get(l.id) || buildSubtitleLayout(l) }
@@ -5798,6 +5816,25 @@ function Editor({ state, setState }) {
       outWidth: ow, outHeight: oh, bgColor, fadeIn, fadeOut, outPath,
       format, quality, custom, preview: !!preview,
     };
+  }
+  // Pre-bake ONE layer's static GPU effect (outline/shadow/glow) to a transparent PNG on disk via the
+  // engine, then write it through IPC → returns the temp path, or null on any failure. effectsOnly=true
+  // bakes ONLY the edge effect (for maskedVideo, whose video fill stays dynamic in ffmpeg).
+  async function prebakeLayerFxPNG(comp, layer, effectsOnly) {
+    try {
+      const frame = buildEngineFrame(layer.startTime || 0, false);
+      const rgba = comp.renderLayerOnly(frame, layer.id, effectsOnly);
+      if (!rgba) return null;
+      const W = outWidth, Hh = outHeight, stride = W * 4;
+      const flipped = new Uint8ClampedArray(rgba.length);   // GL is bottom-up → flip for the canvas
+      for (let y = 0; y < Hh; y++) { const s = (Hh - 1 - y) * stride; flipped.set(rgba.subarray(s, s + stride), y * stride); }
+      const cv = new OffscreenCanvas(W, Hh);
+      cv.getContext('2d').putImageData(new ImageData(flipped, W, Hh), 0, 0);
+      const blob = await cv.convertToBlob({ type: 'image/png' });
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const res = await window.strata?.writeTempPNG?.(bytes);
+      return (res && res.ok) ? res.path : null;
+    } catch (e) { console.warn('[prebake]', e); return null; }
   }
   async function saveAs(fmt, qual) {
     const ext = fmt === 'mp3' ? 'mp3' : fmt === 'webm' ? 'webm' : 'mp4';
@@ -5825,14 +5862,57 @@ function Editor({ state, setState }) {
     // chroma key, outer glow / drop shadow / outline, mask cut-outs, GPU transitions, animated subtitles.
     // Plain edits (cuts, basic overlays, text) take the FAST single-pass ffmpeg path — ~a minute again —
     // and ffmpeg decodes continuously, so there's no clip-seam jerk either.
-    // v1.3.5-SPEED: ALWAYS export through the fast single-pass ffmpeg path. The per-frame GPU-engine
-    // export (compositor.renderFrame → gl.readPixels ~8MB/frame → IPC → ffmpeg rawvideo) is 10-20× slower
-    // and had silently become the default for mp4 on capable GPUs — THAT is the regression vs 1.3.5.
-    // ffmpeg bakes chroma (chromakey), transitions, colour-correction, blur; only GPU-only glow/shadow/
-    // outline aren't baked (exactly as in 1.3.5). runEngineExport stays in the code for a future opt-in.
-    let result = await window.strata?.editVideo?.(
-      buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
-    );
+    // SMART routing: the FAST single-pass ffmpeg path is the DEFAULT (like v1.3.5) for chroma presets &
+    // plain edits. ONLY projects with GPU-only effects ffmpeg can't bake — outer glow / drop shadow /
+    // outline, mask cut-outs, GPU transitions, animated subtitles — use the exact (but ~10-20× slower)
+    // WebGL engine export, so those effects ACTUALLY APPEAR in the output. chromaKey is NOT here: ffmpeg
+    // does it natively (chromakey filter) → fast.
+    // ── Pre-bake STATIC GPU effects (outline/shadow/glow on cut-outs / images) to transparent PNG
+    // overlays so the FAST ffmpeg path composites them, instead of paying the slow per-frame engine
+    // export. Fully guarded: if a bake fails the layer keeps its effects → it still routes to the engine.
+    let exportLayers = layers;
+    if (fmt === 'mp4' && engineMode && engineTierRef.current === 'A' && window.strata?.writeTempPNG) {
+      let comp = null;
+      try { comp = new Compositor(new OffscreenCanvas(outWidth, outHeight)); } catch {}
+      if (comp) {
+        const out = []; let baked = false;
+        for (const l of layers) {
+          const bakeable = !l.hidden && (l.shadow || l.outline || l.glow) && (l.type === 'maskedVideo' || l.type === 'image');
+          const png = bakeable ? await prebakeLayerFxPNG(comp, l, l.type === 'maskedVideo') : null;
+          if (!png) { out.push(l); continue; }     // not bakeable / bake failed → keep original (→ engine)
+          baked = true;
+          const fx = { id: l.id + '_fx', type: 'image', file: png, x: 50, y: 50, size: 100, aspect: outWidth / outHeight, opacity: 100, startTime: l.startTime, endTime: l.endTime };
+          const clean = { ...l, shadow: null, outline: null, glow: null };
+          if (l.type === 'maskedVideo') out.push(fx, clean);   // halo UNDER the cut-out
+          else out.push(clean, fx);                            // effect OVER the image
+        }
+        try { comp.dispose(); } catch {}
+        if (baked) exportLayers = out;
+      }
+    }
+    // Effects ffmpeg CAN'T bake → exact (slow) engine. A maskedVideo WITHOUT GPU effects renders fine on
+    // the FAST ffmpeg path (its handler cuts the shape natively), so it's no longer force-routed here.
+    const needsEngine = exportLayers.some(l => {
+      if (l.hidden) return false;
+      if (l.glow || l.shadow || l.outline) return true;                                    // effect that wasn't baked → engine
+      if (l.type === 'mask') return true;                                                  // clipping mask (ffmpeg can't)
+      if (l.type === 'transition') return true;                                            // GPU transition pack
+      if (l.type === 'text' && (Number(l.outlineWidth) || 0) > 0) return true;             // text outline (engine rasteriser)
+      if (l.type === 'subtitles' && l.style && l.style.anim && l.style.anim !== 'none') return true; // animated subtitles
+      return false;
+    });
+    let result;
+    if (fmt === 'mp4' && engineMode && engineTierRef.current === 'A' && needsEngine) {
+      // GPU-only effects still present → exact WebGL compositor export (slower, but the effects bake in).
+      off?.();   // engine path reports progress via setSaveProgress, not onEditProgress
+      result = await runEngineExport(outPath, (p) => setSaveProgress(Math.min(99, p)));
+      if (result?.ok) { playDoneSound(); setSaveProgress(100); setSaveFinishing(true); }
+    } else {
+      // Fast single-pass ffmpeg path — presets, plain edits, pre-baked cut-outs, mp3/webm, or Tier B.
+      result = await window.strata?.editVideo?.(
+        buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom, layersOverride: exportLayers })
+      );
+    }
     exportingRef.current = false;
     if (result && !result.ok && result.error !== 'canceled') { setSaveProgress(null); setSaveFinishing(false); alert('Ошибка: ' + result.error); }
     else if (result?.ok) window.strata?.revealFile?.(outPath);

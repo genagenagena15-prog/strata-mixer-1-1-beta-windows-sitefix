@@ -60,6 +60,8 @@ contextBridge.exposeInMainWorld('strata', {
   readFileBytes: (path) => ipcRenderer.invoke('file:readBytes', path),
   // Resolve a bundled preset overlay (e.g. 'BALL.mp4') to its real absolute on-disk path.
   getPresetPath: (name) => ipcRenderer.invoke('presets:getPath', name),
+  // Write a pre-baked effect PNG (Uint8Array) to a temp file → { ok, path }.
+  writeTempPNG: (bytes) => ipcRenderer.invoke('temp:write-png', bytes),
   // Chroma-key eyedropper fallback (packaged builds, where the renderer canvas is
   // tainted): read one source pixel's colour via ffmpeg → { ok, hex }.
   sampleVideoPixel: (payload) => ipcRenderer.invoke('chroma:sample-pixel', payload),

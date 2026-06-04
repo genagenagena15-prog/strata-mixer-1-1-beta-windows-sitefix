@@ -12,14 +12,15 @@ function atempoChain(speed) {
   at.push('atempo=' + r.toFixed(4));
   return at.join(',');
 }
-const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+const LOUDNORM = 'loudnorm=I=-16:TP=-1.5:LRA=11';   // kept for a possible future toggle; not used by default
+const PEAK_LIMIT = 'alimiter=limit=0.95:level=disabled';   // default export master: native loudness, only tame peaks
 function audioClipChain(idx, trimStart, trimEnd, delayMs, label, opts) {
   const o = opts || {}, tempo = o.tempo || '', vol = o.vol || '', env = o.env || '';
   return `[${idx}:a]atrim=${trimStart.toFixed(3)}:${trimEnd.toFixed(3)},asetpts=PTS-STARTPTS${tempo},adelay=${delayMs}:all=1${vol}${env}[${label}]`;
 }
 function finalAudioMix(mixInputs, label, opts) {
   const o = opts || {};
-  const ln = (o.loudnorm === false) ? '' : `${LOUDNORM},`;
+  const ln = (o.loudnorm === false) ? '' : `${PEAK_LIMIT},`;
   const ar = ((o.firstPts === false) ? 'aresample=async=1' : 'aresample=async=1:first_pts=0') + ',aformat=channel_layouts=stereo';
   if (mixInputs.length === 1) return `${mixInputs[0]}${ln}${ar}[${label}]`;
   return `${mixInputs.join('')}amix=inputs=${mixInputs.length}:duration=longest:dropout_transition=0:normalize=0,${ln}${ar}[${label}]`;
@@ -53,10 +54,10 @@ const ENV = `,volume='if(lt(t,1.0000),0.5000,1.0000)':eval=frame`;
 }
 eq('export final single',
   finalAudioMix(['[au0]'], 'auFinal'),
-  `[au0]${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
+  `[au0]${PEAK_LIMIT},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 eq('export final multi',
   finalAudioMix(['[au0]', '[au1]'], 'auFinal'),
-  `[au0][au1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
+  `[au0][au1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${PEAK_LIMIT},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 
 // ── 2. video:edit — base [0:a] (no tempo) / main (tempo) / overlay (tempo+env) / audio (env) ──
 eq('vedit base [0:a]',
@@ -83,10 +84,10 @@ eq('vedit base [0:a]',
 }
 eq('vedit final single',
   finalAudioMix(['[auMain]'], 'auFinal'),
-  `[auMain]${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
+  `[auMain]${PEAK_LIMIT},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 eq('vedit final multi',
   finalAudioMix(['[auMain]', '[auVov0]'], 'auFinal'),
-  `[auMain][auVov0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${LOUDNORM},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
+  `[auMain][auVov0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,${PEAK_LIMIT},aresample=async=1:first_pts=0,aformat=channel_layouts=stereo[auFinal]`);
 
 // ── 3. extractMixed… — no volume, no env, no loudnorm, no first_pts ──
 eq('extract base [0:a]',
