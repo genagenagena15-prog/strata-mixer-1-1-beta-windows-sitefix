@@ -160,6 +160,13 @@ export class VideoSource {
     if (!this.ready || this.err) return;
     const tUs = Math.round((tSec + this.srcStart) * US);
     const oldest = this.ring.length ? this.ring[0].timestamp : null;
+    // COLD start — ring empty = a clip that JUST became active on the timeline (e.g. the 2nd of three
+    // cut pieces). Its fresh decoder must chew through a whole GOP from the keyframe up to tUs. On
+    // long-GOP / slow-decode files that can blow past the normal 4s budget; if we bail early, frameAt
+    // is handed the stale keyframe, which then visibly "catches up" over ~1s = the clip-seam jerk in
+    // the EXPORTED file (preview is fine — it samples the live <video>). Give cold starts a much bigger
+    // budget so they finish decoding to the target before we return. Warm frames keep the 4s budget.
+    const budget = (oldest == null) ? Math.max(timeoutMs, 20000) : timeoutMs;
     const kfTarget = this._keyframeFor(Math.max(0, tUs));
     if (oldest != null && tUs < oldest - SEEK_BACK_US) this._seekTo(tUs);
     else if (kfTarget > this.idx) this._seekTo(tUs);
@@ -168,7 +175,7 @@ export class VideoSource {
       this._pump(tUs);
       if (this.ring.some((f) => f.timestamp >= tUs)) return;                            // a frame at/after tUs is decoded → frameAt can pick the right one
       if (this.idx >= this.chunks.length && this.decoder.decodeQueueSize === 0) return; // past EOF — nothing left to decode (hold last frame)
-      if (Date.now() - start > timeoutMs) return;                                       // safety: never hang the export on a stuck decoder
+      if (Date.now() - start > budget) return;                                          // safety: never hang the export on a stuck decoder
       await new Promise((r) => setTimeout(r, 1));                                        // yield so the async decoder output lands in the ring
     }
   }

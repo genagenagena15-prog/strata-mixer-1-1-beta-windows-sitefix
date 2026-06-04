@@ -10,7 +10,7 @@ import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
 import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
 
-const APP_VERSION = 'v1.3.8';
+const APP_VERSION = 'v1.4 beta';
 // Compare two semver-ish strings → -1 / 0 / 1 (tolerates a leading 'v').
 const verCmp = (a, b) => {
   const pa = String(a || '').replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0);
@@ -69,10 +69,20 @@ const LAYER_ICONS = {
 // его не прочитает ни движок-декодер, ни ffmpeg-экспорт). Чтобы добавить новую
 // анимацию: положи видео в assets/presets/ и допиши сюда строку.
 const PRESET_OVERLAYS = [
-  { id: 'ball', name: 'Мяч', emoji: '⚽', file: 'BALL.mp4',
-    previewSrc: new URL('../assets/presets/BALL.mp4', import.meta.url).href,   // для hover-превью (Vite-URL, не для экспорта)
+  { id: 'ball', name: 'Мяч', emoji: '⚽', file: 'ball-fx.mp4',   // мяч + встроенный звук-вжух (картинка не тронута)
+    previewSrc: new URL('../assets/presets/ball-fx.mp4', import.meta.url).href,   // для hover-превью
+    clipColor: '#fde047',   // цвет клипа как у переходов (жёлтый) — единый эффект
+    ccB: 30,                // +30% яркости
     chroma: { color: '#36cc31', threshold: 45, smoothness: 30 },
-    glow: { color: '#ffffff', blur: 50, opacity: 0.9 } },   // светлая вспышка позади мяча
+    glow: { color: '#ffffff', blur: 50, opacity: 0.9 } },   // световой ореол-«вспышка» вокруг мяча (на том же слое)
+  { id: 'chicken', name: 'Chicken', emoji: '🐔', file: 'chicken.mp4',   // курица со своим звуком — просто чистый хромакей
+    previewSrc: new URL('../assets/presets/chicken.mp4', import.meta.url).href,
+    clipColor: '#fde047',
+    chroma: { color: '#28e733', threshold: 45, smoothness: 30 } },
+  { id: 'ball2', name: 'Мяч 2', emoji: '⚽', file: 'ball2.mp4',   // ещё один переход со своим звуком — чистый хромакей
+    previewSrc: new URL('../assets/presets/ball2.mp4', import.meta.url).href,
+    clipColor: '#fde047',
+    chroma: { color: '#11f212', threshold: 45, smoothness: 30 } },
 ];
 
 // Subtitle layout constants — SHARED contract with the ASS export in
@@ -3289,19 +3299,19 @@ function Editor({ state, setState }) {
     let probed = 0;
     try { probed = await probeMediaDuration(f); } catch { probed = 0; }
     const len = probed > 0.1 ? probed : 1.75;
-    // Центрируем анимацию НА плейхеде, как настоящий переход: середина клипа =
-    // позиция курсора. Клампим в неотрицательное; конец вылез за край — растягиваем таймлайн.
+    // Центрируем эффект НА плейхеде (как настоящий переход): середина клипа = позиция курсора.
     const startTime = Math.max(0, currentTime - len / 2);
     const endTime = startTime + len;
     if (endTime > totalDuration) set('totalDuration', endTime);
+    // ОДИН слой: мяч + встроенный звук-вжух, хромакей, ореол-свечение, +30% яркости, цвет как у переходов.
     addLayer({
       id, type: 'videoOverlay', file: f,
-      label: preset.name, isPreset: true,   // маскировка под обычный переход-эффект
+      label: preset.name, isPreset: true, clipColor: preset.clipColor || '#fde047',
       startTime, endTime,
       srcDuration: probed > 0 ? probed : undefined,
-      x: 50, y: 50, size: 100, fitCover: true, muted: true,   // fitCover → залить кадр (по высоте), как у импортируемых видео
-      ccB: 30,                               // +30% яркости (и в превью, и в экспорте)
-      ...(preset.glow ? { glow: { ...preset.glow } } : {}),   // светлая вспышка за мячом (аддитивное свечение по силуэту)
+      x: 50, y: 50, size: 100, fitCover: true,                // заливает кадр (большой); звук родной → НЕ мьютим (гасится динамиком на клипе)
+      ...(preset.ccB ? { ccB: preset.ccB } : {}),             // яркость — по настройке пресета
+      ...(preset.glow ? { glow: { ...preset.glow } } : {}),   // свечение — по настройке пресета
       chromaKey: { ...preset.chroma },
     });
     ensureProxy(id, f);
@@ -5816,14 +5826,29 @@ function Editor({ state, setState }) {
         setSaveProgress(Math.round(d.percent || 0));
       }
     });
+    // The GPU-engine export is pixel-exact (preview == export) but ~10-20× slower (per-frame readPixels
+    // + full-res RGBA IPC). Use it ONLY when the project actually has effects ffmpeg can't bake exactly:
+    // chroma key, outer glow / drop shadow / outline, mask cut-outs, GPU transitions, animated subtitles.
+    // Plain edits (cuts, basic overlays, text) take the FAST single-pass ffmpeg path — ~a minute again —
+    // and ffmpeg decodes continuously, so there's no clip-seam jerk either.
+    const needsEngine = layers.some(l => {
+      if (l.hidden) return false;
+      if (l.glow || l.shadow || l.outline) return true;                                    // outer glow / drop shadow / outline (any layer)
+      if (l.chromaKey && l.chromaKey.color) return true;                                    // exact green-screen removal
+      if (l.type === 'maskedVideo' || l.type === 'transition') return true;                 // cut-out shapes / GPU transition pack
+      if (l.type === 'text' && (Number(l.outlineWidth) || 0) > 0) return true;              // text outline (engine rasteriser)
+      if (l.type === 'subtitles' && l.style && l.style.anim && l.style.anim !== 'none') return true; // animated subtitles
+      return false;
+    });
     let result;
-    if (fmt === 'mp4' && engineMode && engineTierRef.current === 'A') {
-      // Tier A + engine ON → render through the WebGL2 compositor (GPU effects baked in) + the
-      // multi-source audio graph. Falls back to the ffmpeg/ASS path for mp3/webm or Tier B.
+    if (fmt === 'mp4' && engineMode && engineTierRef.current === 'A' && needsEngine) {
+      // Tier A + engine ON + GPU effects present → render through the WebGL2 compositor (effects baked
+      // in) + the multi-source audio graph.
       off?.();   // engine path reports progress via setSaveProgress, not onEditProgress
       result = await runEngineExport(outPath, (p) => setSaveProgress(Math.min(99, p)));
       if (result?.ok) { playDoneSound(); setSaveProgress(100); setSaveFinishing(true); }
     } else {
+      // Fast single-pass ffmpeg path — plain projects, or mp3/webm, or Tier B.
       result = await window.strata?.editVideo?.(
         buildEditPayload({ outWidth, outHeight, outPath, format: fmt, quality: qual, custom: saveCustom })
       );

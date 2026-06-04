@@ -1965,6 +1965,10 @@ ipcMain.handle('video:edit', async (_event, payload) => {
   const srcDurReal = Math.max(0.5, srcProbe.duration || totalDuration || 1);
   const srcMbReal = fileSizeMb(payload.file);
 
+  // H.264 encoder for the burned mp4: a working GPU encoder (NVENC/QuickSync/AMF) if this machine has
+  // one (≫ faster than CPU), else libx264. Probed once + cached, so it costs nothing on later exports.
+  const vCodec = await detectWorkingH264Encoder(ffmpeg).catch(() => 'libx264');
+
   // Probe every file the filter graph will reference. We need both:
   //  - hasAudio: skip [idx:a] for silent sources or the graph fails to parse.
   //  - width/height: clamp srcCrop coords for maskedVideo so ffmpeg's crop
@@ -2742,12 +2746,23 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         args.push('-fps_mode', 'cfr');
         args.push('-c:a', 'libopus', '-b:a', `${audioKbps}k`);
       } else {
-        args.push('-c:v', 'libx264', '-preset', encPreset);
+        // GPU hardware encoder when available (NVENC/QuickSync/AMF) — far faster than CPU libx264 on a
+        // capable card; else libx264. hw encoders need a yuv pixel format (the overlay graph ends in
+        // rgba) → force yuv420p, which is also the most compatible for players.
+        args.push('-c:v', vCodec, '-pix_fmt', 'yuv420p');
+        if (vCodec === 'h264_nvenc') args.push('-preset', quality === 'fast' ? 'p2' : quality === 'max' ? 'p6' : 'p4');
+        else if (vCodec === 'h264_qsv') args.push('-preset', quality === 'fast' ? 'veryfast' : quality === 'max' ? 'slow' : 'medium');
+        else if (vCodec === 'h264_amf') args.push('-quality', quality === 'fast' ? 'speed' : quality === 'max' ? 'quality' : 'balanced');
+        else args.push('-preset', encPreset);
         if (vKbps > 0) {
           const v = Math.max(300, Math.round(vKbps));
           args.push('-b:v', `${v}k`, '-maxrate', `${Math.round(v * maxMul)}k`, '-bufsize', `${Math.round(v * maxMul * 1.6)}k`);
         } else {
-          args.push('-crf', String(quality === 'custom' ? cCrf(23) : quality === 'max' ? 19 : quality === 'fast' ? 27 : 23));
+          const q = quality === 'custom' ? cCrf(23) : quality === 'max' ? 19 : quality === 'fast' ? 27 : 23;
+          if (vCodec === 'h264_nvenc') args.push('-cq', String(Math.max(16, Math.min(40, q))), '-b:v', '0');
+          else if (vCodec === 'h264_qsv') args.push('-global_quality', String(Math.max(16, Math.min(40, q))));
+          else if (vCodec === 'h264_amf') args.push('-rc', 'cqp', '-qp_i', String(Math.max(16, Math.min(40, q))), '-qp_p', String(Math.max(16, Math.min(40, q + 2))));
+          else args.push('-crf', String(q));
         }
         if (quality === 'custom' && cFps > 0) args.push('-r', String(cFps));
         else args.push('-r', '30');
@@ -3445,6 +3460,30 @@ async function detectAcceleration(ffmpeg) {
     cpu: true
   };
   return _accelCache;
+}
+
+// Probe which hardware H.264 encoder ACTUALLY works on THIS machine. The `-encoders` list only proves
+// a codec was compiled in (the bundled ffmpeg ships nvenc+qsv+amf for everyone), NOT that the matching
+// GPU/driver is present. So we run a tiny synthetic encode with each candidate; the first that exits 0
+// is usable. Cached. Falls back to CPU libx264 when no GPU encoder works.
+let _hwEncCache = null;
+async function detectWorkingH264Encoder(ffmpeg) {
+  if (_hwEncCache !== null) return _hwEncCache;
+  for (const codec of ['h264_nvenc', 'h264_qsv', 'h264_amf']) {
+    const ok = await new Promise((resolve) => {
+      try {
+        const p = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+          '-i', 'color=c=black:s=128x128:r=5', '-frames:v', '3', '-c:v', codec, '-f', 'null', '-'],
+          { windowsHide: true });
+        const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(false); }, 6000);
+        p.on('close', (code) => { clearTimeout(t); resolve(code === 0); });
+        p.on('error', () => { clearTimeout(t); resolve(false); });
+      } catch { resolve(false); }
+    });
+    if (ok) { _hwEncCache = codec; return codec; }
+  }
+  _hwEncCache = 'libx264';
+  return 'libx264';
 }
 
 function chooseEncoder(settings, acceleration) {
