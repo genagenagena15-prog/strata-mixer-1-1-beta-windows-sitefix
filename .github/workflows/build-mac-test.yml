@@ -55,10 +55,20 @@ jobs:
           # Unsigned build — skip Apple cert auto-discovery.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
+      # Rename the .dmg to include an ALWAYS-INCREASING build number, so every run
+      # produces a uniquely-named file. Otherwise the artifact + .dmg keep the same
+      # name (StrataMixer-1.4.0-beta.dmg) every build and it's impossible to tell
+      # which download is the latest.
+      - name: Name the .dmg with the build number
+        run: |
+          cd release-installer
+          for f in *.dmg; do mv "$f" "StrataMixer-1.4b-mac-build${{ github.run_number }}.dmg"; done
+          ls -la *.dmg
+
       - name: Upload .dmg as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: StrataMixer-mac-test-dmg
+          name: StrataMixer-1.4b-mac-build${{ github.run_number }}
           path: release-installer/*.dmg
           if-no-files-found: error
           retention-days: 14
