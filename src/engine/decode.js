@@ -70,8 +70,24 @@ export class VideoSource {
     this._configure();
   }
   _configure() {
-    this.decoder.configure({ ...this.config, optimizeForLatency: true, hardwareAcceleration: 'prefer-hardware' });
+    this.decoder.configure({ ...this.config, optimizeForLatency: true, hardwareAcceleration: this._accel || 'prefer-hardware' });
     this._configured = true;
+  }
+
+  // The hardware decoder errored (macOS VideoToolbox is flaky for some streams → it would otherwise
+  // hand the engine a NULL frame forever = black video). Rebuild ONCE on a software decoder before
+  // giving up. Returns true if it recovered (caller should keep trying), false if already fell back.
+  _recover() {
+    if (this._triedSoftware) return false;
+    this._triedSoftware = true;
+    this._accel = 'no-preference';   // let Chromium choose a software decoder
+    this.err = null;
+    try { this.decoder.close(); } catch {}
+    for (const f of this.ring) { try { f.close(); } catch {} }
+    this.ring.length = 0;
+    this._makeDecoder();
+    this.idx = this._keyframeFor(0);
+    return true;
   }
 
   // last keyframe index whose timestamp <= tUs
@@ -122,7 +138,8 @@ export class VideoSource {
   // Return the VideoFrame for media-time tSec (newest ts <= t), or the nearest available, or null
   // while the decoder is still catching up. The ring keeps owning it — DO NOT close it in the caller.
   frameAt(tSec) {
-    if (!this.ready || this.err) return null;
+    if (!this.ready) return null;
+    if (this.err && !this._recover()) return null;   // HW decode died → software fallback (once), else give up
     const tUs = Math.round((tSec + this.srcStart) * US);
     // Seek decision — two cases only:
     //  • backward past the ring  → reset to the target's keyframe.
@@ -157,7 +174,8 @@ export class VideoSource {
   // never calls it (it samples the live <video>). Mirrors frameAt's seek decision so the subsequent
   // sync frameAt(tSec) picks the now-ready frame without re-seeking.
   async ensureFrameAt(tSec, timeoutMs = 4000) {
-    if (!this.ready || this.err) return;
+    if (!this.ready) return;
+    if (this.err && !this._recover()) return;
     const tUs = Math.round((tSec + this.srcStart) * US);
     const oldest = this.ring.length ? this.ring[0].timestamp : null;
     // COLD start — ring empty = a clip that JUST became active on the timeline (e.g. the 2nd of three
@@ -171,7 +189,8 @@ export class VideoSource {
     if (oldest != null && tUs < oldest - SEEK_BACK_US) this._seekTo(tUs);
     else if (kfTarget > this.idx) this._seekTo(tUs);
     const start = Date.now();
-    while (!this.err) {
+    while (true) {
+      if (this.err && !this._recover()) return;                                         // mid-decode HW error → software fallback (once), else bail
       this._pump(tUs);
       if (this.ring.some((f) => f.timestamp >= tUs)) return;                            // a frame at/after tUs is decoded → frameAt can pick the right one
       if (this.idx >= this.chunks.length && this.decoder.decodeQueueSize === 0) return; // past EOF — nothing left to decode (hold last frame)

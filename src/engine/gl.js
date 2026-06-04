@@ -88,11 +88,22 @@ export function createFBO(gl, w, h) {
 
 // Upload a TexImageSource (HTMLVideoElement / HTMLImageElement / VideoFrame / canvas)
 // into `tex`. Natural orientation (no GL flip) — the shader's uFlip handles screen Y.
+// Returns TRUE only if real pixels were uploaded, FALSE if the source had nothing to give
+// (paused/not-presented <video>, closed/empty VideoFrame, or a texImage2D throw). The caller
+// uses this to AVOID latching a black/empty upload as "the current frame" — otherwise a single
+// black upload (a known Chromium video→GL quirk, worse on macOS) sticks forever.
 export function uploadElement(gl, tex, el, premultiply) {
+  if (!el) return false;
+  if (typeof HTMLVideoElement !== 'undefined' && el instanceof HTMLVideoElement && el.readyState < 2) return false;
+  const vw = el.videoWidth || el.displayWidth || el.naturalWidth || el.codedWidth || el.width || 0;
+  const vh = el.videoHeight || el.displayHeight || el.naturalHeight || el.codedHeight || el.height || 0;
+  if (!vw || !vh) return false;
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premultiply);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el);
+  try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el); }
+  catch { return false; }   // closed VideoFrame / cross-thread upload → don't blow up the layer stack
+  return true;
 }
 
 // Shared quad vertex shader. uRect = (x0,y0,x1,y1) in NDC; uFlip flips V.

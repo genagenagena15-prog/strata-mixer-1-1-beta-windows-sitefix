@@ -1642,6 +1642,8 @@
 .ed-mask-shape:hover{border-color:rgba(232,121,249,.55)}
 .ed-mask-shape.active{border-color:#e879f9;background:linear-gradient(135deg,rgba(232,121,249,.18),rgba(163,60,255,.10));color:#fff;box-shadow:0 0 14px rgba(232,121,249,.22)}
 .ed-mask-shape-glyph{font-size:18px;line-height:1}
+/* PNG-иконки форм чёрные: в тёмной теме инвертим в белый (фон кнопки тёмный), в светлой оставляем чёрными (фон белый). */
+[data-theme="dark"] .ed-mask-shape-glyph{filter:invert(1)}
 .ed-mask-shape-lbl{font-size:11px;font-weight:700;letter-spacing:.02em}
 [data-theme="light"] .ed-mask-shape{background:#fff;border-color:rgba(40,46,70,.18);color:#3a3e4d}
 [data-theme="light"] .ed-mask-shape.active{background:linear-gradient(135deg,rgba(232,121,249,.16),rgba(163,60,255,.08));color:#5e2f7f}

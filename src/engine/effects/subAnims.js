@@ -30,6 +30,8 @@ export function animTransform(a, tWord) {
   else if (a === 12) { ox = Math.sin(time * 50) * 0.015; oy = Math.cos(time * 43) * 0.015; }                   // 12 Shake
   else if (a === 13) { oy = 1.2 * (1 - eo) - Math.sin(eo * Math.PI * 2) * 0.08 * (1 - eo); }                   // 13 Bounce-drop
   else if (a === 14) { sx = 1 + 0.14 * Math.sin(time * 8); sy = 1 - 0.14 * Math.sin(time * 8); }               // 14 Jelly
+  else if (a === 15) { const b = (time % 1.1) / 1.1; sx = sy = 1 + 0.12 * Math.exp(-b * 8); }                  // 15 Плашка (мягкий поп плашки+слова)
+  else if (a === 16) { sx = sy = 0.55 + 0.45 * eo; oy = 0.22 * (1 - eo); }                                     // 16 Плашка-поп (плашка+слово выезжают снизу с раздувом)
   return { sx, sy, ox, oy, rot };
 }
 
@@ -39,6 +41,11 @@ export function animTransform(a, tWord) {
 // u_anim branches in textStyles.js are left in place (unreachable, harmless).
 export const PIXEL_ANIMS = new Set();
 export const isPixelAnim = (a) => PIXEL_ANIMS.has(a);
+
+// Plate anims: a SECOND coloured draw (rounded background plate) is rendered BEHIND each word.
+// getTextDraw checks isPlateAnim() and prepends a rasterizePlate() draw per word (same transform).
+export const PLATE_ANIMS = new Set([15, 16]);
+export const isPlateAnim = (a) => PLATE_ANIMS.has(a);
 
 // UI-picker metadata (pack §4). `a` = the u_anim / animTransform selector.
 // NOTE: pixel anims fill(2)/wave(3)/typewriter(10)/blur-in(11) intentionally removed.
@@ -54,5 +61,7 @@ export const TEXT_ANIMS = [
   { id: 'shake',      a: 12, name: 'Shake' },
   { id: 'bouncedrop', a: 13, name: 'Bounce-drop' },
   { id: 'jelly',      a: 14, name: 'Jelly' },
+  { id: 'plate',      a: 15, name: 'Плашка' },
+  { id: 'platepop',   a: 16, name: 'Плашка-поп' },
 ];
 export const TEXT_ANIM_TYPE = Object.fromEntries(TEXT_ANIMS.map(x => [x.id, x.a]));

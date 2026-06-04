@@ -4,11 +4,11 @@ import { createPortal } from 'react-dom';
 import './styles.css';
 // Phase 2 — ONE WebGL2 compositor (preview source-of-truth, default OFF behind engineMode).
 import { Compositor } from './engine/compositor.js';
-import { rasterizeText, rasterizeWord } from './engine/textRaster.js';
+import { rasterizeText, rasterizeWord, rasterizePlate } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
 import { renderExportFrames } from './engine/exportRender.js';
-import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim } from './engine/effects/index.js';
+import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim, isPlateAnim } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.4 beta';
 // Compare two semver-ish strings → -1 / 0 / 1 (tolerates a leading 'v').
@@ -82,6 +82,16 @@ const PRESET_OVERLAYS = [
     clipColor: '#fde047',
     chroma: { color: '#28e733', threshold: 30, smoothness: 26 } },   // порог понижен: курица была слишком прозрачной (выбивался зелёный спилл)
 ];
+
+// Иконки форм для пикеров (блюр + маска). Статичные URL → Vite их бандлит. PNG чёрные —
+// в UI красим в белый силуэт (filter), чтобы было видно на тёмной кнопке.
+const SHAPE_ICONS = {
+  square:  new URL('../assets/shapes/square.png', import.meta.url).href,
+  rounded: new URL('../assets/shapes/rounded.png', import.meta.url).href,
+  circle:  new URL('../assets/shapes/circle.png', import.meta.url).href,
+  hexagon: new URL('../assets/shapes/hexagon.png', import.meta.url).href,
+};
+const SHAPE_OPTIONS = [['square','Квадрат'],['rounded','Скругл.'],['circle','Круг'],['hexagon','Шестигран.']];
 
 // Subtitle layout constants — SHARED contract with the ASS export in
 // electron/main.js (buildAssForSubtitles must use the same fractions so the
@@ -1301,6 +1311,10 @@ function HotkeysOverlay({ onClose }) {
     { keys: [mod, 'C'], title: 'Копировать', desc: 'Копирует выделенный слой или несколько выделенных слоёв', demo: 'copy' },
     { keys: [mod, 'V'], title: 'Вставить', desc: 'Вставляет копию отдельным новым слоем', demo: 'paste' },
     { keys: ['Delete'], title: 'Удалить', desc: 'Удаляет выделенный слой или несколько выделенных слоёв', demo: 'delete' },
+    { keys: [mod, 'Y'], title: 'Вернуть', desc: 'Возвращает отменённое действие (также Ctrl+Shift+Z)', demo: 'undo' },
+    { keys: [mod, 'Shift', 'D'], title: 'Разрезать', desc: 'Режет клип под курсором на две части', demo: 'undo' },
+    { keys: [mod, 'Shift', 'C'], title: 'Объединить', desc: 'Склеивает выделенные клипы в один', demo: 'undo' },
+    { keys: [mod, 'Shift', 'V'], title: 'Уровень звука', desc: 'Включает дорожку громкости на клипах — ставь точки и тяни, меняй звук по времени', demo: 'undo' },
     { keys: ['Shift', '+ тащить'], title: 'Ровное перемещение', desc: 'На превью объект едет строго по горизонтали или вертикали', demo: 'axis' },
     { keys: ['Shift', '+ тащить'], title: 'Прилипание к клипам', desc: 'На таймлайне клип примагничивается к началу и концу других — стык встык без зазоров', demo: 'snap' },
     { keys: ['Тащить', '↑ ↓'], title: 'Сменить дорожку', desc: 'Веди клип вверх/вниз — он прилипнет к другой дорожке', demo: 'reorder' },
@@ -2740,6 +2754,7 @@ function Editor({ state, setState }) {
   const clipboardRef = useRef(null);
   const zoomTmpRef = useRef(null);
   const [undoStack, setUndoStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);   // Ctrl+Y / Ctrl+Shift+Z — вернуть отменённое
   const [selectedIds, setSelectedIds] = useState(new Set());
 
   useEffect(() => { setDurStr(String(totalDuration)); }, [totalDuration]);
@@ -2810,6 +2825,15 @@ function Editor({ state, setState }) {
     // the next paint builds a brand-new Compositor with clean state (like a first load).
     try { compRef.current?.dispose?.(); } catch {}
     compRef.current = null;
+    // Scrub per-<video> present-state + tear down WebCodecs decoders so a REIMPORT primes from scratch
+    // instead of inheriting a stale "_smPrimed" warm-up flag or a leaked decoder. Without this, after
+    // «Очистить» the recycled node skips its black-first-frame warm-up and decoders pile up (macOS caps
+    // the number of active hardware decoders) → the next loaded video renders BLACK.
+    for (const v of [videoRef.current, videoRevRef.current]) {
+      if (v) { try { v._smPrimed = false; v._smFrameSeq = undefined; v._smBlitCanvas = null; } catch {} }
+    }
+    frameCbArmedRef.current = new WeakSet();
+    try { for (const vs of videoSourcesRef.current.values()) vs?.dispose?.(); videoSourcesRef.current.clear(); } catch {}
     videoOverlayRefs.current = {};
     audioLayerRefs.current = {};
     setState((s) => ({ ...s, layers: [], file: null }));
@@ -2887,6 +2911,7 @@ function Editor({ state, setState }) {
   // Snapshot the FULL editor state so Ctrl+Z restores everything, not just
   // layers (also: duration, canvas size, bg, fade, video range, etc.).
   function pushUndo() {
+    setRedoStack([]);   // новое явное действие → «вернуть» больше неактуально
     const json = JSON.stringify(state);
     // Skip if the top of the stack is already identical (avoid duplicate
     // entries when auto-snapshot races an explicit pushUndo).
@@ -3720,7 +3745,7 @@ function Editor({ state, setState }) {
       res.splice(idx + 1, 0, second);
       return res;
     });
-    setSelectedId(layer.id);
+    setSelectedId(newId);   // выделяем ПРАВУЮ (отрезанную) часть, а не исходную
   }
 
   function onVideoMeta(e) {
@@ -4021,11 +4046,17 @@ function Editor({ state, setState }) {
           const outline = spec.outline != null ? spec.outline : Math.max(2, Math.round(fs * 0.08));
           let d;
           if (animPixel) {
-            const word = rasterizeWord('Текст', { cx, cy, w: W * 0.92 }, { fontSize: fs }, fcss, true);
+            const word = rasterizeWord('Text', { cx, cy, w: W * 0.92 }, { fontSize: fs }, fcss, true);
             d = word && { ...word, opacity: 1, scaleX: 1, scaleY: 1, style: 0, base: hexToRgb01(color), acc: hexToRgb01(color), intensity: 1, anim: animA };
           } else {
-            const word = rasterizeWord('Текст', { cx: cx + tr.ox * fs, cy: cy + tr.oy * fs, w: W * 0.92 }, { fontSize: fs, color, outlineColor, outline }, fcss);
+            const word = rasterizeWord('Text', { cx: cx + tr.ox * fs, cy: cy + tr.oy * fs, w: W * 0.92 }, { fontSize: fs, color, outlineColor, outline }, fcss);
             d = word && { ...word, opacity: 1, scaleX: tr.sx, scaleY: tr.sy };
+          }
+          // Плашка в превью пикера — показать фон-подложку для plate-анимаций.
+          let dPlate = null;
+          if (d && isPlateAnim(animA)) {
+            const pl = rasterizePlate('Text', { cx: cx + tr.ox * fs, cy: cy + tr.oy * fs }, { fontSize: fs }, fcss);
+            if (pl) dPlate = { ...pl, opacity: 1, scaleX: tr.sx, scaleY: tr.sy };
           }
           // Background = current frame of the bottom-most video layer (its DOM <video> holds the frame
           // and is reliably sampleable; the GL preview canvas is preserveDrawingBuffer:false → unreadable).
@@ -4043,7 +4074,7 @@ function Editor({ state, setState }) {
             time: loopT, videoStart: 0, videoEnd: 9, dur: 9,
             getPx: () => ({ x: 0, y: 0, w: W, h: H }),
             getSource: (l) => l.type === 'mainVideo' ? bg : null,
-            getTextDraw: (l) => (l.type === 'subtitles' && d) ? [d] : [], getCC: () => null,
+            getTextDraw: (l) => (l.type === 'subtitles' && d) ? (dPlate ? [dPlate, d] : [d]) : [], getCC: () => null,
           });
         } else if (spec.kind === 'preset') {
           // Превью-пресет как у переходов: фон = картинка A (первая половина) → B (вторая),
@@ -4204,6 +4235,13 @@ function Editor({ state, setState }) {
           const dxPx = tr.ox * fs, dyPx = tr.oy * fs;   // clip-space offset → px via font size
           const color = isActive ? highlightColor : baseColor;
           const outline = olMode === 'none' ? 0 : olT;
+          // Плашка («подложка»): для plate-анимаций рисуем скруглённый фон ЗА словом отдельным цветным
+          // draw'ом (идёт через _drawLayer, не FS_TEXT), с той же анимацией-трансформом, что и слово.
+          if (isPlateAnim(animA)) {
+            const plate = rasterizePlate(w.text, { cx: w.cx + dxPx, cy: w.cy + dyPx },
+              { fontSize: fs, plateColor: st.plateColor, plateOpacity: st.plateOpacity, plateRadius: st.plateRadius }, fcss);
+            if (plate) { plate.opacity = 1; plate.scaleX = tr.sx; plate.scaleY = tr.sy; draws.push(plate); }
+          }
           let d;
           if (gpuStyleType > 0 || animPixel) {
             // FS_TEXT pass: GPU style (neon/…) OR a PIXEL anim (fill/wave/type/blur via u_anim) even at
@@ -4305,6 +4343,12 @@ function Editor({ state, setState }) {
           exportSources.set(id, vs);
         } catch (e) { console.error('[engine-export] VideoSource init failed for', id, e); }
       }));
+      // If the MAIN video's decoder couldn't init at all (corrupt / truly unsupported stream — the
+      // software fallback in decode.js handles the common macOS HW-decode flake), FAIL LOUDLY instead
+      // of silently shipping a file with a black background. Throwing routes through the catch below,
+      // which closes ffmpeg cleanly; finally disposes the sources.
+      const _mainVid = layers.find(l => l.type === 'mainVideo' && !l.hidden && l.file);
+      if (_mainVid && wantedSrc.has(_mainVid.id) && !exportSources.has(_mainVid.id)) throw new Error('не удалось декодировать основное видео');
       // Per-frame buildEngineFrame reuse (GC hot-path): the old adapter rebuilt a full frame object
       // (≈8 closures) on EVERY getSource/getTextDraw/getCC call → (Nvideo+Ntext+Ncc) rebuilds per
       // frame × thousands of frames = heavy short-lived garbage during export. Collapse it: getCC
@@ -4880,12 +4924,39 @@ function Editor({ state, setState }) {
       setUndoStack(s => {
         if (!s.length) return s;
         const prev = s[s.length - 1];
+        setRedoStack(r => [...r.slice(-29), JSON.parse(JSON.stringify(state))]);   // текущее состояние → в redo
         // Replace the whole state so duration, canvas, bg etc. all restore.
         setState(() => JSON.parse(JSON.stringify(prev)));
         // Move focus off any input so the next keystroke isn't intercepted.
         try { document.activeElement?.blur?.(); } catch {}
         undoApplyingRef.current = true;
         return s.slice(0, -1);
+      });
+    };
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
+  }, [state]);
+
+  // Ctrl+Y (или Ctrl+Shift+Z) → вернуть отменённое (redo).
+  useEffect(() => {
+    const handler = (e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod || e.altKey) return;
+      const isRedo = (e.code === 'KeyY' && !e.shiftKey)
+        || ((e.key === 'z' || e.key === 'Z' || e.code === 'KeyZ') && e.shiftKey);
+      if (!isRedo) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setRedoStack(r => {
+        if (!r.length) return r;
+        const next = r[r.length - 1];
+        setUndoStack(s => [...s.slice(-29), JSON.parse(JSON.stringify(state))]);   // текущее → в undo
+        setState(() => JSON.parse(JSON.stringify(next)));
+        try { document.activeElement?.blur?.(); } catch {}
+        undoApplyingRef.current = true;
+        return r.slice(0, -1);
       });
     };
     window.addEventListener('keydown', handler, true);
@@ -4959,6 +5030,7 @@ function Editor({ state, setState }) {
         return;
       }
       setUndoStack(s => [...s.slice(-29), JSON.parse(prevJson)]);
+      setRedoStack([]);   // настоящее новое изменение → redo больше не валиден
       lastPushedJsonRef.current = prevJson;
       lastSnapshotRef.current = curJson;
     }, 400);
@@ -4995,7 +5067,9 @@ function Editor({ state, setState }) {
     // which control (button, panel, canvas) currently holds focus.
     if (e.code === 'Space') { e.preventDefault(); e.stopPropagation(); togglePlay(); }
     else if (e.key === 'Delete') { e.preventDefault(); delSelected(); }
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyC') { e.preventDefault(); e.stopPropagation(); if (selectedIds.size >= 2) mergeSelected(); }
     else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyC') { copySelected(); }
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyV') { e.preventDefault(); e.stopPropagation(); setVolEnvMode(v => !v); }
     else if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') { e.preventDefault(); pasteClipboard(); }
     else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyD') { e.preventDefault(); e.stopPropagation(); splitAtPlayhead(); }
     // Phase 2: toggle the WebGL2 compositor preview (default OFF). Guarded on WebGL2 support.
@@ -5335,10 +5409,9 @@ function Editor({ state, setState }) {
             if (Math.abs(nw / startW - 1) > Math.abs(nh / startH - 1)) nh = nw / ratio;
             else nw = nh * ratio;
           }
-          // Mask/maskedVideo can scale up to 300 % of canvas (so the cut-out
-          // can extend past the frame for big-cropout effects). Blur stays
-          // capped at canvas size.
-          const maxPct = L.type === 'blur' ? 100 : 300;
+          // Blur / mask / maskedVideo all scale up to 300 % of canvas — so they can extend well
+          // past the frame (blur larger than the screen, big cut-out effects), like a video layer.
+          const maxPct = 300;
           const cx = anchorCx(nw), cy = anchorCy(nh);
           set('layers', (ls) => ls.map(x => x.id === id ? { ...x,
             width: Math.max(5, Math.min(maxPct, nw / W * 100)),
@@ -7553,10 +7626,10 @@ function Editor({ state, setState }) {
             <div className="ed-prop-block ed-prop-sel">
               <div className="ed-prop-head">◎ Блюр</div>
               <div className="ed-mask-shapes">
-                {[['square','◼','Квадрат'],['rounded','▢','Скругл.'],['circle','●','Круг']].map(([id,glyph,lbl]) => (
+                {SHAPE_OPTIONS.map(([id,lbl]) => (
                   <button key={id} type="button" className={`ed-mask-shape${(sel.shape||'square')===id?' active':''}`}
                     onClick={()=>updLayer(sel.id,'shape',id)} title={lbl}>
-                    <span className="ed-mask-shape-glyph">{glyph}</span>
+                    <img className="ed-mask-shape-glyph" src={SHAPE_ICONS[id]} alt={lbl} style={{width:22,height:22,objectFit:'contain'}} />
                     <span className="ed-mask-shape-lbl">{lbl}</span>
                   </button>
                 ))}
@@ -7591,10 +7664,10 @@ function Editor({ state, setState }) {
                   )}
                 </div>
                 <div className="ed-mask-shapes">
-                  {[['square','◼','Квадрат'],['rounded','▢','Скругл.'],['circle','●','Круг']].map(([id,glyph,lbl]) => (
+                  {SHAPE_OPTIONS.map(([id,lbl]) => (
                     <button key={id} type="button" className={`ed-mask-shape${sel.shape===id?' active':''}`}
                       onClick={()=>changeMaskShape(sel.id,id)} title={lbl}>
-                      <span className="ed-mask-shape-glyph">{glyph}</span>
+                      <img className="ed-mask-shape-glyph" src={SHAPE_ICONS[id]} alt={lbl} style={{width:22,height:22,objectFit:'contain'}} />
                       <span className="ed-mask-shape-lbl">{lbl}</span>
                     </button>
                   ))}
@@ -7958,7 +8031,7 @@ function Editor({ state, setState }) {
             <div className="ed-prop-block ed-prop-sel">
               <div className="ed-prop-head">{sel.isPreset ? '✨ ' + (sel.label || 'Эффект') : '🎬 ' + compactName(fileName(sel.file||''), 16)}</div>
               <Slider label="Размер, %" value={Math.round(sel.size)} min="5" max="200" onChange={v=>updLayer(sel.id,'size',v)} />
-              {!sel.isPreset && <Slider label="Громкость, %" value={sel.volume??100} min="0" max="200" onChange={v=>updLayer(sel.id,'volume',v)} />}
+              <Slider label="Громкость, %" value={sel.volume??100} min="0" max="200" onChange={v=>updLayer(sel.id,'volume',v)} />{/* и у пресетов-эффектов — чтобы можно было убавить/убрать их звук */}
               <Slider label="Яркость" value={sel.ccB ?? 0} min="-50" max="50" onChange={v=>updLayer(sel.id,'ccB',v)} />
               <Slider label="Насыщенность, %" value={sel.ccS ?? 100} min="0" max="200" onChange={v=>updLayer(sel.id,'ccS',v)} />
               <Slider label="Цветовой тон, °" value={sel.ccH ?? 0} min="-180" max="180" onChange={v=>updLayer(sel.id,'ccH',v)} />
@@ -8134,8 +8207,8 @@ function Editor({ state, setState }) {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><text x="11.5" y="13.5" textAnchor="middle" fontFamily="Arial, Helvetica, sans-serif" fontWeight="900" fontSize="15">Aa</text><rect x="2" y="17.4" width="20" height="2.7" rx="1.35"/><rect x="2" y="21.4" width="13.5" height="2.7" rx="1.35"/></svg>Субтитры
             </button>
             <button className="etl-add-btn" onClick={splitAtPlayhead} title="Разрезать клип под курсором по позиции воспроизведения (Ctrl+Shift+D)">✂ Разрезать</button>
-            <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+клик по клипам на таймлайне для мультивыбора)">⛓ Объединить</button>
-            <button className={`etl-add-btn${volEnvMode ? ' etl-add-btn-on' : ''}`} onClick={() => setVolEnvMode(v => !v)} title="Уровень звука по секундам: на видео/аудио-клипах появится дорожка звука с линией — кликни чтобы поставить точку, тяни вниз чтобы тише."><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><path fill="currentColor" d="M11 5 6 9H3v6h3l5 4V5z"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M15.5 8.5a5 5 0 0 1 0 7"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M18.5 6a8 8 0 0 1 0 12"/></svg>Уровень звука</button>
+            <button className="etl-add-btn" onClick={mergeSelected} disabled={selectedIds.size < 2} title="Объединить выбранные клипы (Ctrl+Shift+C) — Ctrl+клик по клипам на таймлайне для мультивыбора">⛓ Объединить</button>
+            <button className={`etl-add-btn${volEnvMode ? ' etl-add-btn-on' : ''}`} onClick={() => setVolEnvMode(v => !v)} title="Уровень звука (Ctrl+Shift+V) — по секундам: на видео/аудио-клипах появится дорожка звука с линией: кликни чтобы поставить точку, тяни вниз чтобы тише."><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style={{marginRight:6, verticalAlign:'-3px'}}><path fill="currentColor" d="M11 5 6 9H3v6h3l5 4V5z"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M15.5 8.5a5 5 0 0 1 0 7"/><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M18.5 6a8 8 0 0 1 0 12"/></svg>Уровень звука</button>
             <div style={{flex:1}} />
             <div className="ed-zoom">
               <span className="ed-zoom-lbl">Масштаб</span>

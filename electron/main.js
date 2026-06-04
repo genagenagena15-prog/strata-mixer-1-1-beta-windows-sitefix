@@ -62,7 +62,10 @@ function audioClipChain(idx, trimStart, trimEnd, delayMs, label, opts) {
 // paths, so layered/hot clips can't clip); the transcription path passes both false (raw signal).
 function finalAudioMix(mixInputs, label, opts) {
   const o = opts || {};
-  const ln = (o.loudnorm === false) ? '' : `${PEAK_LIMIT},`;   // peak limiter (native loudness), not loudnorm
+  // loudnorm===true → normalise to a fixed level (used by TRANSCRIPTION: keeps the speech intelligible
+  // and prevents the summed multi-source mix from clipping/distorting, which made Whisper give up after
+  // a second loud track overlapped). false → nothing. default (export) → transparent peak limiter only.
+  const ln = (o.loudnorm === true) ? `${LOUDNORM},` : ((o.loudnorm === false) ? '' : `${PEAK_LIMIT},`);
   // aformat=channel_layouts=stereo: the newer ffmpeg in the Mac CI build refuses to negotiate the
   // channel layout between aresample and the output format ("Cannot select channel layout … Conversion
   // failed!" → Mac export crashes). Pinning an explicit stereo layout fixes Mac and is a harmless no-op
@@ -857,6 +860,34 @@ function createWindow() {
 const { autoUpdater } = require('electron-updater');
 const NOTIFICATIONS_URL = 'https://raw.githubusercontent.com/genagenagena15-prog/strata-mixer-releases/main/notifications.json';
 
+// ⚠️ ВРЕМЕННО (тест-сборка 1.4 beta). Локальный патчноут — чтобы тестер увидел весь флоу «что
+// нового» (всплывашка + колокольчик) БЕЗ рассылки в публичную ленту. version совпадает с APP_VERSION
+// → попап срабатывает один раз при первом запуске. ПЕРЕД РЕАЛЬНЫМ РЕЛИЗОМ — УДАЛИТЬ это и залить
+// заметки в публичный notifications.json через `release.cjs --notes`.
+const TEST_PATCHNOTE_1_4 = {
+  id: 'v1.4.0-beta-notes',
+  type: 'update',
+  title: 'Вышло обновление 1.4 beta',
+  body: `Strata Mixer — обновление 1.4 beta
+
+• Новый движок на WebGL
+Графика теперь работает на новом движке с аппаратным ускорением — программа отзывчивее, а эффекты обрабатываются быстрее и плавнее.
+
+• Новые переходы
+Свежий набор переходов между клипами с удобным выбором.
+
+• Тени, обводка и свечение
+Для слоёв и текста — добавь мягкую тень, контур или свечение в пару кликов.
+
+• Плавная громкость на клипах
+Задавай уровень звука прямо на клипе: тихо в начале — громче к концу, плавное появление и затухание. Звук меняется мягко, без рывков.
+
+• Исправление багов
+Множество мелких исправлений — стало стабильнее и приятнее.`,
+  version: '1.4.0-beta',
+  date: '2026-06-04'
+};
+
 let updateState = { status: 'idle', version: null, percent: 0, error: null };
 let notificationsCache = [];
 
@@ -931,31 +962,35 @@ async function checkMacUpdate() {
 async function fetchNotifications() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+  let remote = [];
   try {
     const response = await fetch(`${NOTIFICATIONS_URL}?t=${Date.now()}`, {
       cache: 'no-store',
       signal: controller.signal,
       headers: { 'accept': 'application/json' }
     });
-    if (!response.ok) return;
-    const data = await response.json();
-    const list = Array.isArray(data) ? data : (Array.isArray(data?.messages) ? data.messages : []);
-    notificationsCache = list
-      .filter((m) => m && m.id != null)
-      .map((m) => ({
-        id: String(m.id),
-        type: m.type === 'update' ? 'update' : 'info',
-        title: String(m.title || ''),
-        body: String(m.body || ''),
-        version: m.version != null ? String(m.version) : null,
-        date: m.date != null ? String(m.date) : null
-      }));
-    send('notifications:data', notificationsCache);
+    if (response.ok) {
+      const data = await response.json();
+      const list = Array.isArray(data) ? data : (Array.isArray(data?.messages) ? data.messages : []);
+      remote = list
+        .filter((m) => m && m.id != null && String(m.id) !== TEST_PATCHNOTE_1_4.id)
+        .map((m) => ({
+          id: String(m.id),
+          type: m.type === 'update' ? 'update' : 'info',
+          title: String(m.title || ''),
+          body: String(m.body || ''),
+          version: m.version != null ? String(m.version) : null,
+          date: m.date != null ? String(m.date) : null
+        }));
+    }
   } catch {
-    // offline / not yet hosted — keep the last cache silently
+    // offline / not yet hosted — keep remote empty, still show the bundled note below
   } finally {
     clearTimeout(timer);
   }
+  // ⚠️ ВРЕМЕННО (тест-сборка): всегда подмешиваем локальный патчноут 1.4 — см. TEST_PATCHNOTE_1_4.
+  notificationsCache = [TEST_PATCHNOTE_1_4, ...remote];
+  send('notifications:data', notificationsCache);
 }
 
 function startUpdateAndNotificationCycle() {
@@ -2963,7 +2998,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const baLen = Math.max(0.01, Number(baseAudio.length) || 1);
     const baSrcEnd = baSrcStart + baLen;
     const baDelayMs = Math.round((Number(baseAudio.startTime) || 0) * 1000);
-    filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auBase', {}));
+    filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auBase', { vol: `,volume=${volumeCurve(baseAudio.volume == null ? 100 : baseAudio.volume).toFixed(4)}` }));
     mixInputs.push('[auBase]');
   } else if (mainVideo && audioProbeMap.get(mainFile)) {
     // Main video's audio — trimmed + tempo-adjusted + delayed like in video:edit.
@@ -2972,7 +3007,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const clipDur = Math.max(0.01, videoEnd - videoStart);
     const mvSrcEnd = mvSrc + clipDur * mvSp;
     const delayMs = Math.round(videoStart * 1000);
-    filterParts.push(audioClipChain(0, mvSrc, mvSrcEnd, delayMs, 'auMain', { tempo: ',' + atempoChain(mvSp) }));
+    filterParts.push(audioClipChain(0, mvSrc, mvSrcEnd, delayMs, 'auMain', { tempo: ',' + atempoChain(mvSp), vol: `,volume=${volumeCurve(mainVideo.volume == null ? 100 : mainVideo.volume).toFixed(4)}` }));
     mixInputs.push('[auMain]');
   }
 
@@ -2991,7 +3026,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const oSrc = Number(l.srcStart || 0);
     const oSp = Math.max(0.1, (l.speed || 100) / 100);
     const delayMs = Math.round(oStart * 1000);
-    filterParts.push(audioClipChain(idx, oSrc, oSrc + oLen * oSp, delayMs, `auV${i}`, { tempo: ',' + atempoChain(oSp) }));
+    filterParts.push(audioClipChain(idx, oSrc, oSrc + oLen * oSp, delayMs, `auV${i}`, { tempo: ',' + atempoChain(oSp), vol: `,volume=${volumeCurve(l.volume == null ? 100 : l.volume).toFixed(4)}` }));
     mixInputs.push(`[auV${i}]`);
   });
 
@@ -3006,7 +3041,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const aLen = Math.max(0.1, aEnd - aStart);
     const aSrc = Number(l.srcStart || 0);
     const delayMs = Math.round(aStart * 1000);
-    filterParts.push(audioClipChain(idx, aSrc, aSrc + aLen, delayMs, `auA${i}`, {}));
+    filterParts.push(audioClipChain(idx, aSrc, aSrc + aLen, delayMs, `auA${i}`, { vol: `,volume=${volumeCurve(l.volume == null ? 100 : l.volume).toFixed(4)}` }));
     mixInputs.push(`[auA${i}]`);
   });
 
@@ -3022,7 +3057,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
   for (const l of audLayers) contentEnd = Math.max(contentEnd, Number(l.endTime ?? totalDur) || 0);
   const outDur = Math.min(SUBTITLE_MAX_SECONDS, Math.max(0.1, totalDur, contentEnd));
 
-  filterParts.push(finalAudioMix(mixInputs, 'afin', { loudnorm: false, firstPts: false }));
+  filterParts.push(finalAudioMix(mixInputs, 'afin', { loudnorm: true, firstPts: false }));   // loudnorm → ровный звук для Whisper, без клиппинга при наложении дорожек
 
   const args = [
     ...inputArgs,
@@ -3036,6 +3071,16 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     '-t', String(outDur),
     '-y', outPath,
   ];
+
+  // ⚠️ ВРЕМЕННО — диагностика субтитров (убрать после фикса). Печатает, что реально ушло в распознавание.
+  try {
+    const short = (f) => String(f || '').split(/[\\/]/).pop();
+    console.log('[SUB-DEBUG] payload:', JSON.stringify({ mainFile: short(mainFile), videoStart, videoEnd, totalDuration, outDur,
+      layers: (layers || []).map(l => ({ type: l.type, file: short(l.file), startTime: l.startTime, endTime: l.endTime, muted: !!l.muted, srcStart: l.srcStart })) }));
+    console.log('[SUB-DEBUG] probe(hasAudio):', JSON.stringify([...audioProbeMap.entries()].map(([f, h]) => short(f) + '=' + h)));
+    console.log('[SUB-DEBUG] mixInputs:', mixInputs.join(' '));
+    console.log('[SUB-DEBUG] filtergraph:', filterParts.join(';'));
+  } catch (e) { console.log('[SUB-DEBUG] log error', e && e.message); }
 
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpeg, args, { windowsHide: true });

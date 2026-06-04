@@ -84,3 +84,31 @@ export function rasterizeWord(word, box, style, fontFamilyCss, alphaOnly) {
   ctx.fillText(text, mx, my);
   return { source: c, x: box.cx - boxW / 2, y: box.cy - boxH / 2, w: boxW, h: boxH };
 }
+
+// Rasterize a rounded background PLATE («подложка») sized to ONE subtitle word + padding, centred at
+// box.cx/cy. Returned like rasterizeWord so the compositor draws it as a plain COLOURED quad (no
+// FS_TEXT) BEHIND the word, riding the same anim transform. Tunable via style.plate* (defaults below).
+export function rasterizePlate(word, box, style, fontFamilyCss) {
+  const fs = Number(style.fontSize) || 56;
+  const m = measCtx();
+  m.font = `${fs}px ${fontFamilyCss}`;
+  const tw = m.measureText(word || '').width;
+  const padX = Math.round(fs * (style.platePadX != null ? style.platePadX : 0.34));
+  const padY = Math.round(fs * (style.platePadY != null ? style.platePadY : 0.20));
+  const plateW = tw + padX * 2;
+  const plateH = fs + padY * 2;
+  const margin = 6;                                  // canvas headroom so rounded corners aren't clipped
+  const boxW = Math.max(2, Math.ceil(plateW + margin * 2));
+  const boxH = Math.max(2, Math.ceil(plateH + margin * 2));
+  const c = document.createElement('canvas');
+  c.width = boxW; c.height = boxH;
+  const ctx = c.getContext('2d');
+  const r = Math.min(plateH / 2, Math.round(fs * (style.plateRadius != null ? style.plateRadius : 0.32)));
+  ctx.globalAlpha = (style.plateOpacity != null ? style.plateOpacity : 60) / 100;
+  ctx.fillStyle = style.plateColor || '#000000';
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(margin, margin, plateW, plateH, r);
+  else ctx.rect(margin, margin, plateW, plateH);
+  ctx.fill();
+  return { source: c, x: box.cx - boxW / 2, y: box.cy - boxH / 2, w: boxW, h: boxH };
+}

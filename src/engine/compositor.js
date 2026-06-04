@@ -145,6 +145,42 @@ uniform vec2 uRes;
 out vec4 frag;
 void main(){ frag = texture(uTex, gl_FragCoord.xy / uRes); }`;
 
+// Blur composite with a SHAPE: paste the blurred scene (uTex, sampled by screen pos) into the blur
+// rect, but clipped to a shape (rect / ellipse / rounded / hexagon, ~1px AA). alpha = shape coverage,
+// so with src-over the SHARP scene shows OUTSIDE the shape. Shape SDFs mirror FS_MASKSTAMP exactly.
+const FS_BLURRECT = `#version 300 es
+precision highp float;
+in vec2 vUv;                 // 0..1 across the blur rect (from VS_QUAD)
+uniform sampler2D uTex;      // blurred scene
+uniform vec2 uRes;
+uniform int uShape;          // 0 rect, 1 ellipse, 2 rounded, 3 hexagon
+uniform float uRadiusPx;
+uniform vec2 uRectPx;        // blur rect size in backing px (shape AA)
+out vec4 frag;
+void main(){
+  vec4 col = texture(uTex, gl_FragCoord.xy / uRes);
+  vec2 p = vUv * uRectPx;
+  vec2 c = uRectPx * 0.5;
+  float a = 1.0;
+  if(uShape == 1){
+    vec2 d = (p - c) / max(c, vec2(0.5));
+    float r = length(d);
+    float aa = max(fwidth(r), 1e-4);
+    a = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+  } else if(uShape == 2){
+    vec2 d = abs(p - c) - (c - vec2(uRadiusPx));
+    float sd = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - uRadiusPx;
+    float aa = max(fwidth(sd), 1e-4);
+    a = 1.0 - smoothstep(-aa, aa, sd);
+  } else if(uShape == 3){
+    vec2 d = abs((p - c) / max(c, vec2(0.5)));
+    float hx = max(d.y, d.x + 0.5 * d.y) - 1.0;
+    float aa = max(fwidth(hx), 1e-4);
+    a = 1.0 - smoothstep(-aa, aa, hx);
+  }
+  frag = vec4(col.rgb, col.a * a);
+}`;
+
 // Drop shadow / outer glow tint pass ("Эффекты слоя"): take a BLURRED SILHOUETTE (uTex — only its
 // ALPHA channel matters, RGB is ignored) and paint it as a SOLID-coloured shadow, sampled by screen
 // position shifted by uOffset (= dx,dy in backing px, y already flipped for FBO y-up), so the shadow
@@ -219,6 +255,11 @@ void main(){
     float sd = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - uRadiusPx;
     float aa = max(fwidth(sd), 1e-4);
     a = 1.0 - smoothstep(-aa, aa, sd);
+  } else if(uShape == 3){
+    vec2 d = abs((p - c) / max(c, vec2(0.5)));   // flat-top hexagon fit to the rect
+    float hx = max(d.y, d.x + 0.5 * d.y) - 1.0;
+    float aa = max(fwidth(hx), 1e-4);
+    a = 1.0 - smoothstep(-aa, aa, hx);
   }
   vec4 full = texture(uFull, gl_FragCoord.xy / uRes);
   frag = vec4(full.rgb, full.a * a);
@@ -254,6 +295,11 @@ void main(){
     float sd = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - uRadiusPx;
     float aa = max(fwidth(sd), 1e-4);
     a = 1.0 - smoothstep(-aa, aa, sd);
+  } else if(uShape == 3){
+    vec2 dh = abs((p - cen) / max(cen, vec2(0.5)));   // flat-top hexagon fit to the rect
+    float hx = max(dh.y, dh.x + 0.5 * dh.y) - 1.0;
+    float aa = max(fwidth(hx), 1e-4);
+    a = 1.0 - smoothstep(-aa, aa, hx);
   }
   frag = vec4(clamp(c, 0.0, 1.0), a);
 }`;
@@ -297,7 +343,7 @@ function hexToRgb(hex) {
 function srcReady(src) {
   if (typeof HTMLVideoElement !== 'undefined' && src instanceof HTMLVideoElement) return src.readyState >= 2;
   if (typeof HTMLImageElement !== 'undefined' && src instanceof HTMLImageElement) return src.complete && src.naturalWidth > 0;
-  return !!src; // VideoFrame / canvas / ImageBitmap
+  return !!src && (src.codedWidth === undefined || src.codedWidth > 0); // reject a closed/empty VideoFrame; canvas/ImageBitmap have no codedWidth → pass
 }
 
 export class Compositor {
@@ -310,6 +356,7 @@ export class Compositor {
     this.progBlit = makeProgram(gl, VS_QUAD, FS_BLIT);
     this.progGauss = makeProgram(gl, VS_QUAD, FS_GAUSS);
     this.progCopyRect = makeProgram(gl, VS_QUAD, FS_COPYRECT);
+    this.progBlurRect = makeProgram(gl, VS_QUAD, FS_BLURRECT);   // blur composite clipped to a shape
     this.progShadow = makeProgram(gl, VS_QUAD, FS_SHADOW);   // drop shadow / outer glow tint
     this.progMask = makeProgram(gl, VS_QUAD, FS_MASKSTAMP);
     this.progMaskedVideo = makeProgram(gl, VS_QUAD, FS_MASKEDVIDEO);
@@ -396,7 +443,10 @@ export class Compositor {
         // Keep the LAST uploaded frame when the live source isn't ready: rapid scrubbing /
         // seeks briefly drop a <video>'s readyState below 2, and returning null here would
         // flash the layer to BLACK until the seek settles. Only skip on the very first load.
-        if (srcReady(src) && this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
+        if (srcReady(src) && this._vidFresh(src, rec)) {
+          if (uploadElement(gl, rec.tex, src)) { rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
+          else if (!rec.hasFrame) continue;   // black/empty upload → DON'T latch (_seq stays unset → retry next present); skip while nothing cached
+        }
         else if (!rec.hasFrame) continue;   // source not ready AND nothing cached → skip. If we DO have a cached frame, keep painting it (a mid-scrub <video> briefly drops readyState<2 / getSource→null; holding the last good frame avoids a black flash). The phantom-overlay-black case is handled upstream: _isFullCover requires a live source (so it can't occlude the real layer) and doClearAll resets the compositor (so no stale black texture survives a clear).
         const b = frame.getPx(layer);
         if (!b || b.w <= 0 || b.h <= 0) continue;
@@ -535,7 +585,10 @@ export class Compositor {
     if (layer.type === 'image' || layer.type === 'videoOverlay') {
       const src = frame.getSource(layer);
       const rec = this._texFor(layer.id);
-      if (srcReady(src)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; }
+      if (srcReady(src)) {
+        if (uploadElement(gl, rec.tex, src)) rec.hasFrame = true;
+        else if (!rec.hasFrame) return null;   // black/empty upload, nothing cached → skip (retry next frame)
+      }
       else if (!rec.hasFrame) return null;
       const b = frame.getPx(layer);
       if (!b || b.w <= 0 || b.h <= 0) return null;
@@ -747,16 +800,36 @@ export class Compositor {
     const b = frame.getPx(layer);
     if (!b || b.w <= 0 || b.h <= 0) return;
     const rect = pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H);
+    const shape = layer.shape === 'circle' ? 1 : (layer.shape === 'rounded' ? 2 : (layer.shape === 'hexagon' ? 3 : 0));
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
     gl.viewport(0, 0, bw, bh);
-    gl.useProgram(this.progCopyRect);
     gl.bindVertexArray(this.quad);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.scratchB.tex);
-    gl.uniform1i(this.progCopyRect.u.uTex, 0);
-    gl.uniform2f(this.progCopyRect.u.uRes, bw, bh);
-    gl.uniform4f(this.progCopyRect.u.uRect, rect[0], rect[1], rect[2], rect[3]);
-    gl.uniform1i(this.progCopyRect.u.uFlip, 0);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (shape === 0) {
+      // rectangle — fast path: replace the rect with the blurred scene
+      gl.useProgram(this.progCopyRect);
+      gl.uniform1i(this.progCopyRect.u.uTex, 0);
+      gl.uniform2f(this.progCopyRect.u.uRes, bw, bh);
+      gl.uniform4f(this.progCopyRect.u.uRect, rect[0], rect[1], rect[2], rect[3]);
+      gl.uniform1i(this.progCopyRect.u.uFlip, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    } else {
+      // circle / rounded / hexagon: composite the blurred scene CLIPPED to the shape (src-over, so the
+      // sharp scene shows outside). radius + rect-px mirror _drawMaskedVideo so shapes line up 1:1.
+      const rr = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
+      gl.enable(gl.BLEND);
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      const p = this.progBlurRect;
+      gl.useProgram(p);
+      gl.uniform1i(p.u.uTex, 0);
+      gl.uniform2f(p.u.uRes, bw, bh);
+      gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
+      gl.uniform1i(p.u.uFlip, 0);
+      gl.uniform1i(p.u.uShape, shape);
+      gl.uniform1f(p.u.uRadiusPx, rr * S);
+      gl.uniform2f(p.u.uRectPx, b.w * S, b.h * (bh / frame.H));
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
   }
 
   // mask union — at the FIRST mask: snapshot the full composite (scene → scratchA), then reset
@@ -784,7 +857,7 @@ export class Compositor {
     if (mv && !mv.hidden && frame.time >= frame.videoStart && frame.time <= frame.videoEnd) {
       const src = frame.getSource(mv);
       const rec = this._texFor(mv.id);
-      if (srcReady(src) && this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }   // upload only on a fresh present (else keep last)
+      if (srcReady(src) && this._vidFresh(src, rec)) { if (uploadElement(gl, rec.tex, src)) { rec.hasFrame = true; rec._seq = src && src._smFrameSeq; } }   // latch only on a real upload; black/empty → retry next present
       if (rec.hasFrame) {
         const b = frame.getPx(mv);
         if (b && b.w > 0 && b.h > 0) this._drawLayer(rec.tex, pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H), 1);
@@ -799,7 +872,7 @@ export class Compositor {
     if (!b || b.w <= 0 || b.h <= 0) return;
     const S = bw / frame.W;
     const rr = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
-    const shape = layer.shape === 'circle' ? 1 : (layer.shape === 'rounded' ? 2 : 0);
+    const shape = layer.shape === 'circle' ? 1 : (layer.shape === 'rounded' ? 2 : (layer.shape === 'hexagon' ? 3 : 0));
     const rect = pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
     gl.viewport(0, 0, bw, bh);
@@ -835,8 +908,9 @@ export class Compositor {
     if (srcReady(src)) {
       rec.srcW = src.videoWidth || src.naturalWidth || src.displayWidth || src.codedWidth || src.width || 1;
       rec.srcH = src.videoHeight || src.naturalHeight || src.displayHeight || src.codedHeight || src.height || 1;
-      if (this._vidFresh(src, rec)) { uploadElement(gl, rec.tex, src); rec.hasFrame = true; rec._seq = src && src._smFrameSeq; }
-    } else if (!rec.hasFrame) return;
+      if (this._vidFresh(src, rec)) { if (uploadElement(gl, rec.tex, src)) { rec.hasFrame = true; rec._seq = src && src._smFrameSeq; } }
+    }
+    if (!rec.hasFrame) return;   // ready-but-upload-failed OR not-ready-with-nothing-cached → don't stamp a black cut-out; retry next frame
     const srcW = rec.srcW || 1, srcH = rec.srcH || 1;
     // UV sub-rect: srcCrop (clamped exactly like canvas2d) or cover-fit centred.
     let u0, v0, uSize, vSize;
@@ -856,7 +930,7 @@ export class Compositor {
     }
     const S = bw / frame.W;
     const rr = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
-    const shape = layer.shape === 'circle' ? 1 : (layer.shape === 'rounded' ? 2 : 0);
+    const shape = layer.shape === 'circle' ? 1 : (layer.shape === 'rounded' ? 2 : (layer.shape === 'hexagon' ? 3 : 0));
     const rect = pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H);
     const cc = frame.getCC ? frame.getCC(layer) : null;
     const p = this.progMaskedVideo;
@@ -1266,5 +1340,9 @@ export class Compositor {
     const gl = this.gl;
     for (const r of this.texCache.values()) { try { gl.deleteTexture(r.tex); } catch {} }
     this.texCache.clear();
+    // Release the WebGL2 context itself. Without this, every doClearAll / export spins up a NEW
+    // context (exportRender.js, getGL) and leaks the old one until GC — on macOS/Metal Chromium
+    // force-loses the OLDEST context past a ~16-context ceiling, which surfaces as a BLACK frame.
+    try { gl.getExtension('WEBGL_lose_context')?.loseContext(); } catch {}
   }
 }
