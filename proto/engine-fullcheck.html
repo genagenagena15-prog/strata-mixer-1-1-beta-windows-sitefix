@@ -137,6 +137,28 @@ try{
     T('outline_gradient', left[1]>150&&left[0]<120&&left[2]<120 && right[2]>150&&right[0]<120 && mid[0]>150&&mid[1]<90,
       `leftRing=${left}(green) rightRing=${right}(blue) square=${mid}(red)`); }
 
+  // ── Фигура (shape) — solid fill / circle clip / outline ────────────────────────────
+  { const b=R([{id:'shp1',type:'shape',_px:px100(70,70,60,60),shape:'square',fill:{color:'#ff0000',opacity:1}}],{bgColor:'#0000ff'});
+    const c=avg(b,100,100,5), corner=avg(b,30,30,3);
+    T('shape_solid', c[0]>200&&c[2]<60 && corner[2]>150&&corner[0]<60, `center=${c}(red) corner=${corner}(blue)`); }
+
+  { const b=R([{id:'shp2',type:'shape',_px:px100(50,50,100,100),shape:'circle',fill:{color:'#ff0000',opacity:1}}],{bgColor:'#0000ff'});
+    const c=avg(b,100,100,5), corner=avg(b,57,57,1);
+    T('shape_circle', c[0]>200&&c[2]<60 && corner[2]>150, `center=${c}(red) corner=${corner}(blue=clipped)`); }
+
+  { const b=R([{id:'shp3',type:'shape',_px:px100(60,60,80,80),shape:'square',fill:{color:'#ff0000',opacity:1},outline:{color:'#00ff00',width:8,opacity:1}}],{bgColor:'#000000'});
+    const inner=avg(b,100,100,3), ring=avg(b,56,100,1);
+    T('shape_outline', inner[0]>200&&inner[1]<90 && ring[1]>150&&ring[0]<120, `inner=${inner}(red) ring=${ring}(green outline)`); }
+
+  { const b=R([{id:'shp4',type:'shape',_px:px100(50,50,100,100),shape:'square',fill:{grad:true,colors:['#ff0000','#00ff00'],angle:0,opacity:1}}],{bgColor:'#000000'});
+    const left=avg(b,56,100,2), right=avg(b,144,100,2);
+    T('shape_gradient', Math.abs(left[0]-right[0])>80 && Math.abs(left[1]-right[1])>80, `left=${left} right=${right} (red↔green gradient)`); }
+
+  { const noR=R([{id:'shr',type:'shape',_px:px100(40,90,120,20),shape:'square',fill:{color:'#ff0000',opacity:1}}],{bgColor:'#000000'});
+    const r90=R([{id:'shr',type:'shape',_px:px100(40,90,120,20),shape:'square',fill:{color:'#ff0000',opacity:1},angle:90}],{bgColor:'#000000'});
+    const a=avg(noR,100,140,2), b2=avg(r90,100,140,2);
+    T('shape_rotate', a[0]<60 && b2[0]>200, `noRot(100,140)=${a}(bg) rot90=${b2}(red=повёрнут)`); }
+
   done({ ok:true, pass:results.filter(r=>r.pass).length, total:results.length, results });
 }catch(e){ done({ ok:false, err:(e&&e.message||String(e)).slice(0,500), results }); }
 </script></body></html>

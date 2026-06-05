@@ -21,16 +21,22 @@ app.commandLine.appendSwitch('disable-gpu-shader-disk-cache');
 
 const URL = process.env.BENCH_URL || 'http://localhost:5180/proto/preview-bench.html';
 const RESULT = path.join(__dirname, 'last-bench.json');
+const DEBUG = path.join(__dirname, '_bench-debug.log');
+// Electron on Windows is a GUI-subsystem app — its main-process stdout does NOT reliably reach a
+// parent shell pipe. So mirror everything to a FILE via fs (always works) in addition to stdout.
+function dbg(line) { try { fs.appendFileSync(DEBUG, line + '\n'); } catch (e) { /* ignore */ } process.stdout.write(line + '\n'); }
 
 function onConsole(event, ...rest) {
   // Electron changed this signature across versions:
-  //   old: (event, level, message, line, sourceId)
-  //   new: (event, details)  where details = { level, message, lineNumber, sourceId }
+  //   old:   (event, level, message, line, sourceId)
+  //   mid:   (event, details)            where details = { level, message, lineNumber, sourceId }
+  //   new42: (event)                     where the event itself carries { message, level, ... }
   let msg;
-  if (rest.length === 1 && rest[0] && typeof rest[0] === 'object') msg = rest[0].message;
+  if (event && typeof event === 'object' && typeof event.message === 'string') msg = event.message;
+  else if (rest.length === 1 && rest[0] && typeof rest[0] === 'object') msg = rest[0].message;
   else msg = rest[1];
-  if (msg == null) return;
-  process.stdout.write(msg + '\n');
+  if (msg == null) { dbg('[onConsole] msg=null shape: event=' + JSON.stringify(Object.keys(event || {})) + ' restLen=' + rest.length); return; }
+  dbg(String(msg));
   if (typeof msg === 'string' && msg.startsWith('@@BENCH@@')) {
     try { fs.writeFileSync(RESULT, msg.slice('@@BENCH@@'.length)); } catch (e) { /* ignore */ }
   }
@@ -47,15 +53,18 @@ app.whenReady().then(() => {
   });
   win.setMenuBarVisibility(false);
   win.webContents.on('console-message', onConsole);
+  win.webContents.on('did-finish-load', () => dbg('[launcher] did-finish-load'));
   win.webContents.on('did-fail-load', (_e, code, desc) => {
-    process.stdout.write(`[launcher] did-fail-load ${code} ${desc} — is vite up on :5180?\n`);
+    dbg(`[launcher] did-fail-load ${code} ${desc} — is vite up on :5180?`);
   });
   win.webContents.on('render-process-gone', (_e, d) => {
-    process.stdout.write(`[launcher] render-process-gone: ${JSON.stringify(d)}\n`);
+    dbg('[launcher] render-process-gone: ' + JSON.stringify(d));
   });
+  // Safety net: never hang forever if the page errors before done() / window.close().
+  setTimeout(() => { dbg('[launcher] watchdog timeout — quitting'); app.quit(); }, 60000);
   if (process.env.BENCH_DEVTOOLS) win.webContents.openDevTools({ mode: 'detach' });
   win.loadURL(URL);
-  process.stdout.write('[launcher] loading ' + URL + '\n');
+  dbg('[launcher] loading ' + URL);
 });
 
 app.on('window-all-closed', () => app.quit());

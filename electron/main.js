@@ -860,15 +860,15 @@ function createWindow() {
 const { autoUpdater } = require('electron-updater');
 const NOTIFICATIONS_URL = 'https://raw.githubusercontent.com/genagenagena15-prog/strata-mixer-releases/main/notifications.json';
 
-// ⚠️ ВРЕМЕННО (тест-сборка 1.4 beta). Локальный патчноут — чтобы тестер увидел весь флоу «что
+// ⚠️ ВРЕМЕННО (тест-сборка 1.4). Локальный патчноут — чтобы тестер увидел весь флоу «что
 // нового» (всплывашка + колокольчик) БЕЗ рассылки в публичную ленту. version совпадает с APP_VERSION
 // → попап срабатывает один раз при первом запуске. ПЕРЕД РЕАЛЬНЫМ РЕЛИЗОМ — УДАЛИТЬ это и залить
 // заметки в публичный notifications.json через `release.cjs --notes`.
 const TEST_PATCHNOTE_1_4 = {
-  id: 'v1.4.0-beta-notes',
+  id: 'v1.4.0-notes',
   type: 'update',
-  title: 'Вышло обновление 1.4 beta',
-  body: `Strata Mixer — обновление 1.4 beta
+  title: 'Вышло обновление 1.4',
+  body: `Strata Mixer — обновление 1.4
 
 • Новый движок на WebGL
 Графика теперь работает на новом движке с аппаратным ускорением — программа отзывчивее, а эффекты обрабатываются быстрее и плавнее.
@@ -884,7 +884,7 @@ const TEST_PATCHNOTE_1_4 = {
 
 • Исправление багов
 Множество мелких исправлений — стало стабильнее и приятнее.`,
-  version: '1.4.0-beta',
+  version: '1.4.0',
   date: '2026-06-04'
 };
 
@@ -973,7 +973,7 @@ async function fetchNotifications() {
       const data = await response.json();
       const list = Array.isArray(data) ? data : (Array.isArray(data?.messages) ? data.messages : []);
       remote = list
-        .filter((m) => m && m.id != null && String(m.id) !== TEST_PATCHNOTE_1_4.id)
+        .filter((m) => m && m.id != null)
         .map((m) => ({
           id: String(m.id),
           type: m.type === 'update' ? 'update' : 'info',
@@ -988,8 +988,7 @@ async function fetchNotifications() {
   } finally {
     clearTimeout(timer);
   }
-  // ⚠️ ВРЕМЕННО (тест-сборка): всегда подмешиваем локальный патчноут 1.4 — см. TEST_PATCHNOTE_1_4.
-  notificationsCache = [TEST_PATCHNOTE_1_4, ...remote];
+  notificationsCache = [...remote];
   send('notifications:data', notificationsCache);
 }
 
@@ -1342,7 +1341,16 @@ ipcMain.handle('engine:export-begin', async (_e, meta) => {
     filter.push(finalAudioMix(mix, 'auFinal'));
     args.push('-filter_complex', filter.join(';'));
   }
-  args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p');
+  // Encode with the GPU HARDWARE encoder (NVENC / QuickSync / AMF) when the card supports it — the
+  // frames are already rendered on the GPU, so handing the encode to software libx264 here was the
+  // single biggest reason engine renders crawled vs the ffmpeg path. Probed once + cached; falls back
+  // to libx264 on machines with no working hw encoder. yuv420p = hw encoders need yuv + most compatible.
+  const engVCodec = await detectWorkingH264Encoder(ffmpeg).catch(() => 'libx264');
+  args.push('-c:v', engVCodec, '-pix_fmt', 'yuv420p');
+  if (engVCodec === 'h264_nvenc') args.push('-preset', 'p4', '-cq', '20', '-b:v', '0');
+  else if (engVCodec === 'h264_qsv') args.push('-preset', 'medium', '-global_quality', '20');
+  else if (engVCodec === 'h264_amf') args.push('-quality', 'balanced', '-rc', 'cqp', '-qp_i', '20', '-qp_p', '22');
+  else args.push('-preset', 'medium', '-crf', '20');
   // NO '-shortest': the video comes from the rawvideo pipe and its EOF sets the output length.
   // The audio mix can be SHORTER (e.g. the longest clip has no audio track). With '-shortest'
   // ffmpeg finalised when the shorter audio ended and stopped reading the pipe → the render's
@@ -1366,16 +1374,107 @@ ipcMain.handle('engine:export-begin', async (_e, meta) => {
   ff.stdin.on('close', flushDrains);
   ff.on('close', flushDrains);
   ff.on('exit', () => { exited = true; flushDrains(); });
-  _engExp = { ff, drains, getErr: () => stderr, isDead: () => exited || !ff.stdin.writable };
+  _engExp = { ff, drains, getErr: () => stderr, isDead: () => exited || !ff.stdin.writable, queue: [], written: 0, pumping: false };
   return { ok: true };
+});
+
+// ── FAST WebCodecs export — audio-mux pass ──────────────────────────────────────────────────────────────
+// The renderer encodes a VIDEO-ONLY mp4 via WebCodecs (no per-frame 8MB raw IPC — the Windows bottleneck).
+// Here ONE cheap ffmpeg pass muxes the audio onto it: video `-c:v copy` (NOT re-encoded → keeps its colour,
+// near-instant), audio = the SAME per-source atrim/atempo/volume/amix/loudnorm graph as the rawvideo path.
+// Separate from engine:export-begin so the rawvideo FALLBACK path stays byte-for-byte untouched.
+async function buildEngineAudioGraph(ffmpeg, audioSources, mainFile) {
+  let srcs = Array.isArray(audioSources) ? audioSources.filter(s => s && s.file && fs.existsSync(s.file)) : [];
+  if (!srcs.length && mainFile && fs.existsSync(mainFile)) srcs = [{ file: mainFile, trimStart: 0, trimEnd: 1e6, delayMs: 0, speed: 1, volume: 100 }];
+  const engHasAudio = new Map();
+  for (const f of new Set(srcs.map(s => s.file))) {
+    try { const p = await probeMediaInfo(ffmpeg, f); engHasAudio.set(f, !!p.hasAudio); }
+    catch { engHasAudio.set(f, false); }
+  }
+  const inputArgs = [], filter = [], mix = [];
+  srcs.forEach((s, i) => {
+    inputArgs.push('-i', s.file);                    // audio input index = i+1 (0 = the video file)
+    const sp = Math.max(0.1, Number(s.speed) || 1);
+    const ts = Math.max(0, Number(s.trimStart) || 0);
+    const te = Math.max(ts + 0.01, Number(s.trimEnd) || (ts + 1));
+    const delay = Math.max(0, Math.round(Number(s.delayMs) || 0));
+    if (!engHasAudio.get(s.file)) {
+      const segDur = Math.max(0.1, (te - ts) / sp);
+      filter.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${segDur.toFixed(3)},asetpts=PTS-STARTPTS,adelay=${delay}:all=1[au${i}]`);
+      mix.push(`[au${i}]`);
+      return;
+    }
+    const vol = volumeCurve(s.volume != null ? Number(s.volume) : 100).toFixed(4);
+    const tempo = (Math.abs(sp - 1) > 1e-3) ? (',' + atempoChain(sp)) : '';
+    const envExpr = buildVolEnvExpr(s.volKeys, delay / 1000);
+    const envFilt = envExpr ? `,volume='${envExpr}':eval=frame` : '';
+    const baseVol = envExpr ? '1' : vol;
+    filter.push(audioClipChain(i + 1, ts, te, delay, `au${i}`, { tempo, vol: `,volume=${baseVol}`, env: envFilt }));
+    mix.push(`[au${i}]`);
+  });
+  const hasAudio = mix.length > 0;
+  if (hasAudio) filter.push(finalAudioMix(mix, 'auFinal'));
+  return { inputArgs, filterComplex: hasAudio ? filter.join(';') : null, hasAudio };
+}
+ipcMain.handle('engine:mux-av', async (_e, meta) => {
+  const ffmpeg = findFfmpeg();
+  if (!ffmpeg) return { ok: false, error: 'ffmpeg not found' };
+  const { videoBuffer, outPath, audioSources, mainFile } = meta || {};
+  if (!outPath || !videoBuffer) return { ok: false, error: 'bad mux meta' };
+  const tmpVideo = path.join(app.getPath('temp'), `strata-engvid-${process.pid}-${Date.now()}.mp4`);
+  try { fs.writeFileSync(tmpVideo, Buffer.from(videoBuffer)); }
+  catch (e) { return { ok: false, error: 'temp write: ' + ((e && e.message) || e) }; }
+  try {
+    const ag = await buildEngineAudioGraph(ffmpeg, audioSources, mainFile);
+    const args = ['-y', '-i', tmpVideo, ...ag.inputArgs];
+    if (ag.hasAudio) args.push('-filter_complex', ag.filterComplex);
+    args.push('-map', '0:v', '-c:v', 'copy');   // video NOT re-encoded → keeps colour, takes a fraction of a second
+    if (ag.hasAudio) args.push('-map', '[auFinal]', '-c:a', 'aac', '-b:a', '192k');   // NO -shortest (video length wins)
+    else args.push('-an');
+    args.push('-movflags', '+faststart', outPath);
+    return await new Promise((resolve) => {
+      let stderr = '';
+      const ff = spawn(ffmpeg, args);
+      activeProcs.add(ff);
+      ff.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-4000); });
+      ff.on('error', (e) => { activeProcs.delete(ff); resolve({ ok: false, error: 'ffmpeg spawn: ' + ((e && e.message) || e) }); });
+      ff.on('close', (code) => { activeProcs.delete(ff); resolve(code === 0 ? { ok: true } : { ok: false, error: 'ffmpeg ' + code + ': ' + stderr.slice(-400) }); });
+    });
+  } finally { try { fs.unlinkSync(tmpVideo); } catch {} }
 });
 ipcMain.handle('engine:export-frame', async (_e, buf) => {
   if (!_engExp || _engExp.isDead()) return false;   // ffmpeg gone → tell the renderer to stop the loop
   try {
     const ok = _engExp.ff.stdin.write(Buffer.from(buf));
-    if (!ok) await new Promise((r) => _engExp.drains.push(r));
+    if (!ok) { await new Promise((r) => _engExp.drains.push(r)); }   // ffmpeg can't keep up → backpressure
     return !_engExp.isDead();
   } catch { return false; }
+});
+// Zero-copy frame path: the renderer postMessage-TRANSFERS each 8MB frame here (no structured-clone copy
+// — that copy was ~18ms/frame, the whole export bottleneck; ffmpeg itself writes in ~1.2ms). Queue +
+// write to ffmpeg stdin SERIALLY (preserves frame order + honours backpressure), ACK each frame so the
+// renderer paces itself.
+function _engPumpQueue() {
+  if (!_engExp || _engExp.pumping) return;
+  _engExp.pumping = true;
+  (async () => {
+    while (_engExp && _engExp.queue.length) {
+      const it = _engExp.queue.shift();
+      if (!_engExp || _engExp.isDead()) { try { it.sender.send('engine:export-ack', { ok: false }); } catch {} continue; }
+      try {
+        const ok = _engExp.ff.stdin.write(it.b);
+        if (!ok) await new Promise((r) => _engExp.drains.push(r));   // ffmpeg backpressure
+        if (_engExp) _engExp.written++;
+        try { it.sender.send('engine:export-ack', { ok: !!_engExp && !_engExp.isDead() }); } catch {}
+      } catch { try { it.sender.send('engine:export-ack', { ok: false }); } catch {} }
+    }
+    if (_engExp) _engExp.pumping = false;
+  })();
+}
+ipcMain.on('engine:export-frame-x', (e, buf) => {
+  if (!_engExp || _engExp.isDead()) { try { e.sender.send('engine:export-ack', { ok: false }); } catch {} return; }
+  _engExp.queue.push({ b: Buffer.from(buf), sender: e.sender });   // Buffer.from(transferred ArrayBuffer) = zero-copy view
+  _engPumpQueue();
 });
 ipcMain.handle('engine:export-finish', async () => {
   if (!_engExp) return { ok: false, error: 'no export in progress' };
@@ -1972,6 +2071,72 @@ async function _makeProxyImpl(event, payload) {
 // Concatenate multiple clips (possibly from different source files) into one
 // normalised MP4/MP3, returning the temp path so the editor can replace the
 // selection with a single layer pointing at the merged file.
+// ── DECODER-FRIENDLY source for the engine export ──────────────────────────
+// The WebGL engine decodes each video source frame-by-frame via WebCodecs. A clip with lots of
+// B-frames (libx264's default — the OLD merge made ~73% B-frames) decodes pathologically slowly that
+// way (seconds per frame) and stalled heavy renders for 20-30 min. FIX FOR EVERYONE: before the engine
+// decodes a source, if it's B-frame-heavy, transcode it ONCE to a cached B-frame-free copy (same
+// content, -bf 0, short GOP, high quality) and decode THAT. Normal clips pass through untouched. On ANY
+// failure we return the original (correct, just slow) — so this can only make things faster, never worse.
+const _decodeFriendlyCache = new Map();
+function _probeBFrameRatio(ffmpeg, file) {
+  return new Promise((resolve) => {
+    let err = '';
+    try {
+      const proc = spawn(ffmpeg, ['-hide_banner', '-i', file, '-vf', 'showinfo', '-t', '2', '-an', '-f', 'null', '-'], { windowsHide: true });
+      proc.stderr.on('data', d => { err += d.toString(); });
+      proc.on('error', () => resolve(0));
+      proc.on('close', () => {
+        const types = err.match(/type:[IPB]/g) || [];
+        if (!types.length) return resolve(0);
+        resolve(types.filter(t => t.endsWith('B')).length / types.length);
+      });
+    } catch { resolve(0); }
+  });
+}
+async function _doDecodeFriendly(file) {
+  try {
+    const ffmpeg = findFfmpeg();
+    if (!ffmpeg) return file;
+    const bf = await _probeBFrameRatio(ffmpeg, file);
+    if (bf < 0.25) return file;   // already decode-friendly → use as-is
+    let stat; try { stat = fs.statSync(file); } catch { stat = { size: 0, mtimeMs: 0 }; }
+    const ks = file + '|' + stat.size + '|' + Math.round(stat.mtimeMs);
+    let h = 0; for (let i = 0; i < ks.length; i++) { h = (h * 31 + ks.charCodeAt(i)) | 0; }
+    const tmpDir = path.join(app.getPath('temp'), 'strata-df');
+    try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+    const out = path.join(tmpDir, 'df2-' + (h >>> 0).toString(36) + '.mp4');   // df2 = post-race-fix cache namespace (ignores any half-written df- files)
+    if (fs.existsSync(out)) { try { if (fs.statSync(out).size > 1024) return out; } catch {} }   // persistent cache hit (size-checked: a 0-byte/corrupt file falls through to re-transcode instead of dropping the layer)
+    const part = out + '.part';   // write to a temp name, then atomically rename → a reader NEVER sees a half-written file
+    console.log('[decodeFriendly] transcoding B-frame-heavy clip (' + Math.round(bf * 100) + '% B):', path.basename(file));
+    await new Promise((resolve, reject) => {
+      let er = '';
+      const p = spawn(ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', file, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-g', '60', '-bf', '0', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', '-f', 'mp4', part], { windowsHide: true });
+      p.stderr.on('data', d => { er += d.toString(); });
+      p.on('error', reject);
+      p.on('close', c => c === 0 ? resolve() : reject(new Error('ff ' + c + ': ' + er.slice(-200))));
+    });
+    try { fs.renameSync(part, out); } catch { try { fs.unlinkSync(part); } catch {} return file; }
+    try { if (fs.statSync(out).size > 1024) return out; } catch {}
+    return file;
+  } catch (e) { try { console.warn('[decodeFriendly] fallback to original:', e && e.message); } catch {} return file; }
+}
+ipcMain.handle('engine:decodeFriendly', async (_e, file) => {
+  if (!file || typeof file !== 'string') return file;
+  // Dedupe in-flight work: several layers can share ONE source file (and run via Promise.all). Store the
+  // PROMISE synchronously so parallel calls await the SAME transcode instead of racing to write the same
+  // output (that race produced a half-written file → "UnsupportedInputFormatError" → a missing layer).
+  let cached = _decodeFriendlyCache.get(file);
+  if (cached === undefined) {
+    // Do NOT permanently memoize a FAILURE/passthrough (result === original file): a transient ffmpeg error
+    // (likely on the warm-import call fired the instant a clip is imported) would otherwise lock that clip on
+    // the slow original forever. Evict file-results so the next export re-tries; keep only real fast copies.
+    cached = _doDecodeFriendly(file).then(function (r) { if (r === file) _decodeFriendlyCache.delete(file); return r; }, function () { _decodeFriendlyCache.delete(file); return file; });
+    _decodeFriendlyCache.set(file, cached);
+  }
+  try { return await cached; } catch { return file; }
+});
+
 ipcMain.handle('editor:concatClips', async (event, payload) => {
   const { clips = [], w = 1080, h = 1920, isAudio = false } = payload || {};
   if (clips.length < 2) return { ok: false, error: 'нужно минимум 2 клипа' };
@@ -2018,7 +2183,10 @@ ipcMain.handle('editor:concatClips', async (event, payload) => {
     mapArgs = ['-map', '[outa]', '-c:a', 'libmp3lame', '-b:a', '192k'];
   } else {
     filterParts.push(`${outPairs.join('')}concat=n=${clips.length}:v=1:a=1[outv][outa]`);
-    mapArgs = ['-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'];
+    // Decoder-friendly output: a keyframe every 2s (-g 60) + NO B-frames (-bf 0) so the engine can seek
+    // and decode this merged clip FAST frame-by-frame on export (a long-GOP/B-frame merge decoded at
+    // ~4s/frame and stalled heavy renders for minutes). Quality (crf 20) is unchanged.
+    mapArgs = ['-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-g', '60', '-bf', '0', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart'];
   }
 
   // Generate temp output path so renderer doesn't need filesystem access.
@@ -2736,7 +2904,9 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         const baSrcEnd = baSrcStart + baLen;
         const baDelayMs = Math.round((Number(baseAud.startTime) || 0) * 1000);
         const baVol = volumeCurve(Number(baseAud.volume) || 100).toFixed(4);
-        filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auMain', { vol: `,volume=${baVol}` }));
+        const baEnv = buildVolEnvExpr(baseAud.volKeys, baDelayMs / 1000);   // same envelope fix for base audio
+        const baEnvF = baEnv ? `,volume='${baEnv}':eval=frame` : '';
+        filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auMain', { vol: `,volume=${baEnv ? '1' : baVol}`, env: baEnvF }));
       } else if (mvLayer && baseHasAudio && !mvMuted) {
         // [0:a] is the main video's audio — only safe to use as the base mix
         // when there IS a mainVideo (input [0] is conceptually the timeline
@@ -2744,7 +2914,13 @@ ipcMain.handle('video:edit', async (_event, payload) => {
         // applied in the editor are honoured here too (same fix as video).
         const mvAtSrc = (Number(mvLayer.srcStart) || 0);
         const mvAtSrcEnd = mvAtSrc + Math.max(0.01, videoEnd - videoStart) * mvSp;
-        filterParts.push(audioClipChain(0, mvAtSrc, mvAtSrcEnd, Math.round(videoStart * 1000), 'auMain', { tempo: ',' + atempoChain(mvSp), vol: `,volume=${volumeCurve(mvVol).toFixed(4)}` }));
+        // Volume ENVELOPE («Уровень звука» fade) on the MAIN video — was applied to overlays/audio layers
+        // (below) but MISSED here, so a fade on the main track played in PREVIEW but NOT in the EXPORT
+        // (preview≠export). Apply it exactly like the overlays: envelope present → it's the sole level.
+        const mvEnv = buildVolEnvExpr(mvLayer.volKeys, videoStart);
+        const mvEnvF = mvEnv ? `,volume='${mvEnv}':eval=frame` : '';
+        const mvBaseVol = mvEnv ? '1' : volumeCurve(mvVol).toFixed(4);
+        filterParts.push(audioClipChain(0, mvAtSrc, mvAtSrcEnd, Math.round(videoStart * 1000), 'auMain', { tempo: ',' + atempoChain(mvSp), vol: `,volume=${mvBaseVol}`, env: mvEnvF }));
       } else {
         filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${totalDur.toFixed(3)},asetpts=PTS-STARTPTS[auMain]`);
       }
@@ -2868,9 +3044,14 @@ ipcMain.handle('video:edit', async (_event, payload) => {
           args.push('-b:v', `${v}k`, '-maxrate', `${Math.round(v * maxMul)}k`, '-bufsize', `${Math.round(v * maxMul * 1.6)}k`);
         } else {
           const q = quality === 'custom' ? cCrf(23) : quality === 'max' ? 19 : quality === 'fast' ? 27 : 23;
-          if (vCodec === 'h264_nvenc') args.push('-cq', String(Math.max(16, Math.min(40, q))), '-b:v', '0');
-          else if (vCodec === 'h264_qsv') args.push('-global_quality', String(Math.max(16, Math.min(40, q))));
-          else if (vCodec === 'h264_amf') args.push('-rc', 'cqp', '-qp_i', String(Math.max(16, Math.min(40, q))), '-qp_p', String(Math.max(16, Math.min(40, q + 2))));
+          // Hardware encoders (NVENC/QSV/AMF) are LESS efficient than CPU libx264 at the SAME quality
+          // number — they need a ~3-lower CQ to look as sharp. After the hw-encoder fix the output looked
+          // slightly blockier than the old libx264 (and than the lossless preview); offset the hw encoders
+          // only, libx264 keeps its crf. Now matches the engine path's cq20 default.
+          const hwQ = Math.max(14, Math.min(40, q - 3));
+          if (vCodec === 'h264_nvenc') args.push('-cq', String(hwQ), '-b:v', '0');
+          else if (vCodec === 'h264_qsv') args.push('-global_quality', String(hwQ));
+          else if (vCodec === 'h264_amf') args.push('-rc', 'cqp', '-qp_i', String(hwQ), '-qp_p', String(Math.max(14, Math.min(40, hwQ + 2))));
           else args.push('-crf', String(q));
         }
         if (quality === 'custom' && cFps > 0) args.push('-r', String(cFps));
@@ -2998,7 +3179,9 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const baLen = Math.max(0.01, Number(baseAudio.length) || 1);
     const baSrcEnd = baSrcStart + baLen;
     const baDelayMs = Math.round((Number(baseAudio.startTime) || 0) * 1000);
-    filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auBase', { vol: `,volume=${volumeCurve(baseAudio.volume == null ? 100 : baseAudio.volume).toFixed(4)}` }));
+    const baVol = volumeCurve(baseAudio.volume == null ? 100 : baseAudio.volume).toFixed(4);
+    const baEnv = buildVolEnvExpr(baseAudio.volKeys, baDelayMs / 1000);   // 1в1 с экспортом: огибающая громкости (иначе Whisper слышит другой баланс)
+    filterParts.push(audioClipChain(0, baSrcStart, baSrcEnd, baDelayMs, 'auBase', { vol: `,volume=${baEnv ? '1' : baVol}`, env: baEnv ? `,volume='${baEnv}':eval=frame` : '' }));
     mixInputs.push('[auBase]');
   } else if (mainVideo && audioProbeMap.get(mainFile)) {
     // Main video's audio — trimmed + tempo-adjusted + delayed like in video:edit.
@@ -3007,7 +3190,9 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const clipDur = Math.max(0.01, videoEnd - videoStart);
     const mvSrcEnd = mvSrc + clipDur * mvSp;
     const delayMs = Math.round(videoStart * 1000);
-    filterParts.push(audioClipChain(0, mvSrc, mvSrcEnd, delayMs, 'auMain', { tempo: ',' + atempoChain(mvSp), vol: `,volume=${volumeCurve(mainVideo.volume == null ? 100 : mainVideo.volume).toFixed(4)}` }));
+    const mvVol = volumeCurve(mainVideo.volume == null ? 100 : mainVideo.volume).toFixed(4);
+    const mvEnv = buildVolEnvExpr(mainVideo.volKeys, delayMs / 1000);   // 1в1 с экспортом: огибающая громкости
+    filterParts.push(audioClipChain(0, mvSrc, mvSrcEnd, delayMs, 'auMain', { tempo: ',' + atempoChain(mvSp), vol: `,volume=${mvEnv ? '1' : mvVol}`, env: mvEnv ? `,volume='${mvEnv}':eval=frame` : '' }));
     mixInputs.push('[auMain]');
   }
 
@@ -3026,7 +3211,9 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const oSrc = Number(l.srcStart || 0);
     const oSp = Math.max(0.1, (l.speed || 100) / 100);
     const delayMs = Math.round(oStart * 1000);
-    filterParts.push(audioClipChain(idx, oSrc, oSrc + oLen * oSp, delayMs, `auV${i}`, { tempo: ',' + atempoChain(oSp), vol: `,volume=${volumeCurve(l.volume == null ? 100 : l.volume).toFixed(4)}` }));
+    const oVol = volumeCurve(l.volume == null ? 100 : l.volume).toFixed(4);
+    const oEnv = buildVolEnvExpr(l.volKeys, delayMs / 1000);   // 1в1 с экспортом: огибающая громкости
+    filterParts.push(audioClipChain(idx, oSrc, oSrc + oLen * oSp, delayMs, `auV${i}`, { tempo: ',' + atempoChain(oSp), vol: `,volume=${oEnv ? '1' : oVol}`, env: oEnv ? `,volume='${oEnv}':eval=frame` : '' }));
     mixInputs.push(`[auV${i}]`);
   });
 
@@ -3041,7 +3228,9 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     const aLen = Math.max(0.1, aEnd - aStart);
     const aSrc = Number(l.srcStart || 0);
     const delayMs = Math.round(aStart * 1000);
-    filterParts.push(audioClipChain(idx, aSrc, aSrc + aLen, delayMs, `auA${i}`, { vol: `,volume=${volumeCurve(l.volume == null ? 100 : l.volume).toFixed(4)}` }));
+    const aVol = volumeCurve(l.volume == null ? 100 : l.volume).toFixed(4);
+    const aEnv = buildVolEnvExpr(l.volKeys, delayMs / 1000);   // 1в1 с экспортом: огибающая громкости
+    filterParts.push(audioClipChain(idx, aSrc, aSrc + aLen, delayMs, `auA${i}`, { vol: `,volume=${aEnv ? '1' : aVol}`, env: aEnv ? `,volume='${aEnv}':eval=frame` : '' }));
     mixInputs.push(`[auA${i}]`);
   });
 
@@ -3057,7 +3246,7 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
   for (const l of audLayers) contentEnd = Math.max(contentEnd, Number(l.endTime ?? totalDur) || 0);
   const outDur = Math.min(SUBTITLE_MAX_SECONDS, Math.max(0.1, totalDur, contentEnd));
 
-  filterParts.push(finalAudioMix(mixInputs, 'afin', { loudnorm: true, firstPts: false }));   // loudnorm → ровный звук для Whisper, без клиппинга при наложении дорожек
+  filterParts.push(finalAudioMix(mixInputs, 'afin', { firstPts: false }));   // ПИКОВЫЙ ЛИМИТЁР как в экспорте (без loudnorm): распознавание 1в1 с превью — баланс громкости не давится, голос не теряется в насыщенной середине
 
   const args = [
     ...inputArgs,
@@ -3071,16 +3260,6 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
     '-t', String(outDur),
     '-y', outPath,
   ];
-
-  // ⚠️ ВРЕМЕННО — диагностика субтитров (убрать после фикса). Печатает, что реально ушло в распознавание.
-  try {
-    const short = (f) => String(f || '').split(/[\\/]/).pop();
-    console.log('[SUB-DEBUG] payload:', JSON.stringify({ mainFile: short(mainFile), videoStart, videoEnd, totalDuration, outDur,
-      layers: (layers || []).map(l => ({ type: l.type, file: short(l.file), startTime: l.startTime, endTime: l.endTime, muted: !!l.muted, srcStart: l.srcStart })) }));
-    console.log('[SUB-DEBUG] probe(hasAudio):', JSON.stringify([...audioProbeMap.entries()].map(([f, h]) => short(f) + '=' + h)));
-    console.log('[SUB-DEBUG] mixInputs:', mixInputs.join(' '));
-    console.log('[SUB-DEBUG] filtergraph:', filterParts.join(';'));
-  } catch (e) { console.log('[SUB-DEBUG] log error', e && e.message); }
 
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpeg, args, { windowsHide: true });
@@ -3106,14 +3285,11 @@ async function extractMixedAudioForTranscription(payload, outPath, onProgress) {
 // Uses native fetch + FormData (Node 18+ / Electron's bundled Node). The
 // response format `verbose_json` + `timestamp_granularities[]=word` gives
 // per-word start/end timing — required for the CapCut-style highlight.
-async function transcribeWithGroq(audioPath, { language, signal } = {}) {
+// One Groq Whisper call. `prompt` = optional content bias («затравка») that nudges Whisper to KEEP
+// transcribing speech instead of treating a music/intro stretch as noise.
+async function _groqTranscribeOnce(audioPath, fileData, { language, prompt, signal } = {}) {
   const apiKey = groqApiKey();
   if (!apiKey) throw new Error('Groq API ключ не настроен. Свяжись с поддержкой.');
-
-  const fileData = await fs.promises.readFile(audioPath);
-  if (fileData.length > GROQ_MAX_FILE_BYTES) {
-    throw new Error('Аудио слишком большое после сжатия (>25МБ). Сократи длительность проекта.');
-  }
 
   // Browser-compatible Blob + FormData are global in Electron's main process
   // since Node 18 / fetch landed natively. No extra deps needed.
@@ -3124,11 +3300,11 @@ async function transcribeWithGroq(audioPath, { language, signal } = {}) {
   form.append('response_format', 'verbose_json');
   form.append('timestamp_granularities[]', 'word');
   form.append('timestamp_granularities[]', 'segment');
-  // Only pin the language when the user explicitly picked one. Default ('auto'
-  // / empty) lets Whisper DETECT it — forcing the wrong language (e.g. 'ru' on
-  // Portuguese speech) makes it hallucinate a credit line instead of
-  // transcribing. Auto-detect handles ru/pt/en/es/… correctly.
+  // Pin the language only when asked (user-picked OR pass-2 retry). Default ('auto' / empty) lets
+  // Whisper DETECT it — forcing the WRONG language makes it hallucinate a credit line. Forcing the
+  // CORRECT (detected) one in pass 2 makes it commit and transcribe speech it skipped on auto.
   if (language && language !== 'auto') form.append('language', language);
+  if (prompt) form.append('prompt', String(prompt).slice(0, 880));   // ~220 tokens max — biases toward this vocabulary/content
   // `temperature=0` makes it deterministic — same audio → same transcript.
   form.append('temperature', '0');
 
@@ -3153,9 +3329,7 @@ async function transcribeWithGroq(audioPath, { language, signal } = {}) {
   }
 
   const data = await res.json();
-  // Whisper returns { text, words: [{ word, start, end }], segments: [...] }
-  // Group words into phrases of ~5 words (or ~3.5 seconds, whichever first)
-  // for a CapCut-style display. The renderer can later split/merge these.
+  // Whisper returns { text, words: [{ word, start, end }], segments: [...], language }.
   const words = Array.isArray(data.words) ? data.words.map(w => ({
     start: Number(w.start) || 0,
     end: Number(w.end) || 0,
@@ -3177,10 +3351,57 @@ async function transcribeWithGroq(audioPath, { language, signal } = {}) {
   return { text: String(data.text || '').trim(), words, segments, raw: data };
 }
 
+// POST the mp3 to Groq's Whisper endpoint and return word-level segments. On a big word-gap (Whisper
+// skipped speech after a leading music/intro stretch) it re-transcribes the audio trimmed to the content
+// start and keeps the fuller result — see the body.
+async function transcribeWithGroq(audioPath, { language, signal, contentStartSec = 0 } = {}) {
+  const fileData = await fs.promises.readFile(audioPath);
+  if (fileData.length > GROQ_MAX_FILE_BYTES) {
+    throw new Error('Аудио слишком большое после сжатия (>25МБ). Сократи длительность проекта.');
+  }
+  const r1 = await _groqTranscribeOnce(audioPath, fileData, { language, signal });
+  // Whisper SKIPS speech that follows a long music/intro stretch — its first 30s window opens on
+  // non-speech and it "gives up" on the rest of that window. If pass 1 left a big word-gap AND real
+  // content starts well past a leading intro (contentStartSec), re-transcribe the audio TRIMMED to just
+  // before that content: the window then opens AT the speech and Whisper transcribes it. Shift word/
+  // segment times back to the full timeline and keep the fuller result. (Verified: a ~13s music intro
+  // made it skip 16s of speech; trimming to ~11.6s recovered ALL of it — 22 words → 63.)
+  let maxGap = 0;
+  const ws = r1.words.slice().sort((a, b) => a.start - b.start);
+  for (let i = 1; i < ws.length; i++) maxGap = Math.max(maxGap, ws[i].start - ws[i - 1].end);
+  const trimAt = Math.max(0, (Number(contentStartSec) || 0) - 1.5);   // start ~1.5s before the first content clip
+  if (r1.text && maxGap > 8 && trimAt > 4) {
+    let trimmed = null;
+    try {
+      const ffmpeg = findFfmpeg();
+      trimmed = path.join(os.tmpdir(), `smsub_trim_${Date.now()}.mp3`);
+      await new Promise((resolve, reject) => {
+        const p = spawn(ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-ss', String(trimAt), '-i', audioPath, trimmed], { windowsHide: true });
+        p.on('error', reject);
+        p.on('close', (c) => (c === 0 ? resolve() : reject(new Error('ffmpeg trim ' + c))));
+      });
+      const tData = await fs.promises.readFile(trimmed);
+      const rt = await _groqTranscribeOnce(trimmed, tData, { language, signal });
+      const r2 = {
+        text: rt.text,
+        words: rt.words.map((w) => ({ start: w.start + trimAt, end: w.end + trimAt, text: w.text })),
+        segments: rt.segments.map((s) => ({ start: s.start + trimAt, end: s.end + trimAt, text: s.text, noSpeech: s.noSpeech, avgLogprob: s.avgLogprob, compression: s.compression })),
+        raw: rt.raw,
+      };
+      return (r2.words.length > r1.words.length) ? r2 : r1;
+    } catch {
+      /* trim retry failed (ffmpeg/network) → fall back to the full-audio result */
+    } finally {
+      if (trimmed) { try { fs.unlinkSync(trimmed); } catch {} }
+    }
+  }
+  return r1;
+}
+
 // Known Whisper "silence hallucinations" — credit lines / sign-offs baked into
 // the model's YouTube training data that it emits when the audio has NO speech.
 // These are never legitimate content in a user's short clip, so we drop them.
-const HALLUCINATION_RE = /субтитр\w*\s*(сделал|подготов\w*|создал|правил|редактир\w*|выполн\w*|by)|редактор\s+субтитр|коррект[оа]р|продолжение\s+следует|спасибо\s+за\s+(просмотр|внимание|подписку)|подпис(ывайтесь|ывайся|ка|ь)|ставьте\s+лайк|dimatorzok|игорь\s+негода|amara\.?\s*org|subtitles?\s+by|thanks?\s+for\s+watching|please\s+subscribe/i;
+const HALLUCINATION_RE = /субтитр\w*\s*(сделал|подготов\w*|создал|правил|редактир\w*|выполн\w*|by)|редактор\s+субтитр|коррект[оа]р|продолжение\s+следует|спасибо\s+за\s+(просмотр|внимание|подписку)|подпис(ывайтесь|ывайся|ка|ь)|ставьте\s+лайк|dimatorzok|игорь\s+негода|amara\.?\s*org|subtitles?\s+by|thanks?\s+for\s+watching|please\s+subscribe|suscr[ií]b\w*|gracias\s+por\s+ver|no\s+olvides\s+(de\s+)?suscribirte|dale\s+like|merci\s+d'avoir\s+regard|abonnez-vous|untertitel\s+von|sous-titr/i;
 
 function isHallucinatedSegment(seg) {
   if (!seg) return false;
@@ -3268,7 +3489,21 @@ ipcMain.handle('subtitles:generate', async (event, payload) => {
     });
 
     emit({ phase: 'upload', percent: 30 });
-    const { text, words, segments: rawSegments } = await transcribeWithGroq(tmpAudio, { language: payload?.language || 'auto' });
+    // Where real (speech-bearing) content starts: the earliest non-muted overlay/cut-out/audio clip that
+    // ISN'T a full-timeline background track (music). A long music-only intro before it makes Whisper skip
+    // the speech that follows → transcribeWithGroq trims to here on a big gap. 0 = no leading intro to skip.
+    let _contentStart = Infinity;
+    const _td = Number(payload?.totalDuration) || 0;
+    for (const l of (payload?.layers || [])) {
+      if (!l || l.muted || !l.file) continue;
+      if (l.type !== 'videoOverlay' && l.type !== 'maskedVideo' && l.type !== 'audio') continue;
+      const st = Number(l.startTime) || 0;
+      const en = (l.endTime == null) ? _td : Number(l.endTime);
+      if (_td > 0 && st <= 1 && en >= _td - 1) continue;   // full-span background music → ignore
+      if (st < _contentStart) _contentStart = st;
+    }
+    const contentStartSec = isFinite(_contentStart) ? _contentStart : 0;
+    const { text, words, segments: rawSegments } = await transcribeWithGroq(tmpAudio, { language: payload?.language || 'auto', contentStartSec });
 
     emit({ phase: 'pack', percent: 95 });
     // Drop hallucinated / silence segments BEFORE packing so made-up credit
@@ -3591,15 +3826,17 @@ async function detectAcceleration(ffmpeg) {
 
 // Probe which hardware H.264 encoder ACTUALLY works on THIS machine. The `-encoders` list only proves
 // a codec was compiled in (the bundled ffmpeg ships nvenc+qsv+amf for everyone), NOT that the matching
-// GPU/driver is present. So we run a tiny synthetic encode with each candidate; the first that exits 0
-// is usable. Cached. Falls back to CPU libx264 when no GPU encoder works.
+// GPU/driver is present. So we run a small synthetic encode (320×240 — MUST stay ≥~256px: NVENC REJECTS
+// tiny frames with "Frame Dimension less than minimum", so the old 128×128 false-negatived EVERY NVIDIA
+// card → silent CPU-only fallback = slow renders) with each candidate; the first that exits 0 is usable.
+// Cached. Falls back to CPU libx264 when no GPU encoder works.
 let _hwEncCache = null;
 async function detectWorkingH264Encoder(ffmpeg) {
   if (_hwEncCache !== null) return _hwEncCache;
   const test = (codec) => new Promise((resolve) => {
     try {
       const p = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
-        '-i', 'color=c=black:s=128x128:r=5', '-frames:v', '3', '-c:v', codec, '-f', 'null', '-'],
+        '-i', 'color=c=black:s=320x240:r=5', '-frames:v', '3', '-c:v', codec, '-f', 'null', '-'],
         { windowsHide: true });
       const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(false); }, 3500);
       p.on('close', (code) => { clearTimeout(t); resolve(code === 0); });

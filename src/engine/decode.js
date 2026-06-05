@@ -32,7 +32,13 @@ export class VideoSource {
     this.ready = false;
     this.err = null;
     this.decoded = 0;                     // total frames emitted (diagnostics)
+    this._flushedEnd = false;             // EOF flush done once per decode session (drains the B-frame tail)
     this._configured = false;
+    // Decode backend. null → 'prefer-hardware' (the default applied in _configure). The EXPORT may pass
+    // 'prefer-software' on Windows for heavy multi-layer projects so N decoders stay OFF the scarce GPU
+    // video engine (only a few concurrent hardware sessions exist; oversubscribing them stalls the
+    // export). H.264 decode is deterministic → software vs hardware yields byte-identical pixels.
+    this._accel = opts.accel || null;
   }
 
   async init() {
@@ -63,11 +69,37 @@ export class VideoSource {
   }
 
   _makeDecoder() {
+    this._flushedEnd = false;             // fresh decode session → a new EOF flush is allowed
+    // Token guards against late async callbacks from a PREVIOUS decoder we closed (suspend/resume or
+    // _recover): a stale frame/error from the old decoder must not land on the fresh one.
+    const token = (this._token = (this._token || 0) + 1);
     this.decoder = new VideoDecoder({
-      output: (frame) => { this.ring.push(frame); this.decoded++; },
-      error: (e) => { this.err = e; },
+      output: (frame) => { if (token !== this._token) { try { frame.close(); } catch {} return; } this.ring.push(frame); this.decoded++; },
+      error: (e) => { if (token !== this._token) return; this.err = e; },
     });
     this._configure();
+  }
+
+  // EXPORT decoder pool: free a clip's HARDWARE decode session while it is OFF-SCREEN, so a stack of
+  // overlays doesn't keep N hardware decoders alive at once (that oversubscribes the Windows GPU video
+  // engine → decode starvation → multi-minute export stalls). Hardware decode is preserved (correct
+  // colour, no dropped layers); chunks/keyframe index are kept so resume() reconfigures with NO re-demux.
+  // `ready` stays true throughout so the export source map still treats it as a valid source.
+  suspend() {
+    if (this._suspended || !this.ready) return;
+    this._token = (this._token || 0) + 1;          // neuter in-flight callbacks from the decoder we're closing
+    try { this.decoder.close(); } catch {}
+    for (const f of this.ring) { try { f.close(); } catch {} }
+    this.ring.length = 0;
+    this._suspended = true;
+    this._configured = false;
+  }
+  resume(tSec = 0) {
+    if (!this._suspended) return;
+    this._suspended = false;
+    this.err = null;                                // a stale error from the closed decoder must not poison the fresh one
+    this._makeDecoder();                            // fresh decoder; _configure() reapplies this._accel (keeps any sw fallback)
+    this.idx = this._keyframeFor(Math.round((tSec + this.srcStart) * US));
   }
   _configure() {
     this.decoder.configure({ ...this.config, optimizeForLatency: true, hardwareAcceleration: this._accel || 'prefer-hardware' });
@@ -102,6 +134,7 @@ export class VideoSource {
 
   // Hard seek: drop everything in flight, jump submission to the keyframe preceding tUs.
   _seekTo(tUs) {
+    this._flushedEnd = false;             // new decode position → a future EOF must flush its tail again
     for (const f of this.ring) { try { f.close(); } catch {} }
     this.ring.length = 0;
     try { this.decoder.reset(); } catch {}
@@ -139,6 +172,7 @@ export class VideoSource {
   // while the decoder is still catching up. The ring keeps owning it — DO NOT close it in the caller.
   frameAt(tSec) {
     if (!this.ready) return null;
+    if (this._suspended) this.resume(tSec);          // defensive: asked while off-screen-pooled → re-arm now (governor normally resumes first)
     if (this.err && !this._recover()) return null;   // HW decode died → software fallback (once), else give up
     const tUs = Math.round((tSec + this.srcStart) * US);
     // Seek decision — two cases only:
@@ -175,6 +209,7 @@ export class VideoSource {
   // sync frameAt(tSec) picks the now-ready frame without re-seeking.
   async ensureFrameAt(tSec, timeoutMs = 4000) {
     if (!this.ready) return;
+    if (this._suspended) this.resume(tSec);          // ensure a live decoder before we await its frames
     if (this.err && !this._recover()) return;
     const tUs = Math.round((tSec + this.srcStart) * US);
     const oldest = this.ring.length ? this.ring[0].timestamp : null;
@@ -193,7 +228,22 @@ export class VideoSource {
       if (this.err && !this._recover()) return;                                         // mid-decode HW error → software fallback (once), else bail
       this._pump(tUs);
       if (this.ring.some((f) => f.timestamp >= tUs)) return;                            // a frame at/after tUs is decoded → frameAt can pick the right one
-      if (this.idx >= this.chunks.length && this.decoder.decodeQueueSize === 0) return; // past EOF — nothing left to decode (hold last frame)
+      if (this.idx >= this.chunks.length && this.decoder.decodeQueueSize === 0) {
+        // Submitted every chunk and the queue is drained — but decodeQueueSize===0 means the decoder
+        // ACCEPTED all chunks, NOT that it EMITTED all frames: with B-frame reorder / optimizeForLatency it
+        // legally holds the tail internally. flush() drains those last frames into the ring (ONCE), so the
+        // sync frameAt() then picks the TRUE last frame instead of an earlier (frozen) one — that stale tail
+        // was the export-only freeze on chroma/overlay clips (preview is fine: it samples the live <video>).
+        if (!this._flushedEnd) {
+          this._flushedEnd = true;
+          const tok = this._token;
+          const left = Math.max(500, budget - (Date.now() - start));
+          try { await Promise.race([this.decoder.flush(), new Promise((r) => setTimeout(r, left))]); } catch {}
+          if (tok !== this._token) return;                                              // decoder swapped (suspend/seek/recover) mid-flush → stale, bail
+          continue;                                                                     // re-check the ring now the tail frames have landed
+        }
+        return;                                                                         // already flushed — genuinely nothing left; hold the (now-correct) last frame
+      }
       if (Date.now() - start > budget) return;                                          // safety: never hang the export on a stuck decoder
       await new Promise((r) => setTimeout(r, 1));                                        // yield so the async decoder output lands in the ring
     }

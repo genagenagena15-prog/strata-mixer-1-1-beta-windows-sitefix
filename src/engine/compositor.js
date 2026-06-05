@@ -181,6 +181,57 @@ void main(){
   frag = vec4(col.rgb, col.a * a);
 }`;
 
+// Shape FILL ("Фигура"): same shape SDF as FS_BLURRECT, but outputs a SOLID colour or a multi-stop
+// GRADIENT (no texture). Drives both the visible fill AND the white silhouette that feeds the layer's
+// outline/glow/shadow (drawn via the shared _drawLayerShadow path, exactly like maskedVideo/blur).
+const FS_SHAPEFILL = `#version 300 es
+precision highp float;
+in vec2 vUv;                 // 0..1 across the shape rect (from VS_QUAD)
+uniform int uShape;          // 0 rect, 1 ellipse, 2 rounded, 3 hexagon
+uniform float uRadiusPx;
+uniform vec2 uRectPx;        // shape rect size in backing px (shape AA)
+uniform vec3 uColor;         // solid fill rgb 0..1
+uniform float uOpacity;      // 0..1
+uniform int uGradN;          // 0 = flat uColor; 2..4 = gradient stops across the rect
+uniform vec3 uGradC0; uniform vec3 uGradC1; uniform vec3 uGradC2; uniform vec3 uGradC3;
+uniform vec2 uGradDir;       // gradient axis (cosθ, -sinθ)
+out vec4 frag;
+vec3 gradAt(float t){
+  if(uGradN <= 2) return mix(uGradC0, uGradC1, t);
+  float s = t * float(uGradN - 1);
+  if(uGradN == 3) return (s < 1.0) ? mix(uGradC0, uGradC1, s) : mix(uGradC1, uGradC2, s - 1.0);
+  if(s < 1.0) return mix(uGradC0, uGradC1, s);
+  if(s < 2.0) return mix(uGradC1, uGradC2, s - 1.0);
+  return mix(uGradC2, uGradC3, s - 2.0);
+}
+void main(){
+  vec2 p = vUv * uRectPx;
+  vec2 c = uRectPx * 0.5;
+  float a = 1.0;
+  if(uShape == 1){
+    vec2 d = (p - c) / max(c, vec2(0.5));
+    float r = length(d);
+    float aa = max(fwidth(r), 1e-4);
+    a = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+  } else if(uShape == 2){
+    vec2 d = abs(p - c) - (c - vec2(uRadiusPx));
+    float sd = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - uRadiusPx;
+    float aa = max(fwidth(sd), 1e-4);
+    a = 1.0 - smoothstep(-aa, aa, sd);
+  } else if(uShape == 3){
+    vec2 d = abs((p - c) / max(c, vec2(0.5)));
+    float hx = max(d.y, d.x + 0.5 * d.y) - 1.0;
+    float aa = max(fwidth(hx), 1e-4);
+    a = 1.0 - smoothstep(-aa, aa, hx);
+  }
+  vec3 col = uColor;
+  if(uGradN >= 2){
+    float tt = clamp(dot(vUv - 0.5, uGradDir) + 0.5, 0.0, 1.0);
+    col = gradAt(tt);
+  }
+  frag = vec4(col, a * uOpacity);
+}`;
+
 // Drop shadow / outer glow tint pass ("Эффекты слоя"): take a BLURRED SILHOUETTE (uTex — only its
 // ALPHA channel matters, RGB is ignored) and paint it as a SOLID-coloured shadow, sampled by screen
 // position shifted by uOffset (= dx,dy in backing px, y already flipped for FBO y-up), so the shadow
@@ -357,6 +408,7 @@ export class Compositor {
     this.progGauss = makeProgram(gl, VS_QUAD, FS_GAUSS);
     this.progCopyRect = makeProgram(gl, VS_QUAD, FS_COPYRECT);
     this.progBlurRect = makeProgram(gl, VS_QUAD, FS_BLURRECT);   // blur composite clipped to a shape
+    this.progShapeFill = makeProgram(gl, VS_QUAD, FS_SHAPEFILL); // «Фигура» fill (solid/gradient) clipped to a shape
     this.progShadow = makeProgram(gl, VS_QUAD, FS_SHADOW);   // drop shadow / outer glow tint
     this.progMask = makeProgram(gl, VS_QUAD, FS_MASKSTAMP);
     this.progMaskedVideo = makeProgram(gl, VS_QUAD, FS_MASKEDVIDEO);
@@ -369,7 +421,8 @@ export class Compositor {
     this.scratchA = createFBO(gl, 16, 16); // ping-pong for effects that read the accumulator
     this.scratchB = createFBO(gl, 16, 16);
     this.scratchC = createFBO(gl, 16, 16); // 3rd buffer: scale→blur ping-pong while scratchA holds a snapshot
-    this.texCache = new Map(); // layerId -> { tex }
+    this.texCache = new Map(); // (LRU) layerId | layerId#rkey -> { tex } — Map order = least→most recently used
+    this._texCacheMax = 800;   // bound it; sits far above the max simultaneous on-screen draws (~<100)
     this.whiteTex = createTexture(gl);
     gl.bindTexture(gl.TEXTURE_2D, this.whiteTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
@@ -377,7 +430,21 @@ export class Compositor {
 
   _texFor(id) {
     let r = this.texCache.get(id);
-    if (!r) { r = { tex: createTexture(this.gl) }; this.texCache.set(id, r); }
+    if (r) { this.texCache.delete(id); this.texCache.set(id, r); return r; }   // LRU: refresh recency (Map reorder only)
+    // Miss → bound the cache before minting. Text draws key by layerId#rkey, so every unique
+    // subtitle word/colour/style used to leave a GL texture alive FOREVER (freed only on layer
+    // delete) — a slow VRAM creep = late-session stutter + GPU-context-loss pressure. Evict the
+    // OLDEST entry, which (thanks to the per-frame recency-refresh above) is never a texture used in
+    // the CURRENT frame: the cap sits far above the max simultaneous on-screen draws, so a live glyph
+    // can't be evicted mid-frame. Pixels are unaffected — a re-minted texture re-uploads from d.source.
+    if (this.texCache.size >= this._texCacheMax) {
+      const oldest = this.texCache.keys().next().value;
+      const or = this.texCache.get(oldest);
+      if (or) { try { this.gl.deleteTexture(or.tex); } catch {} }
+      this.texCache.delete(oldest);
+    }
+    r = { tex: createTexture(this.gl) };
+    this.texCache.set(id, r);
     return r;
   }
   // Decide whether to (re)upload a source into its texture this frame. A DOM <video> is
@@ -476,6 +543,8 @@ export class Compositor {
         else this._drawLayer(rec.tex, rect, opacity, cc, rot, aspect);
       } else if (layer.type === 'blur') {
         this._blur(frame, layer, bw, bh);
+      } else if (layer.type === 'shape') {
+        this._drawShape(frame, layer, bw, bh);
       } else if (layer.type === 'mask') {
         if (!maskInitDone) { this._captureFullAndResetBase(frame, bw, bh); maskInitDone = true; }
         this._stampMask(frame, layer, bw, bh);
@@ -513,8 +582,8 @@ export class Compositor {
             const sil = () => {
               for (let di = 0; di < draws.length; di++) {
                 const d = draws[di]; if (!d || !d.source) continue;
-                const rec = this._texFor(layer.id + '#' + di);
-                uploadElement(gl, rec.tex, d.source);
+                const rec = this._texFor(layer.id + '#' + (d.rkey || di));
+                if (!d.rkey || rec._rkey !== d.rkey) { uploadElement(gl, rec.tex, d.source); rec._rkey = d.rkey; }   // upload a word's glyph ONCE, reuse across frames
                 this._drawLayer(rec.tex, drawRect(d), d.opacity != null ? d.opacity : 1, null, trot, tasp);
               }
             };
@@ -526,8 +595,8 @@ export class Compositor {
           for (let di = 0; di < draws.length; di++) {
             const d = draws[di];
             if (!d || !d.source) continue;
-            const rec = this._texFor(layer.id + '#' + di);
-            uploadElement(gl, rec.tex, d.source);
+            const rec = this._texFor(layer.id + '#' + (d.rkey || di));
+            if (!d.rkey || rec._rkey !== d.rkey) { uploadElement(gl, rec.tex, d.source); rec._rkey = d.rkey; }   // upload a word's glyph ONCE, reuse across frames
             const r2 = drawRect(d);
             if (d.style != null && (d.style > 0 || (d.anim != null && d.anim > 0))) {
               // FS_TEXT pass: GPU style (neon/fire/…) OR a PIXEL anim (fill/wave/type/blur, via u_anim)
@@ -675,7 +744,12 @@ export class Compositor {
     // reimport / stacked overlays. The paused-frame blit keeps genuinely-scrubbing layers "ready", so
     // live-only here does NOT reintroduce scrub flicker.)
     const src = frame.getSource ? frame.getSource(layer) : null;
-    return srcReady(src);
+    if (!srcReady(src)) return false;
+    // Only let a cover OCCLUDE the layers below it once it has actually uploaded a REAL frame
+    // (rec.hasFrame is set ONLY on a successful, non-black upload — see renderFrame). A cover whose
+    // texture is still the initial black/empty one must NOT hide the content beneath it.
+    const rec = this.texCache.get(layer.id);
+    return !!(rec && rec.hasFrame);
   }
 
   _drawLayer(tex, rect, opacity, cc, rot, aspect) {
@@ -830,6 +904,68 @@ export class Compositor {
       gl.uniform2f(p.u.uRectPx, b.w * S, b.h * (bh / frame.H));
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
+  }
+
+  // «Фигура»: a solid-colour OR gradient shape (square/rounded/circle/hexagon) with optional
+  // outline/glow/shadow. Mirrors maskedVideo: edge effects first (from the shape's white silhouette),
+  // then the fill on top. Same Compositor as preview ⇒ identical in export.
+  _drawShape(frame, layer, bw, bh) {
+    const b = frame.getPx(layer);
+    if (!b || b.w <= 0 || b.h <= 0) return;
+    const W = frame.W, H = frame.H;
+    const sh = this._shadowParams(layer.shadow), gl2 = this._shadowParams(layer.glow), ol = this._outlineParams(layer.outline);
+    if (sh || gl2 || ol) {
+      const sil = (fbo) => this._fillShape(frame, layer, bw, bh, fbo, true);   // white silhouette → edge effects
+      if (gl2) this._drawLayerShadow(frame, gl2, sil, bw, bh, true);
+      if (sh) this._drawLayerShadow(frame, sh, sil, bw, bh, false);
+      if (ol) this._drawLayerShadow(frame, ol, sil, bw, bh, false, OUTLINE_THRESH, this._gradFor(layer.outline, b, W, H));
+    }
+    this._fillShape(frame, layer, bw, bh, this.scene.fbo, false);   // the fill itself, ON TOP of the effects
+  }
+
+  // Draw the shape's fill into `fbo`. whiteSil=true → flat WHITE (the alpha silhouette consumed by
+  // _drawLayerShadow). Otherwise the layer's fill: solid colour, or a 2..4-stop gradient across the rect.
+  _fillShape(frame, layer, bw, bh, fbo, whiteSil) {
+    const gl = this.gl;
+    const b = frame.getPx(layer);
+    if (!b || b.w <= 0 || b.h <= 0) return;
+    const S = bw / frame.W;
+    const rect = pxRectToNDC(b.x, b.y, b.w, b.h, frame.W, frame.H);
+    const shape = layer.shape === 'circle' ? 1 : (layer.shape === 'rounded' ? 2 : (layer.shape === 'hexagon' ? 3 : 0));
+    const rr = Math.max(0, Math.min(Math.min(b.w, b.h) / 2, (layer.radius || 0) / 100 * Math.min(b.w, b.h) / 2));
+    const fill = layer.fill || {};
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, bw, bh);
+    gl.bindVertexArray(this.quad);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    const p = this.progShapeFill;
+    gl.useProgram(p);
+    gl.uniform4f(p.u.uRect, rect[0], rect[1], rect[2], rect[3]);
+    gl.uniform1i(p.u.uFlip, 0);
+    gl.uniform1i(p.u.uShape, shape);
+    gl.uniform1f(p.u.uRadiusPx, rr * S);
+    gl.uniform2f(p.u.uRectPx, b.w * S, b.h * (bh / frame.H));
+    gl.uniform1f(p.u.uRot, -(layer.angle || 0) * Math.PI / 180);   // rotation — same convention as _drawLayer / maskedVideo (VS_QUAD spins the quad; the SDF rides along in vUv)
+    gl.uniform1f(p.u.uAspect, frame.W / frame.H);
+    const useGrad = !whiteSil && fill.grad && Array.isArray(fill.colors) && fill.colors.length >= 2;
+    if (useGrad) {
+      const gc = fill.colors.slice(0, 4).map(hexToRgb);
+      gl.uniform1i(p.u.uGradN, gc.length);
+      gl.uniform3f(p.u.uGradC0, gc[0][0], gc[0][1], gc[0][2]);
+      gl.uniform3f(p.u.uGradC1, gc[1][0], gc[1][1], gc[1][2]);
+      if (gc[2]) gl.uniform3f(p.u.uGradC2, gc[2][0], gc[2][1], gc[2][2]);
+      if (gc[3]) gl.uniform3f(p.u.uGradC3, gc[3][0], gc[3][1], gc[3][2]);
+      const radg = (+fill.angle || 0) * Math.PI / 180;
+      gl.uniform2f(p.u.uGradDir, Math.cos(radg), -Math.sin(radg));
+      gl.uniform3f(p.u.uColor, 1, 1, 1);
+    } else {
+      const rgb = whiteSil ? [1, 1, 1] : hexToRgb(fill.color || '#ff3b30');
+      gl.uniform1i(p.u.uGradN, 0);
+      gl.uniform3f(p.u.uColor, rgb[0], rgb[1], rgb[2]);
+    }
+    gl.uniform1f(p.u.uOpacity, whiteSil ? 1 : (fill.opacity != null ? +fill.opacity : 1));
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
   // mask union — at the FIRST mask: snapshot the full composite (scene → scratchA), then reset
@@ -1336,13 +1472,82 @@ export class Compositor {
     return buf; // row 0 = bottom (GL order)
   }
 
-  dispose() {
+  // ── ASYNC readback (EXPORT ONLY) ─────────────────────────────────────────────────────────────
+  // The sync readPixels() above is a glFinish-class stall: the CPU blocks on the whole GPU queue every
+  // frame, which serializes GPU-render and the NVENC encode. For export we kick the readback into a
+  // Pixel Pack Buffer (PBO), fence it, and resolve it a frame or two LATER (exportRender.js pipelines
+  // this) — so the GPU renders frame N+1 while frame N's pixels are still in flight. The sync path above
+  // is left byte-for-byte (the parity harness calls it directly); bytes/format/orientation are identical.
+  readPixelsBeginAsync(w, h) {
+    const gl = this.gl;
+    const W = w || this.canvas.width, H = h || this.canvas.height;
+    const bytes = W * H * 4;
+    const RING = 3;                                       // must be >= pipeline DEPTH + 1 (exportRender uses DEPTH 2)
+    if (!this._pboRing || this._pboBytes !== bytes) {
+      if (this._pboRing) for (const p of this._pboRing) { try { gl.deleteBuffer(p); } catch {} }
+      this._pboRing = [];
+      for (let i = 0; i < RING; i++) {
+        const p = gl.createBuffer();
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, p);
+        gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_READ);
+        this._pboRing.push(p);
+      }
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      this._pboBytes = bytes;
+      this._pboSlot = 0;
+    }
+    const slot = this._pboSlot;
+    this._pboSlot = (this._pboSlot + 1) % this._pboRing.length;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fbo);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this._pboRing[slot]);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, 0); // offset 0 → into the PBO, NON-blocking
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();                                          // make sure the readback + fence reach the GPU
+    return { fence, slot, bytes };
+  }
+
+  // Resolve a handle from readPixelsBeginAsync into outBuf — a CALLER-OWNED Uint8Array of handle.bytes
+  // (NEVER share one buffer across in-flight frames, or they alias and corrupt). Polls the fence WITHOUT
+  // blocking the CPU (timeout 0) and yields between polls; with a depth>=2 pipeline the fence is almost
+  // always already signalled by the time we get here, so this returns near-instantly.
+  async readPixelsResolve(handle, outBuf) {
+    const gl = this.gl;
+    if (handle && handle.fence) {
+      let done = false;
+      for (let tries = 0; tries < 240; tries++) {        // bounded yielding poll (~up to a few hundred ms)
+        const status = gl.clientWaitSync(handle.fence, tries === 0 ? gl.SYNC_FLUSH_COMMANDS_BIT : 0, 0);
+        if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) { done = true; break; }
+        if (status === gl.WAIT_FAILED) break;
+        await new Promise((r) => setTimeout(r));         // yield (~0-4ms) so the GPU can finish the frame
+      }
+      // SAFETY: if the fence still isn't signalled, do ONE bounded BLOCKING wait (≤1s) so the export can
+      // NEVER spin forever (a never-signalling fence = a stuck/lost context). Worst case a frame costs ≤1s
+      // extra, the render keeps moving — it can't freeze.
+      if (!done) { try { gl.clientWaitSync(handle.fence, gl.SYNC_FLUSH_COMMANDS_BIT, 1000000000); } catch {} }
+      try { gl.deleteSync(handle.fence); } catch {}
+    }
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this._pboRing[handle.slot]);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, outBuf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    return outBuf;                                        // row 0 = bottom (GL order), same as readPixels
+  }
+
+  // Free an async handle's fence without reading it back (abort path).
+  releaseAsyncHandle(handle) {
+    if (handle && handle.fence) { try { this.gl.deleteSync(handle.fence); } catch {} }
+  }
+
+  dispose(releaseContext) {
     const gl = this.gl;
     for (const r of this.texCache.values()) { try { gl.deleteTexture(r.tex); } catch {} }
     this.texCache.clear();
-    // Release the WebGL2 context itself. Without this, every doClearAll / export spins up a NEW
-    // context (exportRender.js, getGL) and leaks the old one until GC — on macOS/Metal Chromium
-    // force-loses the OLDEST context past a ~16-context ceiling, which surfaces as a BLACK frame.
-    try { gl.getExtension('WEBGL_lose_context')?.loseContext(); } catch {}
+    if (this._pboRing) { for (const p of this._pboRing) { try { gl.deleteBuffer(p); } catch {} } this._pboRing = null; }
+    // Release the WebGL2 context ONLY for a throwaway compositor. The EXPORT compositor uses a fresh
+    // OffscreenCanvas per run, so without this each export leaks a context and macOS/Metal force-loses
+    // the oldest one (= black). The PREVIEW compositor, however, REUSES its canvas — doClearAll disposes
+    // then rebuilds a new Compositor on the SAME canvas/context — so it must NOT lose the context, or the
+    // rebuilt compositor lands on a dead context and renders BLACK (only canvas2d/Ctrl+Shift+G recovers).
+    if (releaseContext) { try { gl.getExtension('WEBGL_lose_context')?.loseContext(); } catch {} }
   }
 }

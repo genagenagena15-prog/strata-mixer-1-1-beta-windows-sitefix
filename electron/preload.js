@@ -68,7 +68,14 @@ contextBridge.exposeInMainWorld('strata', {
   // Phase 2 engineExport — stream compositor-rendered RGBA frames to ffmpeg (rawvideo → H.264).
   engineExportBegin: (meta) => ipcRenderer.invoke('engine:export-begin', meta),
   engineExportFrame: (buf) => ipcRenderer.invoke('engine:export-frame', buf),
+  // Zero-copy frame transfer: postMessage MOVES the 8MB ArrayBuffer to main instead of structured-cloning
+  // it (the clone was ~18ms/frame = THE export bottleneck; ffmpeg itself writes in ~1.2ms). Main acks each
+  // frame (tiny msg) after it's written → ordered per-frame backpressure without the big copy.
+  engineExportFrameX: (buf) => ipcRenderer.postMessage('engine:export-frame-x', buf),
+  onEngineExportAck: (cb) => { const h = (_e, d) => cb(d); ipcRenderer.on('engine:export-ack', h); return () => { try { ipcRenderer.removeListener('engine:export-ack', h); } catch {} }; },
   engineExportFinish: () => ipcRenderer.invoke('engine:export-finish'),
+  engineMuxAV: (meta) => ipcRenderer.invoke('engine:mux-av', meta),   // FAST path: mux audio onto the WebCodecs video-only mp4
+  engineDecodeFriendly: (file) => ipcRenderer.invoke('engine:decodeFriendly', file),   // transcode a B-frame-heavy source to a fast-decoding cached copy (else returns the original)
   editVideo: (payload) => ipcRenderer.invoke('video:edit', payload),
   previewProxyPath: (n) => ipcRenderer.invoke('editor:previewProxyPath', n),
   cancelPreview: () => ipcRenderer.invoke('editor:cancelPreview'),

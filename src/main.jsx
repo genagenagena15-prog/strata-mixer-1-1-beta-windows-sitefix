@@ -7,7 +7,7 @@ import { Compositor } from './engine/compositor.js';
 import { rasterizeText, rasterizeWord, rasterizePlate } from './engine/textRaster.js';
 import { canUseWebgl, pickTier } from './engine/caps.js';
 import { VideoSource } from './engine/decode.js';
-import { renderExportFrames } from './engine/exportRender.js';
+import { renderExportFrames, renderExportFramesEncoded, canEncodeAvc } from './engine/exportRender.js';
 import { TEXT_STYLE_TYPE, TRANSITIONS, TRANSITION_TYPE, TEXT_ANIMS, TEXT_ANIM_TYPE, animTransform, isPixelAnim, isPlateAnim } from './engine/effects/index.js';
 
 const APP_VERSION = 'v1.4 beta';
@@ -59,6 +59,7 @@ const LAYER_ICONS = {
   subtitles:    new URL('../assets/layer-icons/text.png', import.meta.url).href,
   mask:         new URL('../assets/layer-icons/mask.png', import.meta.url).href,
   blur:         new URL('../assets/layer-icons/blur.png', import.meta.url).href,
+  shape:        new URL('../assets/layer-icons/mask.png', import.meta.url).href,
   zoom:         new URL('../assets/layer-icons/zoom.png', import.meta.url).href,
   transition:   new URL('../assets/layer-icons/transition.png', import.meta.url).href,
 };
@@ -75,7 +76,7 @@ const PRESET_OVERLAYS = [
     chroma: { color: '#11f212', threshold: 45, smoothness: 30 } },
   { id: 'chicken_jump', name: 'Chicken', emoji: '🐔', file: 'chicken_jump.mp4',   // новый «Chicken» (chicken_jump_green.gif → mp4): чистый зелёный фон #00ff00, со звуком кудахтанья (1с, запечён по центру клипа)
     previewSrc: new URL('../assets/presets/chicken_jump.mp4', import.meta.url).href,
-    clipColor: '#fde047',
+    clipColor: '#fde047', volume: 30,   // дефолтная громкость кудахтанья потише (по просьбе — 30)
     chroma: { color: '#00ff00', threshold: 40, smoothness: 32 } },
   { id: 'chicken', name: 'Chicken R7', emoji: '🐔', file: 'chicken.mp4',   // бывш. «Chicken» → теперь «Chicken R7» — курица со своим звуком
     previewSrc: new URL('../assets/presets/chicken.mp4', import.meta.url).href,
@@ -1532,7 +1533,7 @@ function Watermark({ settings, update, chooseWatermark, embedded }) {
           <label className="field"><span>Текст</span><input value={active.text} onChange={(e) => updateLayer(active.id, 'text', e.target.value)} placeholder="Введи текст..." /></label>
           <label className="field wm-color-row"><span>Цвет текста</span><input type="color" value={active.color || '#ffffff'} onChange={(e) => updateLayer(active.id, 'color', e.target.value)} /></label>
           <Slider label="Прозрачность, %" value={active.opacity} min="0" max="100" onChange={(v) => updateLayer(active.id, 'opacity', v)} />
-          <Slider label="Размер шрифта, px" value={active.size} min="12" max="200" onChange={(v) => updateLayer(active.id, 'size', v)} />
+          <Slider label="Размер шрифта, px" value={active.size} min="12" max="600" onChange={(v) => updateLayer(active.id, 'size', v)} />
           <Slider label="Поворот, °" value={active.angle} min="-45" max="45" onChange={(v) => updateLayer(active.id, 'angle', v)} />
           <Switch label="Подложка под текст" checked={active.box} onChange={(v) => updateLayer(active.id, 'box', v)} />
         </>}
@@ -2451,6 +2452,7 @@ function Editor({ state, setState }) {
   // modal. They were merged before, and a non-zero render number would also
   // satisfy the project modal's truthy check → both modals shown simultaneously.
   const [saveProgress, setSaveProgress] = useState(null);
+  const [savePreparing, setSavePreparing] = useState(false);   // «Готовлю видео…» phase: media transcode + decoder init BEFORE the render loop (so a fresh-load render doesn't look stuck)
   const [projSaveProgress, setProjSaveProgress] = useState(null);
   useEffect(() => {
     if (!window.strata?.onSaveProgress) return;
@@ -2791,7 +2793,7 @@ function Editor({ state, setState }) {
           return { ...l, size: l.size * fx };
         }
         // Region layers sized as % of frame (w = width%·W, h = height%·H).
-        if (l.type === 'blur' || l.type === 'mask' || l.type === 'maskedVideo') {
+        if (l.type === 'blur' || l.type === 'mask' || l.type === 'maskedVideo' || l.type === 'shape') {
           const o = { ...l };
           if (typeof o.width === 'number') o.width = o.width * fx;
           if (typeof o.height === 'number') o.height = o.height * fy;
@@ -2943,11 +2945,31 @@ function Editor({ state, setState }) {
     setSelectedIds(new Set());
     setEdPropTab('props');
   };
+  // After a clip is removed, force the preview to recompose so it never gets stuck on a stale/black
+  // frame: while paused no new <video> present fires (the rVFC re-arm early-returns for already-armed
+  // elements), so the canvas won't repaint on its own. Dispose the removed clip's export decoder, then
+  // kick a fresh paint — pausedVideoSource re-blits each remaining clip's current frame (rock-solid GL
+  // upload). Same hygiene «Очистить» does, but for a single-clip delete via the × button.
+  const refreshAfterDelete = (deletedIds) => {
+    for (const did of (deletedIds || [])) {
+      try { videoSourcesRef.current.get(did)?.dispose?.(); videoSourcesRef.current.delete(did); } catch {}
+    }
+    // The single-clip delete is the ONLY remove-path that DIDN'T rebuild the GL compositor — and that
+    // leaves it in a state where a later import/paint renders BLACK (proven: «Очистить», which DOES
+    // rebuild, is fine). So rebuild it exactly like doClearAll: dispose + null → the next paint builds a
+    // brand-new Compositor with clean GL state. (compRef.current?.dispose?.() — no arg → keeps the canvas
+    // context alive for the rebuild; only export/unmount pass `true` to release it.)
+    try { compRef.current?.dispose?.(); } catch {}
+    compRef.current = null;
+    kickRender(1200);
+    if (paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
+  };
   const delLayer = (id) => {
     pushUndo();
     if (id === '__mv__') {
       setState(s => ({ ...s, file: null, layers: s.layers.filter(x => x.id !== id) }));
       setSelectedId(null);
+      refreshAfterDelete(['__mv__']);
       return;
     }
     // Release cached bitmaps & DOM refs for the deleted layer so they don't
@@ -2979,6 +3001,7 @@ function Editor({ state, setState }) {
     seekCooldownRef.current.delete(id + '_v');
     seekCooldownRef.current.delete(id + '_a');
     seekCooldownRef.current.delete(id + '_au');
+    refreshAfterDelete([id]);
   };
   const delSelected = () => {
     const ids = selectedIds.size ? [...selectedIds] : (selectedId ? [selectedId] : []);
@@ -2999,6 +3022,7 @@ function Editor({ state, setState }) {
     }
     setState((s) => ({ ...s, file: ids.includes('__mv__') ? null : s.file, layers: s.layers.filter((x) => !ids.includes(x.id)) }));
     setSelectedId(null); setSelectedIds(new Set());
+    refreshAfterDelete(ids);
   };
   const updLayer = (id, k, v) => set('layers', (l) => l.map(x => x.id === id ? { ...x, [k]: v } : x));
   const moveLayer = (id, dir) => { pushUndo(); set('layers', (l) => {
@@ -3032,11 +3056,38 @@ function Editor({ state, setState }) {
     if (f) addLayer({ id: Date.now(), type: 'image', file: f, startTime: 0, endTime: dur, x: 50, y: 50, size: 100, opacity: 100, fitCover: true });
   }
   function addBlurRegion() {
-    addLayer({ id: Date.now(), type: 'blur', startTime: 0, endTime: Math.min(3, dur), x: 25, y: 25, width: 50, height: 30, strength: 15, shape: 'square', radius: 12 });
+    addLayer({ id: Date.now(), type: 'blur', startTime: 0, endTime: dur, x: 50, y: 50, width: 50, height: 30, strength: 15, shape: 'square', radius: 12 });
   }
   function addZoom() {
     addLayer({ id: uid(), type: 'zoom', startTime: 0, endTime: Math.min(2, dur), strength: 30 });
   }
+  function addShapeLayer() {
+    const sqH = 30 * (outWidth / (outHeight || 1));   // height % so the box is SQUARE in px → ровный квадрат/круг
+    addLayer({ id: uid(), type: 'shape', startTime: 0, endTime: dur, x: 50, y: 50, width: 30, height: sqH, shape: 'square', radius: 12, fill: { grad: false, color: '#ff3b30', colors: ['#ff3b30', '#ffd60a'], angle: 0, opacity: 1 } });
+  }
+  // «Фигура» fill helpers (colour / gradient) — mirror the outline-gradient ones above.
+  const updShapeFill = (id, key, val) => set('layers', ls => ls.map(x => x.id === id
+    ? { ...x, fill: { color: '#ff3b30', opacity: 1, ...(x.fill || {}), [key]: val } } : x));
+  const setShapeFillGrad = (id, on) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    const fl = { color: '#ff3b30', opacity: 1, ...(x.fill || {}) };
+    if (on && (!Array.isArray(fl.colors) || fl.colors.length < 2)) fl.colors = [fl.color || '#ff3b30', '#ffd60a'];
+    fl.grad = on;
+    return { ...x, fill: fl };
+  }));
+  const updShapeFillColor = (id, i, val) => set('layers', ls => ls.map(x => x.id === id
+    ? { ...x, fill: { ...x.fill, colors: (x.fill.colors || []).map((c, j) => j === i ? val : c) } } : x));
+  const addShapeFillColor = (id) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    const cs = [...((x.fill && x.fill.colors) || [])]; if (cs.length >= 4) return x;
+    cs.push(cs[cs.length - 1] || '#ffd60a');
+    return { ...x, fill: { ...x.fill, colors: cs } };
+  }));
+  const removeShapeFillColor = (id, i) => set('layers', ls => ls.map(x => {
+    if (x.id !== id) return x;
+    const cs = ((x.fill && x.fill.colors) || []).filter((_, j) => j !== i); if (cs.length < 2) return x;
+    return { ...x, fill: { ...x.fill, colors: cs } };
+  }));
   // Auto-find the nearest clip edge on the timeline so transitions snap to
   // the place where two clips meet. Falls back to the playhead if no clips.
   function nearestClipBoundary() {
@@ -3162,11 +3213,33 @@ function Editor({ state, setState }) {
       // Which slice of the source video was under the mask at Apply time.
       // The cut-out keeps showing THESE pixels even after you drag it elsewhere.
       srcCrop,
+      // Remember the source clip's framing so «Вернуть видео» (revertMask) restores it exactly.
+      _preMask: { size: src.size, x: src.x, y: src.y, aspect: src.aspect || vAspect },
     };
     set('layers', (ls) => ls
       .filter(l => l.id !== mask.id)
       .map(l => l.id === src.id ? masked : l));
     setSelectedId(masked.id);
+    setSelectedIds(new Set());
+  }
+  // Inverse of applyMask: a maskedVideo (Вырезка) → back to a normal videoOverlay. Masking is
+  // non-destructive (same file, same id), so we just drop the cut-out geometry and restore the source
+  // clip's original framing (saved in _preMask; falls back to the cut-out box / canvas centre for clips
+  // masked before this existed). Undoable.
+  function revertMask(id) {
+    const m = layers.find(l => l.id === id);
+    if (!m || m.type !== 'maskedVideo') return;
+    pushUndo();
+    const pre = m._preMask || {};
+    const vidEl = videoOverlayRefs.current[id];
+    const aspect = pre.aspect || m.aspect || (vidEl && vidEl.videoWidth ? vidEl.videoWidth / vidEl.videoHeight : 16 / 9);
+    set('layers', (ls) => ls.map((l) => {
+      if (l.id !== id) return l;
+      const r = { ...l, type: 'videoOverlay', aspect, size: pre.size ?? l.width ?? 40, x: pre.x ?? l.x, y: pre.y ?? l.y };
+      delete r.shape; delete r.radius; delete r.srcCrop; delete r.width; delete r.height; delete r._preMask;
+      return r;
+    }));
+    setSelectedId(id);
     setSelectedIds(new Set());
   }
   function addTextOverlay() {
@@ -3347,6 +3420,7 @@ function Editor({ state, setState }) {
       startTime, endTime,
       srcDuration: probed > 0 ? probed : undefined,
       x: 50, y: 50, size: 100, fitCover: true,                // заливает кадр (большой); звук родной → НЕ мьютим (гасится динамиком на клипе)
+      ...(preset.volume != null ? { volume: preset.volume } : {}),   // дефолтная громкость пресета (если задана), иначе 100
       ...(preset.ccB ? { ccB: preset.ccB } : {}),             // яркость — по настройке пресета
       ...(preset.glow ? { glow: { ...preset.glow } } : {}),   // свечение — по настройке пресета
       chromaKey: { ...preset.chroma },
@@ -3368,7 +3442,13 @@ function Editor({ state, setState }) {
   // Probes first (fast); only re-encodes if HEVC/AV1/ProRes etc. Result is
   // cached by file path so reopening or duplicating the layer is instant.
   function ensureProxy(layerId, filePath) {
-    if (!window.strata?.makeProxy || !filePath) return;
+    if (!filePath) return;
+    // CapCut-style "optimized media": warm the export decode-friendly cache in the BACKGROUND the moment a
+    // clip enters the project, so by export time it is already a fast-decoding copy and the render starts
+    // instantly (no export-time conversion pause). Fire-and-forget; cached on disk; the export-time await
+    // (engineDecodeFriendly before VideoSource init) reuses the warm cache, or transcodes then if needed.
+    try { window.strata?.engineDecodeFriendly?.(filePath)?.catch(() => {}); } catch {}
+    if (!window.strata?.makeProxy) return;
     window.strata.makeProxy({ file: filePath }).then(res => {
       if (res?.ok && res.proxyPath) {
         setState(s => ({ ...s, layers: s.layers.map(x =>
@@ -4109,7 +4189,7 @@ function Editor({ state, setState }) {
     raf = requestAnimationFrame(loop);
     return () => { cancelAnimationFrame(raf); try { presetPrevVideoRef.current?.pause(); } catch {} };
   }, [effPreview]);
-  useEffect(() => () => { try { effPrevCompRef.current?.dispose?.(); } catch {} try { presetPrevVideoRef.current?.remove(); presetPrevVideoRef.current = null; } catch {} }, []);
+  useEffect(() => () => { try { effPrevCompRef.current?.dispose?.(true); } catch {} try { presetPrevVideoRef.current?.remove(); presetPrevVideoRef.current = null; } catch {} }, []);
 
   // Lazily decode an audio/video file → downsampled peaks for the timeline waveform. Cached per file.
   const ensureWave = (file) => {
@@ -4156,7 +4236,10 @@ function Editor({ state, setState }) {
       // decoded, already running for audio/clock). WebCodecs 0-copy (frameAt) is used ONLY for EXPORT,
       // where no DOM element is seeked to t. This also avoids the intermittent BLACK frames the
       // WebCodecs decoder can return on scrub/pause (which left the preview black).
-      const wc = forExport && engineTierRef.current === 'A' && !l.reversed && (!l.speed || l.speed === 1);
+      // speed is handled by the per-clip time-map below (byte-identical to the preview seek at ~3921), so a
+      // sped/slowed overlay no longer falls out of the WebCodecs path and VANISHES in export. l.speed is a
+      // PERCENT (100 = normal). Reverse still excluded here (needs a forward all-keyframe proxy — separate fix).
+      const wc = forExport && engineTierRef.current === 'A' && !l.reversed;
       if (l.type === 'mainVideo') {
         if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T); if (f) return f; } }
         if (forExport) return null;
@@ -4164,7 +4247,7 @@ function Editor({ state, setState }) {
       }
       if (l.type === 'image') return imgCacheRef.current.get(l.file) || null;
       if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
-        if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const f = vs.frameAt(T - (l.startTime || 0) + (l.srcStart || 0)); if (f) return f; } }
+        if (wc) { const vs = videoSourcesRef.current.get(l.id); if (vs && vs.ready) { const spd = Math.max(0.1, (l.speed || 100) / 100); const f = vs.frameAt((l.srcStart || 0) + Math.max(0, T - (l.startTime || 0)) * spd); if (f) return f; } }   // per-clip speed map == preview seek (~3921)
         if (forExport) return null;
         const ov = videoOverlayRefs.current[l.id];
         if (ov && ov.readyState >= 2 && ov.videoWidth) return ov.paused ? pausedVideoSource(ov) : ov;
@@ -4281,14 +4364,14 @@ function Editor({ state, setState }) {
   function buildEngineAudioSources() {
     const out = [];
     const mv = layers.find(l => l.type === 'mainVideo');
-    if (file && (!mv || !mv.muted)) {
+    if (file && (!mv || !mv.muted) && !(mv && mv.reversed)) {   // reversed main: preview silent → silence export to match
       const sp = Math.max(0.1, ((mv && mv.speed) || 100) / 100);
       const clipLen = Math.max(0.01, videoEnd - videoStart);
       const ss = Number((mv && mv.srcStart) || 0);
       out.push({ file, trimStart: ss, trimEnd: ss + clipLen * sp, delayMs: Math.round(videoStart * 1000), speed: sp, volume: (mv && mv.volume) ?? 100, volKeys: (mv && mv.volKeys) || null });
     }
     for (const l of layers) {
-      if ((l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file && !l.muted) {
+      if ((l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file && !l.muted && !l.reversed) {   // reversed clip: preview is silent (gated at ~3971) → silence in export too, else preview≠export audio
         const sp = Math.max(0.1, (l.speed || 100) / 100);
         const oStart = l.startTime || 0, oEnd = Math.min(l.endTime ?? dur, dur), oLen = Math.max(0.1, oEnd - oStart);
         const ss = Number(l.srcStart || 0);
@@ -4322,8 +4405,7 @@ function Editor({ state, setState }) {
     try {
       const fps = 30;
       const durationSec = Math.max(0.2, (Number(dur) || 0) || (videoEnd - videoStart) || 1);
-      const begin = await window.strata.engineExportBegin({ W: outWidth, H: outHeight, fps, outPath, audioSources: buildEngineAudioSources() });
-      if (!begin || !begin.ok) { result = { ok: false, error: (begin && begin.error) || 'ffmpeg' }; if (!onPct) alert('Экспорт не запустился: ' + result.error); return result; }
+      const audioSources = buildEngineAudioSources();   // shared by BOTH the WebCodecs path and the rawvideo fallback
       // Prepare one VideoSource per (visible) video layer. Bytes come via preload IPC (fetch file://
       // is blocked). init() does the demux + decoder config; failures are tolerated per-layer (that
       // layer simply falls back to no source for export, same as before when a source wasn't ready).
@@ -4332,12 +4414,34 @@ function Editor({ state, setState }) {
         if (l.hidden) continue;
         if ((l.type === 'mainVideo' || l.type === 'videoOverlay' || l.type === 'maskedVideo') && l.file) wantedSrc.set(l.id, l.file);
       }
+      // Windows GPU video engines expose only a FEW concurrent HARDWARE decode sessions; one decoder per
+      // video layer + the hardware encoder oversubscribes them → a busy decoder's throughput collapses
+      // = the multi-minute export stall on heavy multi-overlay projects. ffmpeg avoids this by decoding
+      // in SOFTWARE (CPU) by default. So on Windows, when several video layers stack (>=3), decode them in
+      // software — the GPU video engine then only runs the encoder, no contention. macOS (VideoToolbox
+      // virtualises sessions fine — already renders these projects) and light 1–2-video projects keep
+      // hardware decode. H.264 decode is deterministic, so software vs hardware = byte-identical pixels →
+      // preview==export parity is preserved, and Mac is structurally untouched.
+      // CONTENTION FIX (re-enabled): many simultaneous HARDWARE decoders oversubscribe the Windows GPU
+      // video engine (only a few sessions) → throughput collapses = the multi-minute export STALL (the
+      // render WAITS on starved decoders → low CPU + crawling progress). With 3+ video layers on Windows,
+      // decode in SOFTWARE (CPU — 12 cores here) so the GPU video engine runs ONLY the encoder → no
+      // contention → fast. The bf=0 fast-decode copies (decodeFriendly above; short GOP, keyframe every 2s)
+      // keep software decode quick AND fix the OLD deep-trim cold-start that made trimmed clips vanish
+      // (seek now spans <2s, not a whole long GOP). H.264 decode is deterministic → byte-identical to
+      // hardware → preview==export parity preserved. Light 1–2-video projects + macOS keep hardware decode.
+      const _winExp = /win/i.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '');
+      const exportDecodeAccel = (_winExp && wantedSrc.size >= 3) ? 'prefer-software' : null;
+      setSavePreparing(true);   // «Готовлю видео…» — transcode + decoder init can take a moment on a fresh load
       await Promise.all([...wantedSrc].map(async ([id, file]) => {
         try {
           if (!window.strata || !window.strata.readFileBytes) return;
-          const bytes = await window.strata.readFileBytes(file);
+          // For the engine decode, swap a B-frame-heavy clip for its cached fast-decoding copy (backend
+          // transcodes it once; returns the original for already-friendly clips or on any failure → never worse).
+          const friendly = (window.strata.engineDecodeFriendly ? await window.strata.engineDecodeFriendly(file).catch(() => file) : file) || file;
+          const bytes = await window.strata.readFileBytes(friendly);
           if (!bytes) return;
-          const vs = new VideoSource(new Blob([bytes]), { label: id });
+          const vs = new VideoSource(new Blob([bytes]), { label: id, accel: exportDecodeAccel });
           vs._file = file;
           await vs.init();
           exportSources.set(id, vs);
@@ -4349,6 +4453,7 @@ function Editor({ state, setState }) {
       // which closes ffmpeg cleanly; finally disposes the sources.
       const _mainVid = layers.find(l => l.type === 'mainVideo' && !l.hidden && l.file);
       if (_mainVid && wantedSrc.has(_mainVid.id) && !exportSources.has(_mainVid.id)) throw new Error('не удалось декодировать основное видео');
+      setSavePreparing(false);   // media ready → the heavy render loop begins (progress ticks from here)
       // Per-frame buildEngineFrame reuse (GC hot-path): the old adapter rebuilt a full frame object
       // (≈8 closures) on EVERY getSource/getTextDraw/getCC call → (Nvideo+Ntext+Ncc) rebuilds per
       // frame × thousands of frames = heavy short-lived garbage during export. Collapse it: getCC
@@ -4376,7 +4481,7 @@ function Editor({ state, setState }) {
             else if (l.type === 'videoOverlay' || l.type === 'maskedVideo') {
               const ls = l.startTime || 0, le = l.endTime != null ? l.endTime : durationSec;
               if (t < ls || t > le) continue;                 // layer off-screen this frame → don't decode it
-              vs = exportSources.get(l.id); st = t - ls + (l.srcStart || 0);
+              vs = exportSources.get(l.id); const spd = Math.max(0.1, (l.speed || 100) / 100); st = (l.srcStart || 0) + Math.max(0, t - ls) * spd;   // SAME speed map as getSource (~4196) so ensureFrameAt warms the exact frame frameAt picks
             }
             if (vs && vs.ready && vs.ensureFrameAt) proms.push(vs.ensureFrameAt(st));
           }
@@ -4384,10 +4489,48 @@ function Editor({ state, setState }) {
         },
         onProgress: (done, total) => setPct(Math.round(done / total * 100)),
       };
-      await renderExportFrames(spec, async (rgba) => { return await window.strata.engineExportFrame(rgba.buffer); });
-      const fin = await window.strata.engineExportFinish();
-      result = (fin && fin.ok) ? { ok: true } : { ok: false, error: (fin && fin.error) || 'ошибка ffmpeg' };
-      if (!onPct) { if (result.ok) alert('Готово (движок):\n' + outPath); else alert('Экспорт: ' + result.error); }
+      // ── FAST PATH: encode H.264 in the RENDERER (WebCodecs, GPU) → only a tiny COMPRESSED stream crosses
+      // to main, not 8MB raw per frame (the Windows IPC bottleneck; macOS was already fast). Pixels are
+      // IDENTICAL to preview (same Compositor) — only the final RGB→H.264 encode differs. On any failure or
+      // an unsupported machine it falls through to the proven rawvideo path below.
+      let didEncode = false;
+      const canEnc = await canEncodeAvc(outWidth, outHeight).catch(() => false);
+      if (canEnc && window.strata.engineMuxAV) {
+        try {
+          const videoBytes = await renderExportFramesEncoded(spec);   // video-only mp4 bytes (megabytes, not GB)
+          if (videoBytes && videoBytes.length) {
+            const mux = await window.strata.engineMuxAV({ videoBuffer: videoBytes.buffer, outPath, audioSources });
+            result = (mux && mux.ok) ? { ok: true } : { ok: false, error: (mux && mux.error) || 'ошибка склейки звука' };
+            didEncode = true;
+          }
+        } catch (encErr) {
+          console.warn('[engine-export] WebCodecs encode path failed → rawvideo fallback:', encErr);
+          didEncode = false;   // fall through to the proven path
+        }
+      }
+      if (!didEncode) {
+        // ── FALLBACK: rawvideo → ffmpeg (original path, untouched). Used when WebCodecs encode is unsupported
+        // or errored. Slower (8MB/frame IPC) but always works — nobody is left without an export.
+        const begin = await window.strata.engineExportBegin({ W: outWidth, H: outHeight, fps, outPath, audioSources });
+        if (!begin || !begin.ok) { result = { ok: false, error: (begin && begin.error) || 'ffmpeg' }; if (!onPct) alert('Экспорт не запустился: ' + result.error); return result; }
+        if (window.strata.engineExportFrameX && window.strata.onEngineExportAck) {
+          const _ackWaiters = [];
+          const _unsubAck = window.strata.onEngineExportAck((d) => { const r = _ackWaiters.shift(); if (r) r(d); });
+          try {
+            await renderExportFrames(spec, async (rgba) => {
+              const ackP = new Promise((r) => _ackWaiters.push(r));
+              window.strata.engineExportFrameX(rgba.buffer);
+              const ack = await ackP;
+              return !!(ack && ack.ok);
+            });
+          } finally { try { _unsubAck(); } catch {} }
+        } else {
+          await renderExportFrames(spec, async (rgba) => { return await window.strata.engineExportFrame(rgba.buffer); });
+        }
+        const fin = await window.strata.engineExportFinish();
+        result = (fin && fin.ok) ? { ok: true } : { ok: false, error: (fin && fin.error) || 'ошибка ffmpeg' };
+      }
+      if (!onPct) { if (result && result.ok) alert('Готово (движок):\n' + outPath); else alert('Экспорт: ' + (result && result.error)); }
     } catch (e) { console.error('[engine-export]', e); try { await window.strata.engineExportFinish(); } catch {} result = { ok: false, error: e.message }; if (!onPct) alert('Экспорт через движок: ' + e.message); }
     finally {
       // Tear down the export-only WebCodecs decoders so they don't keep VRAM/decoders alive afterwards.
@@ -4411,7 +4554,15 @@ function Editor({ state, setState }) {
       const gl = glCanvasRef.current;
       if (gl) {
         try {
-          if (!compRef.current) compRef.current = new Compositor(gl);
+          // Rebuild if the <canvas> element itself was remounted. After a delete/import React can swap in
+          // a FRESH <canvas> (default 300×150) while compRef still holds the OLD one — renderFrame then
+          // sizes & paints the detached old canvas and the DISPLAYED one stays 300×150 and BLACK
+          // (diag: glW:300 glH:150 glBright:0 while the layer + its source were perfectly valid). Binding
+          // the compositor to the CURRENT canvas every paint fixes the black-after-delete-then-import.
+          if (!compRef.current || compRef.current.canvas !== gl) {
+            try { compRef.current?.dispose?.(true); } catch {}   // old canvas is detached → release its GL context
+            compRef.current = new Compositor(gl);
+          }
           compRef.current.renderFrame(buildEngineFrame());
           // Engine mode returns here and never runs the 2D paint path below — which is what normally
           // fills the fullscreen MIRROR canvas, so fullscreen stayed BLACK on Tier A. When the
@@ -4436,26 +4587,10 @@ function Editor({ state, setState }) {
   // a ref that's refreshed every render → a continuous drag (loop never restarts) paints
   // the LATEST mask/video position instead of needing an extra "poke" to refresh.
   paintOnceRef.current = paintOnce;
-  // DIAGNOSTIC (temporary): window.__smDiag() forces a fresh paint, then returns the live engine state —
-  // engine on/tier/err, what getSource hands EACH layer (NULL / canvas / <video> + dims), layer geometry,
-  // GL-canvas brightness, and the overlay <video> state. Used to pin down the reimport-after-clear black.
-  if (typeof window !== 'undefined') window.__smDiag = () => {
-    try { paintOnceRef.current && paintOnceRef.current(); } catch (e) {}
-    let ef; try { ef = buildEngineFrame(); } catch (e) { return { buildErr: String((e && e.message) || e) }; }
-    const info = (layers || []).map((l) => {
-      let s = 'n/a', px = null;
-      try { const r = ef.getSource(l); s = (r === null) ? 'NULL' : (typeof r === 'string' ? r : (r.tagName || 'canvas') + ' ' + (r.videoWidth || r.width || 0) + 'x' + (r.videoHeight || r.height || 0)); } catch (e) { s = 'ERR:' + ((e && e.message) || e); }
-      try { px = ef.getPx(l); } catch (e) {}
-      const ov = videoOverlayRefs.current[l.id];
-      return { id: String(l.id).slice(-6), type: l.type, op: l.opacity, st: l.startTime, et: l.endTime, px: px ? { x: Math.round(px.x), y: Math.round(px.y), w: Math.round(px.w), h: Math.round(px.h) } : null, src: s, ovRS: ov ? ov.readyState : null, ovT: ov ? +(ov.currentTime || 0).toFixed(2) : null, ovPaused: ov ? ov.paused : null, ovW: ov ? ov.videoWidth : null };
-    });
-    let glBright = '?'; try { const g = glCanvasRef.current; const t = document.createElement('canvas'); t.width = 16; t.height = 16; const x = t.getContext('2d'); x.drawImage(g, 0, 0, 16, 16); const d = x.getImageData(0, 0, 16, 16).data; let m = 0; for (let i = 0; i < d.length; i += 4) m = Math.max(m, d[i], d[i + 1], d[i + 2]); glBright = m; } catch (e) { glBright = 'ERR'; }
-    return { engineMode: engineModeRef.current, tier: engineTierRef.current, engineErr, T: +((ef.time) || 0).toFixed(2), playing: playingRef.current, loopRunning: loopRunningRef.current, glW: glCanvasRef.current ? glCanvasRef.current.width : null, glH: glCanvasRef.current ? glCanvasRef.current.height : null, glBright, nLayers: (layers || []).length, layers: info };
-  };
   const ensureRenderLoop = () => {
     if (loopRunningRef.current) return;
     loopRunningRef.current = true;
-    let last = 0;
+    let last = 0, slowFrames = 0;
     const tick = (ts) => {
       // ADAPTIVE quality: play at FULL res and only drop to low if the canvas
       // can't keep up (heavy project → slow frames → stutter/audio-drop risk).
@@ -4485,7 +4620,12 @@ function Editor({ state, setState }) {
       if (playingRef.current && !proxyPlayRef.current && fullRes) {
         const dt = nowMs() - t0;
         paintMsRef.current = paintMsRef.current ? paintMsRef.current * 0.8 + dt * 0.2 : dt;
-        if (paintMsRef.current > 26) lowResRef.current = true;
+        // Hysteresis: drop to low-res only after 3 CONSECUTIVE slow frames. At play-start the
+        // codec is cold and the first frame or two are always slow — without this the EMA tips
+        // over 26ms, flips HD→Low, and the FBO realloc on that switch frame is exactly the
+        // "first 0.3–1s chews" hitch. A single fast frame resets the streak.
+        if (paintMsRef.current > 26) { if (++slowFrames >= 3) lowResRef.current = true; }
+        else slowFrames = 0;
       }
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -4625,17 +4765,48 @@ function Editor({ state, setState }) {
   useEffect(() => {
     const cv = glCanvasRef.current;
     if (!cv) return;
+    // How many times we've auto-recovered in this session. A healthy GPU loses the context
+    // rarely (driver TDR on a heavy frame, VRAM pressure) and restores fine; a pathological
+    // loss⇄restore loop would thrash the preview, so after a handful we stop re-enabling and
+    // stay on canvas2d for good.
+    let recoveryTries = 0;
     const onLost = (ev) => {
+      // preventDefault() is what tells Chromium to ATTEMPT a restore and later fire
+      // 'webglcontextrestored' — without it the context stays dead forever.
       try { ev.preventDefault(); } catch {}
       compRef.current = null;
       engineModeRef.current = false;
       setEngineMode(false);
-      setEngineErr('GPU‑контекст потерян — включён безопасный режим (canvas2d)');
-      console.warn('[engine] WebGL context lost → canvas2d fallback');
+      setEngineErr(recoveryTries > 6 ? 'GPU‑контекст потерян — включён безопасный режим (canvas2d)'
+                                     : 'GPU‑контекст потерян — восстанавливаю…');
+      console.warn('[engine] WebGL context lost → canvas2d fallback (awaiting restore)');
       kickRender();
     };
+    const onRestored = () => {
+      // The browser handed us a FRESH gl context on the SAME canvas. Every old GL resource
+      // (textures/programs) died with the old context, so we null the compositor and let
+      // paintOnce rebuild it on the new context, clear the banner, and switch the engine back
+      // on — chroma/transitions render again with no app restart and no stuck green preview.
+      if (recoveryTries > 6) {   // give up after repeated losses → stay on the canvas2d fallback
+        setEngineErr('GPU‑контекст нестабилен — включён безопасный режим (canvas2d)');
+        console.warn('[engine] WebGL context restored but too many losses → staying on canvas2d');
+        return;
+      }
+      recoveryTries++;
+      compRef.current = null;
+      engineModeRef.current = true;
+      setEngineMode(true);
+      setEngineErr('');
+      console.warn('[engine] WebGL context restored → engine re-enabled');
+      kickRender();
+      if (paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
+    };
     cv.addEventListener('webglcontextlost', onLost);
-    return () => cv.removeEventListener('webglcontextlost', onLost);
+    cv.addEventListener('webglcontextrestored', onRestored);
+    return () => {
+      cv.removeEventListener('webglcontextlost', onLost);
+      cv.removeEventListener('webglcontextrestored', onRestored);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // requestVideoFrameCallback: repaint EXACTLY when a preview <video> presents a new frame.
@@ -4656,7 +4827,12 @@ function Editor({ state, setState }) {
         // canvas synchronously (pausedVideoSource) — no async ImageBitmap, no seq race. _smFrameSeq
         // also gates the compositor's per-present upload of the LIVE <video> during playback.
         kickRender();
-        if (paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
+        // While PLAYING, the throttled 30fps loop already repaints from the freshest
+        // gated texture — so an extra synchronous full paint here is redundant work piled
+        // on top of the loop (unbudgeted, and a burst-stall when several videos present at
+        // once right at play-start). Keep the instant paint ONLY when paused, where a
+        // freshly-seeked/first-presented frame must show immediately.
+        if (!playingRef.current && paintOnceRef.current) { try { paintOnceRef.current(); } catch {} }
         try { v.requestVideoFrameCallback(onFrame); } catch { armed.delete(v); }
       };
       try { v.requestVideoFrameCallback(onFrame); } catch { armed.delete(v); }
@@ -4697,7 +4873,7 @@ function Editor({ state, setState }) {
   // Stop the loop on unmount.
   useEffect(() => () => {
     loopRunningRef.current = false; cancelAnimationFrame(rafRef.current);
-    try { compRef.current?.dispose(); } catch {}
+    try { compRef.current?.dispose(true); } catch {}   // editor unmount → canvas goes away → release its GL context
     for (const vs of videoSourcesRef.current.values()) { try { vs.dispose && vs.dispose(); } catch {} }
     videoSourcesRef.current.clear();
     // FIX 4A: clear dangling timers
@@ -5119,15 +5295,23 @@ function Editor({ state, setState }) {
       }
       return null;
     };
+    let acc = currentTimeRef.current || 0;   // wall-clock fallback accumulator (advances every frame)
+    let lastSet = 0;                          // throttle gate for the React state push
     const tick = (ts) => {
       const delta = (ts - last) / 1000; last = ts;
       const mt = masterTime();
-      if (mt != null) {
-        if (mt >= dur) { setCurrentTime(dur); setPlaying(false); }
-        else setCurrentTime(mt);
-      } else {
-        setCurrentTime((t) => { const nt = t + delta; if (nt >= dur) { setPlaying(false); return dur; } return nt; });
-      }
+      let nt, stop = false;
+      if (mt != null) { nt = mt; acc = mt; if (nt >= dur) { nt = dur; stop = true; } }
+      else { acc += delta; nt = acc; if (nt >= dur) { nt = dur; stop = true; } }
+      // Feed the ref EVERY frame so the live playhead stays exact — the GL render loop and the
+      // 2D fallback read currentTimeRef without React's one-commit lag, so picture timing is
+      // pixel-precise regardless of the throttle below.
+      currentTimeRef.current = nt;
+      // Throttle the React STATE to ~30fps. setCurrentTime only moves 3 playhead divs + the time
+      // label, but each call re-renders this whole large component — pushing it every vsync
+      // (60–144Hz) was a needless reconcile storm. At 30fps the playhead still glides smoothly.
+      if (stop || ts - lastSet >= 33) { lastSet = ts; setCurrentTime(nt); }
+      if (stop) { setPlaying(false); return; }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -5175,8 +5359,13 @@ function Editor({ state, setState }) {
       seekTo(t);
     };
     seek(e);
-    const move = (ev) => seek(ev);
-    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    // rAF-coalesce: high-Hz mice fire pointermove faster than the display refreshes, and each
+    // seek → setCurrentTime → a full re-render of this large component. Apply at most ONE seek
+    // per frame; the final cursor position is flushed on pointerup so the playhead lands exactly.
+    let pendingEv = null, rafId = 0;
+    const applySeek = () => { rafId = 0; const ev = pendingEv; pendingEv = null; if (ev) seek(ev); };
+    const move = (ev) => { pendingEv = { clientX: ev.clientX, shiftKey: ev.shiftKey }; if (!rafId) rafId = requestAnimationFrame(applySeek); };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } if (pendingEv) applySeek(); };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
   }
@@ -5400,7 +5589,7 @@ function Editor({ state, setState }) {
         const dxPx = dxs * ca + dys * sa;
         const dyPx = -dxs * sa + dys * ca;
         const keepAspect = ev.shiftKey;
-        if (L.type === 'blur' || L.type === 'mask' || L.type === 'maskedVideo') {
+        if (L.type === 'blur' || L.type === 'mask' || L.type === 'maskedVideo' || L.type === 'shape') {
           let nw = startW, nh = startH;
           if (hsign) nw = Math.max(0.05 * W, startW + dxPx * hsign);
           if (vsign) nh = Math.max(0.05 * H, startH + dyPx * vsign);
@@ -5424,7 +5613,7 @@ function Editor({ state, setState }) {
           if (hsign) ratio = (startW + dxPx * hsign * 2) / startW;
           else if (vsign) ratio = (startH + dyPx * vsign * 2) / startH;
           ratio = Math.max(0.1, ratio);
-          const ns = Math.max(8, Math.min(400, Math.round((L.size || 48) * ratio)));
+          const ns = Math.max(8, Math.min(600, Math.round((L.size || 48) * ratio)));
           set('layers', (ls) => ls.map(x => x.id === id ? { ...x, size: ns,
             x: clamp(startCx / W * 100, 0, 100), y: clamp(startCy / H * 100, 0, 100) } : x));
           return;
@@ -5842,8 +6031,11 @@ function Editor({ state, setState }) {
     e.preventDefault();
     pausePlayback();
     timelineSeek(e);
-    const move = ev => timelineSeek(ev);
-    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    // rAF-coalesce the drag (see scrubPointerDown): one seek per frame, flush final pos on up.
+    let pendingEv = null, rafId = 0;
+    const applySeek = () => { rafId = 0; const ev = pendingEv; pendingEv = null; if (ev) timelineSeek(ev); };
+    const move = ev => { pendingEv = { clientX: ev.clientX, shiftKey: ev.shiftKey }; if (!rafId) rafId = requestAnimationFrame(applySeek); };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } if (pendingEv) applySeek(); };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
   }
@@ -5959,7 +6151,7 @@ function Editor({ state, setState }) {
           if (l.type === 'maskedVideo') out.push(fx, clean);   // halo UNDER the cut-out
           else out.push(clean, fx);                            // effect OVER the image
         }
-        try { comp.dispose(); } catch {}
+        try { comp.dispose(true); } catch {}   // throwaway prebake compositor → release its GL context
         if (baked) exportLayers = out;
       }
     }
@@ -6097,6 +6289,7 @@ function Editor({ state, setState }) {
     if (l.type === 'mainVideo') return '#38bdf8';
     if (l.type === 'text') return '#f472b6';
     if (l.type === 'blur') return '#818cf8';
+    if (l.type === 'shape') return '#fb7185';
     if (l.type === 'image') return '#4ade80';
     if (l.type === 'videoOverlay') return '#38bdf8';
     if (l.type === 'audio') return '#34d399';
@@ -6114,6 +6307,7 @@ function Editor({ state, setState }) {
     if (l.type === 'maskedVideo') return '◐';
     if (l.type === 'transition') return '⚡';
     if (l.type === 'subtitles') return 'CC';
+    if (l.type === 'shape') return '■';
     return l.type === 'text' ? 'T' : l.type === 'blur' ? '◎' : l.type === 'image' ? '🖼' : '🎬';
   }
   function lName(l) {
@@ -6122,6 +6316,7 @@ function Editor({ state, setState }) {
     if (l.type === 'mainVideo') return compactName(fileName(l.file || ''), 9) + rev;
     if (l.type === 'text') return l.text?.slice(0, 8) || 'Текст';
     if (l.type === 'blur') return 'Блюр';
+    if (l.type === 'shape') return 'Фигура';
     if (l.type === 'zoom') return 'Зум';
     if (l.type === 'mask') return 'Маска';
     if (l.type === 'maskedVideo') return 'Маска' + rev;
@@ -6242,7 +6437,7 @@ function Editor({ state, setState }) {
       const w = (layer.size || 30) / 100 * W, h = w / aspect;
       return { w, h, x: (layer.x / 100) * W - w / 2, y: (layer.y / 100) * H - h / 2 };
     }
-    if (layer.type === 'blur' || layer.type === 'mask' || layer.type === 'maskedVideo') {
+    if (layer.type === 'blur' || layer.type === 'mask' || layer.type === 'maskedVideo' || layer.type === 'shape') {
       const w = (layer.width || 50) / 100 * W, h = (layer.height || 30) / 100 * H;
       return { w, h, x: (layer.x / 100) * W - w / 2, y: (layer.y / 100) * H - h / 2 };
     }
@@ -6859,9 +7054,9 @@ function Editor({ state, setState }) {
               autoPlay muted playsInline loop={!saveFinishing} style={{ background: cubeBg }}
               onEnded={() => { if (saveFinishing) { setSaveProgress(null); setSaveFinishing(false); } }} />
             <div className="editor-save-modal-title" style={{ color: lightTheme ? '#1a1c25' : '#fff' }}>
-              {saveFinishing ? 'Готово!' : 'Рендеринг'}
+              {saveFinishing ? 'Готово!' : (savePreparing ? 'Подготовка...' : 'Рендеринг')}
             </div>
-            {!saveFinishing && <>
+            {!saveFinishing && !savePreparing && <>
               <div className="editor-save-modal-pct">{saveProgress}%</div>
               <div className="editor-save-modal-bar-wrap" style={{ background: lightTheme ? '#d3d8e2' : '#121214' }}>
                 <div className="editor-save-modal-bar" style={{ width: `${saveProgress}%` }} />
@@ -7359,7 +7554,7 @@ function Editor({ state, setState }) {
                           onPointerDown={makePreviewResize(layer.id, h)} />)}
                       {/* Rotate handle — a stem + knob above the top edge. Drag to spin the
                           layer around its centre; Shift snaps to 15°. */}
-                      {!isTextEditing && isSel && ['mainVideo','videoOverlay','image','text','maskedVideo'].includes(layer.type) && (
+                      {!isTextEditing && isSel && ['mainVideo','videoOverlay','image','text','maskedVideo','shape'].includes(layer.type) && (
                         <div className="preview-rotate" title="Вращать (Shift — шаг 15°, двойной клик — сброс)"
                           onPointerDown={makePreviewRotate(layer.id)}
                           onDoubleClick={(e)=>{ e.stopPropagation(); pushUndo(); set('layers', ls=>ls.map(x=>x.id===layer.id?{...x,angle:0}:x)); }}><span className="preview-rotate-stem" /></div>
@@ -7642,6 +7837,67 @@ function Editor({ state, setState }) {
             </div>
           )}
 
+          {sel?.type === 'shape' && (
+            <div className="ed-prop-block ed-prop-sel">
+              <div className="ed-prop-head">■ Фигура</div>
+              <div className="ed-mask-shapes">
+                {SHAPE_OPTIONS.map(([id,lbl]) => (
+                  <button key={id} type="button" className={`ed-mask-shape${(sel.shape||'square')===id?' active':''}`}
+                    onClick={()=>updLayer(sel.id,'shape',id)} title={lbl}>
+                    <img className="ed-mask-shape-glyph" src={SHAPE_ICONS[id]} alt={lbl} style={{width:22,height:22,objectFit:'contain'}} />
+                    <span className="ed-mask-shape-lbl">{lbl}</span>
+                  </button>
+                ))}
+              </div>
+              {(sel.shape||'square') === 'rounded' && (
+                <Slider label="Скругление углов, %" value={sel.radius ?? 12} min="0" max="50" onChange={v=>updLayer(sel.id,'radius',v)} />
+              )}
+              <div className="ed-prop-row">
+                <span className="ed-prop-label">Заливка</span>
+                <select className="ed-font-sel" value={(sel.fill && sel.fill.grad) ? 'grad' : 'solid'}
+                  onChange={e => setShapeFillGrad(sel.id, e.target.value === 'grad')}>
+                  <option value="solid">Цвет</option>
+                  <option value="grad">Градиент</option>
+                </select>
+              </div>
+              {!(sel.fill && sel.fill.grad) && (
+                <div className="ed-prop-row">
+                  <span className="ed-prop-label">Цвет</span>
+                  <input type="color" className="ed-color-inp" value={(sel.fill && sel.fill.color) || '#ff3b30'}
+                    onChange={e => updShapeFill(sel.id, 'color', e.target.value)} />
+                </div>
+              )}
+              {sel.fill && sel.fill.grad && (
+                <>
+                  <div className="ed-prop-row ed-grad-row">
+                    <span className="ed-prop-label">Цвета ({((sel.fill && sel.fill.colors) || []).length}/4)</span>
+                    <div className="ed-grad-colors">
+                      {((sel.fill && sel.fill.colors) || []).map((c, i) => (
+                        <span key={i} className="ed-grad-swatch">
+                          <input type="color" className="ed-color-inp" value={c}
+                            onChange={e => updShapeFillColor(sel.id, i, e.target.value)} />
+                          {((sel.fill && sel.fill.colors) || []).length > 2 && (
+                            <button type="button" className="ed-grad-rm" title="Убрать цвет"
+                              onClick={() => removeShapeFillColor(sel.id, i)}>×</button>
+                          )}
+                        </span>
+                      ))}
+                      {((sel.fill && sel.fill.colors) || []).length < 4 && (
+                        <button type="button" className="ed-grad-add" title="Добавить цвет"
+                          onClick={() => addShapeFillColor(sel.id)}>＋</button>
+                      )}
+                    </div>
+                  </div>
+                  <Slider label="Угол, °" value={Math.round(+(sel.fill && sel.fill.angle) || 0)} min="0" max="360"
+                    onChange={v => updShapeFill(sel.id, 'angle', v)} />
+                </>
+              )}
+              <Slider label="Непрозрачность, %" value={Math.round((sel.fill && sel.fill.opacity != null ? sel.fill.opacity : 1) * 100)} min="0" max="100" onChange={v => updShapeFill(sel.id, 'opacity', v / 100)} />
+              {renderLayerFx(sel)}
+              <p className="ed-effects-hint">Размер и положение — тяни прямо на превью. Обводка / свечение / тень — ниже.</p>
+            </div>
+          )}
+
           {/* Mask + masked-video share the same shape-editor block. */}
           {(sel?.type === 'mask' || sel?.type === 'maskedVideo') && (() => {
             const locked = sel.shape === 'circle' || sel.shape === 'square';
@@ -7672,6 +7928,9 @@ function Editor({ state, setState }) {
                     </button>
                   ))}
                 </div>
+                {sel.type === 'maskedVideo' && (
+                  <button className="ed-mask-revert" onClick={() => revertMask(sel.id)} title="Вернуть обычный видео-клип. Исходный файл не меняется.">↩ Снять маску</button>
+                )}
                 {locked ? (
                   <Slider label="Размер, px" value={Math.round(sizePx)} min="40" max={maxPx} onChange={updSize} />
                 ) : (
@@ -8143,6 +8402,7 @@ function Editor({ state, setState }) {
                     <button className="ed-effect-btn" data-onb="blur" onClick={addBlurRegion}>Блюр</button>
                     <button className="ed-effect-btn" onClick={addZoom}>Зум</button>
                     <button className="ed-effect-btn" onClick={addMaskRegion}>Маска</button>
+                    <button className="ed-effect-btn" onClick={addShapeLayer}>Фигура</button>
                     <button className="ed-effect-btn" data-onb="text" onClick={addTextOverlay}>Текст</button>
                   </div>
                 </div></div>
