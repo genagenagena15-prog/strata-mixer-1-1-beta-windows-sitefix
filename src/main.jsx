@@ -913,13 +913,13 @@ function NotificationBell() {
         // The one-time "what's new" popup is a CENTERED modal showing the release's patch notes.
         const newest = [...showable].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))[0];
         if (!mutedRef.current) playNotifChime();
-        setCenterModal({ title: newest.title || 'Что нового', body: newest.body || '', version: newest.version, kind: 'info' });
+        setCenterModal({ id: newest.id, title: newest.title || 'Что нового', body: newest.body || '', version: newest.version, kind: 'info' });
       }
       // Mark only the SHOWN ones as seen — a future-version update stays unseen until its version ships.
       if (showable.length) {
         const next = new Set(seenSet);
         showable.forEach(n => next.add(n.id));
-        saveSeenIds(next);
+        persistSeenIds(next);
         setSeen(next);
       }
     };
@@ -992,7 +992,7 @@ function NotificationBell() {
   function closeCenterModal() {
     if (centerModal && centerModal.id) {
       const next = new Set(seen); next.add(centerModal.id);
-      saveSeenIds(next); setSeen(next);
+      persistSeenIds(next); setSeen(next);
     }
     setCenterModal(null);
   }
